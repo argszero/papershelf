@@ -1,0 +1,35 @@
+# 构建上下文排除项。
+# ⚠️ 这个文件比 .gitignore 更重要：**被 .gitignore 忽略的文件照样进构建上下文**
+#    （Docker 只认 .dockerignore），而这里有 200M 的 agent 运行时会话数据。
+.git
+.gitignore
+.dockerignore
+Dockerfile
+docker-compose.yml
+
+# EMRG agent 运行时（含会话 tmp 里的演示 PDF —— 绝不能进镜像）
+.emrg/
+
+# 开发/测试残留
+.pytest_cache/
+**/__pycache__/
+*.py[cod]
+.venv/
+venv/
+/data/
+/out/
+*.egg-info/
+.env
+.env.*
+!.env.example
+# ⚠️ 别写成 `data/`：那会连 tests/data/ 的测试夹具一起排除（.gitignore 踩过同一个坑）
+
+# 前端依赖与旧产物：镜像内会重新构建（见 Dockerfile 阶段 1）
+web/node_modules/
+web/dist/
+src/papershelf/static/assets/
+
+# 编辑器 / 系统
+.DS_Store
+.idea/
+.vscode/

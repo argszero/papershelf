@@ -1,0 +1,48 @@
+# papershelf —— 一条命令起服务
+#
+#   cp .env.example .env      # 填 PAPERSHELF_SECRET / LLM / 管理员
+#   docker compose up -d
+#   open http://localhost:8000
+#
+# 镜像由 GitHub Actions 构建推送到 GHCR（.github/workflows/docker.yml），
+# 这里直接拉取即可 —— 部署机不需要 Node/Python 工具链。
+# 兼容新旧两代 Docker：`docker compose`（v2 插件）与 `docker-compose`（v1 / 独立安装）都用这份文件。
+
+services:
+  papershelf:
+    # 想用自己改的源码构建：注释掉 image、放开下面两行
+    image: ghcr.io/argszero/papershelf:latest
+    # build: .
+    # image: papershelf:dev
+    container_name: papershelf
+    restart: unless-stopped
+
+    # 首次启动的具体步骤见 docs/install.md（含反代与备份）
+    env_file:
+      - .env
+    environment:
+      # 容器内固定：数据落卷、监听 0.0.0.0
+      PAPERSHELF_DATA_DIR: /data
+      PAPERSHELF_HEALTHCHECK_PORT: "8000"
+    ports:
+      - "8000:8000"
+    volumes:
+      # SQLite + 原始 PDF + 抽出的图片；**唯一的持久化状态**
+      - papershelf-data:/data
+
+    healthcheck:
+      test: ["CMD", "healthcheck.py"]
+      interval: 30s
+      timeout: 5s
+      start_period: 10s
+      retries: 3
+
+    # 转换（fitz 解析 + LLM 调用）是内存与 CPU 的短期尖峰；
+    # 不设 hard limit，避免在弱机器上把转换直接 OOM 掉，只声明"预期用量"。
+    deploy:
+      resources:
+        reservations:
+          memory: 256M
+
+volumes:
+  papershelf-data:
