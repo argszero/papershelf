@@ -640,11 +640,6 @@ export function ReaderPage() {
   }
 
   const title = paper?.title || String(meta.title_zh || meta.title_en || `文献 #${pid}`)
-  const sub = [
-    meta.title_en && meta.title_zh ? String(meta.title_en) : null,
-    paper?.venue, paper?.year,
-    `${stats.total} 块 · ${stats.figs} 图 · ${stats.marks} 处标注`,
-  ].filter(Boolean).join(' · ')
 
   return (
     <>
@@ -653,23 +648,11 @@ export function ReaderPage() {
         <div className="reader-toolbar">
           <button className="icon-btn" aria-label="返回文献库" title="返回文献库"
                   onClick={() => nav(link('/library'))}><IconBack /></button>
+          {/* 工具栏只留标题一行（副标题与四支笔都撤了，保持简洁）：
+              论文信息在正文首屏 `doc-head` + 右栏大纲里有，选笔只在浮条里（㉛）。 */}
           <div className="rt-title" style={{ flex: 1 }}>
             <div className="rt-t" title={title}>{clip(title, 44)}</div>
-            <div className="rt-s">{sub}</div>
           </div>
-
-          {/* 当前那支笔（㉛）：先选笔再划，或者划完在浮条上选 —— 两条路都通。
-              只读分享态不渲染（⑪：写入口一律不出现）。 */}
-          {!readonly && (
-            <div className="pen-row" role="group" aria-label="画笔颜色">
-              {HL_COLORS.map((c) => (
-                <button key={c} className={`pen pen-${c}${pen === c ? ' is-on' : ''}`}
-                        aria-label={`${HL_LABEL[c]}笔`} aria-pressed={pen === c}
-                        title={`${HL_LABEL[c]}（点选后直接划）`}
-                        onClick={() => setPen(c)} />
-              ))}
-            </div>
-          )}
 
           <div className="seg" role="group" aria-label="对照模式">
             {([['dual', '中英对照'], ['zh', '仅中文'], ['en', '仅原文']] as Array<[Mode, string]>).map(([k, l]) => (

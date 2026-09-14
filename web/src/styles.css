@@ -411,7 +411,6 @@ select.input { width: auto; }
 .reader-toolbar .rt-title { min-width: 0; }
 .reader-toolbar .rt-title .rt-t { font-weight: 570; font-size: 14px; white-space: nowrap;
   overflow: hidden; text-overflow: ellipsis; max-width: 340px; }
-.reader-toolbar .rt-title .rt-s { font-family: var(--font-mono); font-size: 11px; color: var(--muted); }
 .icon-btn {
   width: 34px; height: 34px; border: 1px solid var(--border); background: var(--surface);
   border-radius: var(--radius); display: grid; place-items: center; color: var(--muted); flex: none;
@@ -513,9 +512,8 @@ select.input { width: auto; }
   100% { background: transparent; } }
 .hl.is-flash, .blk-p.is-flash { animation: hlFlash 1.3s ease; }
 
-/* 色板圆点：工具栏里的"当前那支笔"与浮条里的选笔共用（两处必须是同一颗圆点，
-   否则"我选的是哪支"这件事会出现两套视觉语言）。 */
-.pen-row { display: inline-flex; align-items: center; gap: 6px; margin-right: 4px; }
+/* 色板圆点：浮条（选中文字 / 点已有划痕）里的选笔。工具栏上不再常驻一排笔
+   （2026-09-14 宿主：保持工具栏简洁，选笔在浮条里就够了）。 */
 .pen { width: 18px; height: 18px; padding: 0; border-radius: 50%; cursor: pointer;
   border: 1px solid color-mix(in oklch, var(--fg) 18%, transparent); flex: none; }
 .pen-amber { background: oklch(80% 0.15 85); }
