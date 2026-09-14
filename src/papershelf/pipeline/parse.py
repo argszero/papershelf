@@ -25,12 +25,28 @@ from .model import Doc, make_block_id
 # 缓存。于是「解析器改了（本次：每个块新增 `payload.page`），旧库却仍读旧解析产物」——
 # 分页容器永远不出现，而代码看上去完全正确。把版本号混进 fingerprint，
 # 解析语义一变即自动失效重建（代价是那次重跑要重做 LaTeX 化与翻译）。
-PARSE_VERSION = 2
+#
+# v3（2026-09-14）：阅读顺序从「整页二选一（单栏/双栏）」改为**分区**处理
+# （通栏段 + 窄块段 + 栏间空白剖面），修掉**混合版式**下两栏逐行交错
+# （生产 paper 12 首页正文首句错位即此例）。
+PARSE_VERSION = 3
 
 # 页面上下边缘（比例），落在其中的短文本块视为页眉/页脚候选
 EDGE_TOP, EDGE_BOTTOM = 0.075, 0.925
 MIN_REPEAT_RATIO = 0.3   # 跨页重复比例超过此值 → 判为页眉/页脚
 CAPTION_PREFIXES = ("fig", "figure", "table", "tab.", "表", "图")
+
+# ── 阅读顺序（分区 + 栏间空白）──────────────────────────────────────────────
+# 跨栏块判定：宽度超过「页面宽度 × 该比例」的块视为通栏（标题、摘要、大表、跨栏图）。
+_SPAN_RATIO = 0.62
+# 找 gutter（栏间空白）只在页面中央这段找 —— 栏间空白必在中间，不必全页扫。
+_GUTTER_CENTER = (0.35, 0.65)
+# 找 gutter 只看正文带：页眉/页脚/页码常落在栏间，会把 gutter 打钉子。
+_GUTTER_EDGE_TOP, _GUTTER_EDGE_BOTTOM = 0.09, 0.91
+# 允许横跨 gutter 的块占比上限（公式溢出、跨栏小图）；超过就认为"这不是双栏"。
+_MAX_BRIDGE_RATIO = 0.06
+# 分栏后每栏至少这么多块，否则不分（防止把单栏页的缩进项切坏）。
+_MIN_COL_BLOCKS = 2
 
 # 章节编号模式（IEEE/学术常见）：顶层「I. / II.」，次级「A. / B.」，深层「1.1 / 2.3.1」
 _RE_H2 = re.compile(r"^([IVX]{1,6})\.\s+\S")
@@ -76,26 +92,85 @@ def _is_bold(block: dict[str, Any]) -> bool:
     return bool(fonts) and all(("Bold" in f) or ("black" in f.lower()) for f in fonts)
 
 
-def _two_column(blocks: list[dict[str, Any]], width: float) -> bool:
-    """启发式判断双栏：左右两侧各有足够多的窄块。"""
-    left = sum(1 for b in blocks if b["bbox"][2] <= width * 0.58)
-    right = sum(1 for b in blocks if b["bbox"][0] >= width * 0.42)
-    return left >= 4 and right >= 4
+def _by_y(blocks: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return sorted(blocks, key=lambda b: (round(b["bbox"][1], 1), b["bbox"][0]))
+
+
+def _columns(blocks: list[dict[str, Any]], width: float, height: float
+             ) -> list[list[dict[str, Any]]] | None:
+    """把 blocks 按「栏间空白(gutter)」切成若干栏；切不出来返回 None。
+
+    找 gutter 用**覆盖度剖面**，不是「相邻块间隙 ≥ N」那种邻接扫描 ——
+    后者会被**溢出栏间的公式碎片**骗过：B5-01 第 7 页右栏从 x=300.9 起、
+    而左栏一道公式的 `≤ 0` 一直伸到 299.2，真正的空白只剩 1.7pt，
+    任何像样的间隙阈值都扫不出来（实测：那页 55 个块被当成"一栏"）。
+    剖面则处处成立：真栏内任意 x 都被大量块横跨，只有 gutter 接近 0。
+    """
+    # 只统计**正文带**里的块：页眉/页脚/页码常常正落在两栏之间的空白里，
+    # 拿它们算剖面等于给 gutter 打钉子（B2-03 第 24 页的页码 "186" 就卡在栏间）。
+    body = [b for b in blocks
+            if b["bbox"][3] > height * _GUTTER_EDGE_TOP and b["bbox"][1] < height * _GUTTER_EDGE_BOTTOM]
+    if len(body) < 2 * _MIN_COL_BLOCKS:
+        return None
+
+    lo, hi = width * _GUTTER_CENTER[0], width * _GUTTER_CENTER[1]
+    best_x, best_cov = None, None
+    x = lo
+    while x <= hi:
+        cov = sum(1 for b in body if b["bbox"][0] < x < b["bbox"][2])
+        if best_cov is None or cov < best_cov:
+            best_x, best_cov = x, cov
+        x += 0.5
+    if best_x is None:
+        return None
+    # 允许极少数块横跨（公式溢出/跨栏小图），但不许"半个正文都横跨"
+    if best_cov > max(1, int(len(body) * _MAX_BRIDGE_RATIO)):
+        return None
+
+    cols: list[list[dict[str, Any]]] = [[], []]
+    for b in blocks:
+        cx = (b["bbox"][0] + b["bbox"][2]) / 2
+        cols[0 if cx < best_x else 1].append(b)
+    if len(cols[0]) < _MIN_COL_BLOCKS or len(cols[1]) < _MIN_COL_BLOCKS:
+        return None
+    return [_by_y(c) for c in cols]
 
 
 def _reading_order(
-    blocks: list[dict[str, Any]], width: float, two_col: bool
+    blocks: list[dict[str, Any]], width: float, height: float
 ) -> list[dict[str, Any]]:
-    """按阅读顺序排序：单栏按 y；双栏按「左栏(自顶向下) → 右栏(自顶向下)」。"""
-    if not two_col:
-        return sorted(blocks, key=lambda b: (round(b["bbox"][1], 1), b["bbox"][0]))
-    mid = width / 2
-    left = sorted(
-        [b for b in blocks if b["bbox"][0] < mid and b["bbox"][2] <= width * 0.62],
-        key=lambda b: b["bbox"][1],
-    )
-    right = sorted([b for b in blocks if b not in left], key=lambda b: b["bbox"][1])
-    return left + right
+    """按阅读顺序排序：**分区**处理 —— 通栏块自成一段，窄块段内再分栏。
+
+    旧实现只有「整页单栏」和「整页双栏」两种模式，且双栏与否靠 `_two_column`
+    （左右各 ≥4 个窄块）整页猜一次。**混合版式猜错就静默按 y 排 → 两栏逐行交错**
+    （生产 paper 12 首页即此例，见 `PARSE_VERSION` 注释）。
+
+    这里按 y 把块切成「通栏段 / 窄块段」，各自处理：
+    通栏段按 y 排；窄块段尝试分栏（成功则左栏整栏 → 右栏整栏，失败退回按 y）。
+    混合版式下封面信息（通栏）因此落在其下的双栏正文之前，不会再错位。
+    """
+    if not blocks:
+        return []
+    runs: list[tuple[str, list[dict[str, Any]]]] = []
+    for b in _by_y(blocks):
+        cls = "full" if (b["bbox"][2] - b["bbox"][0]) > width * _SPAN_RATIO else "col"
+        if runs and runs[-1][0] == cls:
+            runs[-1][1].append(b)
+        else:
+            runs.append((cls, [b]))
+
+    out: list[dict[str, Any]] = []
+    for cls, group in runs:
+        if cls == "full":
+            out.extend(_by_y(group))
+            continue
+        cols = _columns(group, width, height)
+        if cols:
+            for col in cols:
+                out.extend(col)
+        else:
+            out.extend(_by_y(group))
+    return out
 
 
 def _running_headers(pages: list[list[dict[str, Any]]], heights: list[float]) -> set[str]:
@@ -459,8 +534,7 @@ def parse_pdf(
         #    跨页合并时页码会略有偏差（同一段公式被 PDF 拆到两页的极少数情形）。
         add = _paged_adder(doc, page_no)
 
-        two_col = _two_column(text_blocks, width)
-        ordered = _reading_order(text_blocks + image_blocks, width, two_col)
+        ordered = _reading_order(text_blocks + image_blocks, width, heights[page_no - 1])
         captions, caption_blocks = _pair_captions_by_geometry(image_blocks, text_blocks)
 
         for b in ordered:
