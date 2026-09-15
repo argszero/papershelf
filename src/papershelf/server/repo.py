@@ -193,10 +193,33 @@ def update_block(conn: sqlite3.Connection, paper_id: int, block_id: str, *,
     return True
 
 
+_NOTE_ORDER = """
+SELECT n.* FROM notes n
+LEFT JOIN blocks b ON b.id = n.block_id AND b.paper_id = n.paper_id
+WHERE n.paper_id = ?
+ORDER BY
+    -- ① 有落点的在前、无落点的（文献级笔记）在后：笔记列表是**顺着原文读**的，
+    --    不按写入时间来（宿主 2026-09-15：「应该按照笔记关联的原文的位置为顺序」）。
+    CASE WHEN n.block_id IS NULL OR b.ord IS NULL THEN 1 ELSE 0 END,
+    -- ② 落点跟着文档顺序（`blocks.ord` 就是阅读顺序，㉜ 分栏感知已把它排好）。
+    --    `b.ord IS NULL` 的兜底：块在重新解析后消失了，别让它插到最前面。
+    COALESCE(b.ord, 0),
+    -- ③ 同一段里：整段笔记在前，然后是划住某几个字的（`start` 非空）。
+    CASE WHEN n.start IS NULL THEN 0 ELSE 1 END,
+    -- ④ 再按字符位置；位置相同（两栏各有笔记）时原文列在前 —— 与并排阅读的视觉顺序一致。
+    COALESCE(n.start, 0),
+    CASE n.lang WHEN 'en' THEN 0 WHEN 'zh' THEN 1 ELSE 2 END,
+    n.id
+"""
+
+
 def list_notes(conn: sqlite3.Connection, paper_id: int) -> list[dict[str, Any]]:
-    return rows_to_list(conn.execute(
-        "SELECT * FROM notes WHERE paper_id=? ORDER BY created_at DESC", (paper_id,)
-    ).fetchall())
+    """该文献的全部笔记，**按锚点在原文里的位置排序**（不是按写入时间）。
+
+    排序键见 `_NOTE_ORDER` 的注释；最后一级 `n.id` 只为让顺序**确定**（同样位置的
+    两条笔记不该因为查询计划不同而换位）。
+    """
+    return rows_to_list(conn.execute(_NOTE_ORDER, (paper_id,)).fetchall())
 
 
 def marks_by_block(rows: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:

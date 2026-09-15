@@ -785,7 +785,13 @@ export function ReaderPage() {
                               target?.segs[0]?.end, paraIndex)}
                             quote={target?.segs[0]?.quote ?? ''}
                             onAdded={(n) => {
-                              setNotes((ns) => [n, ...ns])
+                              // ⚠️ **不能 `[n, ...ns]`**：列表的顺序是「锚点在原文里的位置」
+                              // （服务端 `_NOTE_ORDER`），新写的笔记落点可能在文档中间甚至最前。
+                              // 位置只有服务端算得对（它才有 `blocks.ord`），所以重拉一次列表，
+                              // 前端不自己插 —— 两份排序实现必然分叉。
+                              void (share ? share.loadNotes(pid) : api.notes(pid))
+                                .then(setNotes)
+                                .catch(() => setNotes((ns) => [...ns, n]))  // 拉不到也别把笔记藏起来
                               // 服务端给这段选区**顺手补了一道划痕** → 块得重拉一次才看得见
                               // （`<mark>` 是服务端渲染进 `en_html`/`zh_html` 的，㉛ 的不变量）
                               if (n.hl_id != null && !markById.has(n.hl_id)) {

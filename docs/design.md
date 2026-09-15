@@ -252,6 +252,8 @@ POST   /api/docs/{paper_id}/blocks/{block_id}/retranslate  # ⑯ 重译此块
 GET    /api/papers/{id}/export?lang=zh|en|dual # 合成单文件 HTML（⑳）
 
 # 笔记
+#   GET 的顺序 = **锚点在原文里的位置**（不是写入时间）：blocks.ord → 整段在前 → 字符位置 → 原文列在前
+#   无落点的（文献级笔记）排最后 —— 列表是顺着原文读的（宿主 2026-09-15）
 GET/POST        /api/papers/{id}/notes        # POST body 含 {content, block_id?, lang?, start?, end?, hl_id?, quote?}
 PATCH/DELETE    /api/notes/{id}
 
