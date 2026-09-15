@@ -121,7 +121,8 @@ def _fit_images(messages: list[dict], budget: int = MAX_BODY_BYTES) -> int:
 
 
 # ── 思考预算（**成本的真正大头**）────────────────────────────────────────
-# 2026-09-14 实测（同一条校对请求，池子里的视觉模型 `deepseek-v4-flash-vision-exp`）：
+# 2026-09-14 实测（同一条校对请求，池子里的视觉模型 `deepseek-v4-flash-vision-exp`；
+# ⚠️ 该名 2026-09-15 已改叫 `deepseek-flash`，旧名仍作别名可用、指向同一后端）：
 #   基线 max_tokens=32000      completion=2001 tokens / 思考 6819 字符 / 10.0s
 #   max_tokens=1500            completion=1179 tokens / 8.6s（压 max_tokens 只能压一点）
 #   reasoning_effort="low"     completion=1179 tokens

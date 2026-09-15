@@ -26,12 +26,12 @@ ssh argszero        # 目录只有 .env / docker-compose.yml / data/ + .env.bak.
 | `PAPERSHELF_ADMIN_PASSWORD` | 宿主给（`ensure_admin` 每次启动重置该邮箱口令 → 必须写进 `.env`） |
 | `PAPERSHELF_LLM_BASE_URL` | `https://aitokenpool.args.fun/v1` |
 | `PAPERSHELF_LLM_API_KEY` | `atk_live_…445` |
-| `PAPERSHELF_LLM_MODEL` | `deepseek-v4-flash-vision-exp` |
+| `PAPERSHELF_LLM_MODEL` | `deepseek-flash`（2026-09-15 改；旧名 `deepseek-v4-flash-vision-exp` 已成别名） |
 | `PAPERSHELF_SMTP_HOST` | `smtp.gmail.com` |
 | `PAPERSHELF_SMTP_PORT` | `465`（走 `SMTP_SSL` 分支） |
 | `PAPERSHELF_SMTP_USER` / `_PASS` / `_FROM` | `4tempuse@gmail.com` / Gmail app password / 同邮箱 |
 | `PAPERSHELF_SMTP_TLS` | `true` |
-| `PAPERSHELF_EMAIL_DOMAIN_ALLOWLIST` | `edu.cn`（未改） |
+| `PAPERSHELF_EMAIL_DOMAIN_ALLOWLIST` | `edu.cn,ac.cn`（2026-09-15 加 `.ac.cn`） |
 
 **镜像**：`ghcr.io/argszero/papershelf:latest` = `sha-1de2277`，含 **M5 + 分页 + 验证码认证 + 发信重试**
 （前端 bundle `index-U1cJuCKf.js` / CSS `index-BSRYqHhl.css`）。
