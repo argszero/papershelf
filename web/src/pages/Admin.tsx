@@ -81,7 +81,7 @@ export function AdminPage() {
 
   return (
     <>
-      <TopBar title="用户管理" sub={`${counts.all} 个账号 · 开放注册限 .edu.cn，白名单走环境变量`} />
+      <TopBar title="用户管理" sub={`${counts.all} 个账号 · 开放注册限白名单域名，白名单走环境变量`} />
       <div className="view-scroll">
         <div className="view">
           <section className="grid g-4" style={{ marginBottom: 16 }}>

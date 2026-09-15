@@ -105,7 +105,11 @@ class Settings:
     log_access: bool = field(default_factory=lambda: _bool("PAPERSHELF_LOG_ACCESS", True))
 
     # ── 注册与邮箱（决策⑭⑮）──
-    email_allowlist: str = field(default_factory=lambda: os.environ.get("PAPERSHELF_EMAIL_DOMAIN_ALLOWLIST", "edu.cn"))
+    # 逗号分隔的**后缀**白名单，含子域（`stu.pku.edu.cn` 命中 `edu.cn`）。
+    # 默认 `.edu.cn`（高校）+ `.ac.cn`（科研院所，如 `cas.ac.cn`）—— 2026-09-15 宿主指示。
+    email_allowlist: str = field(
+        default_factory=lambda: os.environ.get("PAPERSHELF_EMAIL_DOMAIN_ALLOWLIST", "edu.cn,ac.cn")
+    )
     smtp_host: str = field(default_factory=lambda: os.environ.get("PAPERSHELF_SMTP_HOST", ""))
     smtp_port: int = field(default_factory=lambda: _int("PAPERSHELF_SMTP_PORT", 587))
     smtp_user: str = field(default_factory=lambda: os.environ.get("PAPERSHELF_SMTP_USER", ""))

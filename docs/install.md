@@ -68,7 +68,7 @@ docker run -d --name papershelf --restart unless-stopped \
 | `PAPERSHELF_LLM_BASE_URL` / `_API_KEY` / `_MODEL` | LLM（OpenAI 兼容协议） | 空 |
 | `PAPERSHELF_MAX_CONCURRENCY` | 同时转换的文献数 | `2` |
 | `PAPERSHELF_TOKEN_BUDGET` / `_MAX_ATTEMPTS` | 单篇 token 预算 / 最大尝试次数 | `400000` / `3` |
-| `PAPERSHELF_EMAIL_DOMAIN_ALLOWLIST` | 注册白名单（逗号分隔，含子域） | `edu.cn` |
+| `PAPERSHELF_EMAIL_DOMAIN_ALLOWLIST` | 注册白名单（逗号分隔的**域名后缀**，含子域） | `edu.cn,ac.cn` |
 | `PAPERSHELF_SMTP_HOST` + `_FROM`（+`_PORT/_USER/_PASS/_TLS`） | **配全 → 开放自助注册（邮件激活）；未配 → 自动关闭注册，改由管理员开号** | 空 |
 | `PAPERSHELF_SHARE_HOURS` | 分享默认有效期（小时，**硬上限 24**，填更大也只按 24 算） | `24` |
 

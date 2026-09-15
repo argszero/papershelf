@@ -11,6 +11,7 @@ import re
 import pytest
 
 from papershelf.pipeline.model import Block, Doc
+from papershelf.server.security import email_allowed
 
 PNG = base64.b64decode(
     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8DwHwAFAAH/q842iQAAAABJRU5ErkJggg=="
@@ -63,15 +64,44 @@ def test_registration_closed_without_smtp(client):
 
 
 def test_registration_requires_edu_cn(client, monkeypatch):
-    """⑭：白名单限 .edu.cn。"""
+    """⑭：白名单限 `.edu.cn`（默认还含 `.ac.cn`，见下一条）。"""
     monkeypatch.setenv("PAPERSHELF_SMTP_HOST", "smtp.example.com")
     monkeypatch.setenv("PAPERSHELF_SMTP_FROM", "noreply@example.com")
+    monkeypatch.delenv("PAPERSHELF_EMAIL_DOMAIN_ALLOWLIST", raising=False)
     from papershelf.server.config import get_settings
 
     get_settings(refresh=True)
     r = client.post("/api/auth/register/code", json={"email": "a@gmail.com"})
     assert r.status_code == 400
     assert "edu.cn" in r.json()["detail"]
+    assert "ac.cn" in r.json()["detail"], "提示语里也应带上 ac.cn（否则用户看不出还能用科研院所邮箱）"
+
+
+def test_registration_allowlist_default_includes_ac_cn(client, monkeypatch, sent_mails):
+    """⑯ 修订（2026-09-15 宿主）：白名单默认 = `.edu.cn` + `.ac.cn`（科研院所）。
+
+    两处容易写错，都用**真实形状**的邮箱钉住：
+    - **子域必须命中**：`stu.pku.edu.cn` / `cas.ac.cn`（后缀比对 `endswith("." + d)`）。
+    - **后缀比对不能退化成 `endswith(d)`**：`notedu.cn`、`evil-ac.cn` 看着"结尾像"，
+      实际是别的域名 —— 这类邮箱放进来等于白名单失效。
+    """
+    _enable_smtp(monkeypatch)
+    monkeypatch.delenv("PAPERSHELF_EMAIL_DOMAIN_ALLOWLIST", raising=False)
+    from papershelf.server.config import get_settings
+
+    settings = get_settings(refresh=True)
+    assert settings.allowed_domains == ["edu.cn", "ac.cn"]
+
+    for ok in ("a@tsinghua.edu.cn", "a@stu.pku.edu.cn", "a@cas.ac.cn", "a@imr.ac.cn", "a@AC.CN"):
+        assert email_allowed(ok, settings) is True, f"{ok} 应被白名单接受"
+    for bad in ("a@gmail.com", "a@notedu.cn", "a@evil-ac.cn", "a@edu.cn.evil.com", "a@x.edu"):
+        assert email_allowed(bad, settings) is False, f"{bad} 不该被白名单接受"
+
+    # 走到**真实路由**上再验一遍（`email_allowed` 是纯函数，但拦截发生在发码口）
+    assert client.post("/api/auth/register/code",
+                       json={"email": "a@cas.ac.cn"}).status_code == 200
+    assert client.post("/api/auth/register/code",
+                       json={"email": "a@gmail.com"}).status_code == 400
 
 
 def test_register_code_sends_mail(client, monkeypatch, sent_mails):
