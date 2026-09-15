@@ -99,6 +99,13 @@ CI 原生并行双架构推 GHCR + **真起容器冒烟**（4分51秒）；`docs
 **㊲ ①c 分块校对：栏间续段只标记**（`PARSE_VERSION` → 7；判据 = 几何 + 文字两条同时成立；
 agent 看页图后 `merge_block`；端到端实测合并真的落进产物、译文成一整段）
 全量离线回归 **324 passed**（新增 `test_last_read.py` 9 项 / `test_block_seams.py` 22 项）
+**㊱ + ㊲ 已上生产 ✅**（2026-09-15 22:3x，`0f24241`；CI 六 job 绿；bundle `index-BdNiDVTl.js`；healthy）：
+生产实测 `progress 13` → `待读 → 在读` + `status_at` 盖一次 + `last_read_at` 写入、看板 1/1、文献库那格
+「已生成 · 创建 09-15 · 最近阅读 今天」；生产两篇的块**都没有** `seam`（`PARSE_VERSION 7` 之前解析的），
+**未重新提取**（≈180 万 tokens，等宿主指示）。两条新教训：
+① **远端 `docker compose pull` 要挂着跑**（42MB 那层反复 Retrying ≈ 35–40 分钟；SSH 直接等会被 600s 切断、
+镜像拉不全，`docker images` 仍是旧的）；② **后台标签页里的「程序化滚动」不发 `scroll` 事件**
+（`Input.dispatchMouseEvent` 也 IPC 超时）→ 看着像功能坏了；判据 = 自挂 scroll 监听器先看事件来没来。
 
 **下一步待宿主指示**：图表 VLM／用量面板／跨计划检索／生产数据集导入
 
@@ -109,4 +116,4 @@ agent 看页图后 `merge_block`；端到端实测合并真的落进产物、译
 **明确推后**：4 术语表归属（v1 计划级）· 5 成本护栏数值 · 6 用量面板（已攒 `tokens_used`，v2）·
 9 图表 VLM（v2）· 14 标签词表（v1 自由标签）
 
-_Last updated: 2026-09-15T20:40:00+08:00_
+_Last updated: 2026-09-15T23:10:00+08:00_

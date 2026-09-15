@@ -1533,6 +1533,41 @@ b-0239 (右栏首) the above sections does not talk…  ← 小写起（真正�
 
 标记是新解析产物的一部分（`PARSE_VERSION` 7）→ 只有**重新提取**才会生效；
 生产 paper 1 走「重新提取」= 全部作废、从零重跑（¥ ≈ 180 万 tokens，译文重译、批注重划）。
+**生产实测（2026-09-15 22:4x）：库里两篇的 `blocks.payload` 都**没有** `seam`（0/498、0/909）
+—— 都是 `PARSE_VERSION 7` 之前解析的，与上一条一致。宿主未指示重新提取，**没动**。
+
+---
+
+## 上线记录（2026-09-15 22:09 宿主「上」）
+
+`0f24241`（㊱ + ㊲ + 记忆 + `.gitignore` `.dev.log`）→ CI 六 job 全绿 →
+生产 `docker compose pull app && up -d app`：`revision=0f24241…` / **healthy** / 公网 health 200 /
+bundle **`index-BdNiDVTl.js`**（与本地构建指纹一致）/ 容器日志零 error / 启动即「转换队列已启动」。
+DB 与 `.env` 部署前均已备份（`papershelf.db.bak.20260915-220958`、`.env.bak.20260915-113706.model`）。
+
+### ⚠️ 教训：**生产 `docker compose pull` 必须挂着跑、不要让 SSH 等它**
+
+这次那 42MB 的层在部署机上**反复 `Retrying`**，实测约 **35–40 分钟**才拉完；
+第一次 `ssh ... docker compose pull app` 在 **600s** 被 SSH 超时切断（**镜像没拉全**，
+`docker images` 仍显示 10 小时前的那个）→ 改成
+`(nohup docker compose pull app > /tmp/ps-pull.log 2>&1 &)` + 轮询 `ps`/`tail` 才成功。
+
+### ⚠️ 教训：**后台标签页里「程序化滚动」不算数**（本轮生产验收踩的）
+
+`new_tab()` 开的标签是**后台**的（harness 有意不改可见标签）→ 在那里面
+`el.scrollTop = N` 写进去了（读得回 34400）但**一个 `scroll` 事件都不发**
+（我自己挂的监听器收到 `[]`），`Input.dispatchMouseEvent` 也**直接 IPC 超时 45s**。
+⇒ 表现与「功能坏了」完全一样（无 PATCH、`progress` 仍是 0），但其实是**渲染被节流**。
+判据：**自己挂一个 scroll 监听器先看事件有没有来**——事件为 0 就是环境问题，不是代码问题。
+生产验收改用**同一条真实请求路径**：从 `Network.getAllCookies` 取 `papershelf_session`
+→ `curl -X PATCH /api/papers/2 {"progress":13}` → 查库 + 硬刷文献库读 UI。
+**诚实边界**：这验的是**服务端逻辑 + 前端渲染**，滚动→上报那一段的**真实用户输入**只在本地验过。
+
+生产实测结果（宿主数据）：`progress 13` → `待读 → 在读`、`status_at` 盖 `14:35:41`、
+`last_read_at` 同时写入；再报 `progress 30` → **`status_at` 不盖第二次**、`last_read_at` 前进到 `14:35:54`；
+看板 `待读 1 / 在读 1`；文献库那格 `已生成 · 创建 09-15 · 最近阅读 今天`。
+**验收痕迹已复原**（paper 2 回到 `unread / progress 0 / last_read_at NULL / 原 updated_at`，
+我开的那个标签已关，`papershelf_session` 拷出后即 rm）。
 
 ---
 

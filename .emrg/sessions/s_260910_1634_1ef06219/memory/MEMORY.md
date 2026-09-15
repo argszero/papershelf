@@ -240,4 +240,19 @@ DOM 是历史遗留、API 已 401；拿它当验收对象会得出完全错误�
   `parse`，懒加载的 `proofread` 报假的 `ImportError`）—— 这不是代码缺陷。
 - 全量离线回归 **324 passed**；本地验收残留（paper 4/5/6/7「seam-probe」+ 合成 PDF）已清干净。
 
-_Last updated: 2026-09-15T20:40:00+08:00_
+### 同一轮：**已上生产**（2026-09-15 22:3x，宿主「上」）
+
+`0f24241` → CI 六 job 全绿 → `docker compose pull app && up -d app`：
+`revision=0f24241…` / healthy / 公网 health 200 / bundle `index-BdNiDVTl.js` / 日志零 error。
+DB 与 `.env` 部署前已备份。生产实测（宿主数据 paper 2）：`progress 13` → `待读 → 在读` +
+`status_at` 只盖一次 + `last_read_at` 写入，看板 1/1，文献库那格「已生成 · 创建 09-15 · 最近阅读 今天」；
+**痕迹已复原**（paper 2 回到 unread/0/NULL）。
+生产两篇的块**都没有** `seam` 标记（`PARSE_VERSION 7` 之前解析的）→ 要变好只能「重新提取」（≈180 万 tokens），**未动**。
+**两条新教训**：① 远端 `docker compose pull` 的 42MB 层反复 Retrying ≈ 35–40 分钟，
+`ssh` 直接等会被 600s 切断且**镜像没拉全**（`docker images` 仍是旧的）→ 必须 `nohup ... &` + 轮询；
+② **后台标签页里程序化 `scrollTop` 不发 `scroll` 事件**、`Input.dispatchMouseEvent` IPC 超时 →
+看着像功能坏了；判据 = 自挂一个 scroll 监听器先看事件来没来（事件 0 = 环境问题）。
+生产验收改用「取 `papershelf_session` cookie → curl PATCH → 查库 + 硬刷 UI」，
+**诚实边界**：那验的是服务端逻辑 + 前端渲染，真实滚轮那一段只在本地验过。
+
+_Last updated: 2026-09-15T23:10:00+08:00_
