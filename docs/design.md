@@ -727,9 +727,9 @@ services:
 | 2 | 前端框架 | ✅ **已落地**：React + TypeScript + Vite，`react-router-dom` 路由。**刻意不引** axios / react-query / 状态库 —— 端点只有十来个，多一层库只会把"错误怎么呈现"藏起来（决策⑨）；错误一律 `ApiError(status, detail)` 原样上屏 |
 | 3 | 任务队列 | ✅ **v1 已落地，2026-09-12 改为常驻队列**：进程内 `ConversionQueue`（常驻线程）+ DB 轮询 + 启动恢复（`doing→queued`）+ 原子认领。⚠️ 仍**只起单 worker**（见 §7），加 `-w` 会变成多份互不知情的队列 —— 要横向扩得先换队列实现 |
 | 4 | 术语表归属 | **计划级**（与 ⑦ 一致）；提示：同一概念跨计划需各配一次 |
-| 5 | 成本护栏 | 并发=2；单篇预算（如 200k token）；`conv_attempts` ≤3；超限置 failed 待人工重试 |
+| 5 | 成本护栏 | 并发=2；单篇预算（如 200k token）；`conv_attempts` ≤3；超限置 failed 待人工重试。⚠️ **2026-09-15 才真正生效**：计数原先写在 `_set_state(..., "doing")` 里，而 `doing` 的转换由 `claim_paper` 做 → 那条分支从未被走到，**计数恒为 0**（护栏空转、日志「第 N 次尝试」永远显示 1）。现改为**认领即计数**（`claim_paper` 里 `+1`），且**人工入口归零**（`/convert` 重试、`/reextract`）—— 护栏防的是"自动重试烧钱"，不是防用户，否则"超限待人工重试"这句是空话 |
 | 6 | 用量可见性 | v1 不做（㉑）；在 `docs`/`papers` 记录 `tokens_used` 字段**先攒数据**，v2 出面板 |
-| 7 | 翻译去重 | ✅ **已落地**：`doc_cache(fingerprint = sha256(pdf) + PARSE_VERSION)` 复用**解析+LaTeX 化**结果，翻译仍按需重放。⚠️ 指纹里必须带 `PARSE_VERSION`：否则改了**解析产物形状**（例如给块加 `payload.page`）而 PDF 没变时会永远命中旧产物（2026-09-11 踩过） |
+| 7 | 翻译去重 | ✅ **已落地**：`doc_cache(fingerprint = sha256(pdf) + PARSE_VERSION)` 复用**解析+LaTeX 化**结果（①c 校对结果也在里面），翻译仍按需重放。⚠️ 指纹里必须带 `PARSE_VERSION`：否则改了**解析产物形状**（例如给块加 `payload.page`）而 PDF 没变时会永远命中旧产物（2026-09-11 踩过）。⚠️ 指纹**原本没有单篇失效出口**（唯一手段是改代码里的 `PARSE_VERSION` = 全库一起失效）→ 2026-09-15 补 **`POST /api/papers/{id}/reextract`**（文献库「重新提取」按钮）：删这一篇的缓存行 + 作废它的笔记/划痕 + 重新排队；语义是**全部作废、从零重跑**（宿主选 A） |
 | 8 | 公式渲染 | ✅ **已落地，且改为更省的路子**：**服务端 LaTeX → MathML**（`latex2mathml`，纯 Python）。理由见下 |
 | 9 | 图表说明 | v2；届时独立决策 VLM 选型与幻觉护栏 |
 | 10 | 版权警示 | ✅ 已落地且**位置已调整**（2026-09-11）：README 不再提（与开源项目本身无关）；改由**注册用户协议**约束（服务端强校验 + `users.consent_version/consent_at` 留档），运维事项写在 `docs/install.md` §9 |

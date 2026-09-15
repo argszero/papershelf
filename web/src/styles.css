@@ -369,6 +369,9 @@ select.input { width: auto; }
 /* 删除是破坏性动作，hover 时给 danger 色 —— 与「编辑」区分开，
    免得两个一模一样的胶囊按钮并排、点错代价却完全不同。 */
 .ptable .t-del:hover { color: var(--danger); border-color: var(--danger); }
+/* 「重新提取」是**中等破坏性**（作废笔记/划痕 + 花 token，但不丢这篇文献）：
+   hover 给 warn 色，三个并排的胶囊各自可辨（编辑=accent / 重新提取=warn / 删除=danger）。 */
+.ptable .t-re:hover { color: var(--warn); border-color: var(--warn); }
 .ptable .t-edit:disabled { opacity: .4; cursor: not-allowed; }
 /* 触屏没有 hover，永远看得见（否则该入口等于不存在） */
 @media (hover: none) { .ptable .t-edit { opacity: 1; } }

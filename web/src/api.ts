@@ -91,6 +91,10 @@ export const api = {
     request<Paper>(`/api/plans/${planId}/papers/arxiv`, json({ ref })),
   retryConvert: (id: number) =>
     request<{ ok: boolean; conv_state: string }>(`/api/papers/${id}/convert`, { method: 'POST' }),
+  // 重新提取：清解析缓存 + 作废笔记/划痕，从头再跑一遍管线（有 token 代价）
+  reextractPaper: (id: number) =>
+    request<{ ok: boolean; conv_state: string; cache_cleared: boolean }>(
+      `/api/papers/${id}/reextract`, { method: 'POST' }),
 
   // ── 阅读（块级 JSON 是唯一事实来源，决策⑳）──
   doc: (paperId: number) => request<PaperDoc>(`/api/papers/${paperId}/doc`),

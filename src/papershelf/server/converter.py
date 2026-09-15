@@ -49,10 +49,27 @@ def claim_paper(conn: sqlite3.Connection, paper_id: int) -> bool:
 
     `server/queue.py` 直接复用它 —— **互斥点只能有一份实现**，两处各写一遍必然漂移。
     没有它，同一篇会被跑两遍：双倍 token，且两份产物互相覆盖。
+
+    ## 认领即计数（`conv_attempts + 1`）—— 2026-09-15 修
+
+    原先计数写在 `_set_state(..., "doing")` 里，而 `doing` 的转换**是由本函数做的**
+    （`_set_state` 只会被 `failed` 调用）→ 那条 `1 if state == "doing" else 0` 的分支
+    **从来没被走到**。实测后果（宿主机上跑一条转换即可复现）：
+
+    - `papers.conv_attempts` **恒为 0**，`max_conv_attempts`（默认 3）这道成本护栏
+      **从未生效** —— 一篇必然失败（例如 LLM 欠费 402）的文献可以被人无限次重跑；
+    - 每篇日志都写「第 1 次尝试」，**在撒谎** —— 排障时会得出"它只试过一次"的错误结论。
+
+    计数语义 = **"这篇开始跑第几次了"**，所以它应该落在"开始"那一步，也就是认领。
+    检查仍在 `convert_paper` 开头（先看 `>= max` 再认领），因此第 `max+1` 次会被挡下。
+    人工主动入口（`/convert` 重试、`/reextract`）会把计数**归零** —— 护栏防的是
+    "自动重试烧钱"，不是防用户（`docs/design.md` 的原文即「超限置 failed 待人工重试」，
+    人工重试若不能重置计数，那句话就是空话）。
     """
     with tx(conn):
         cur = conn.execute(
-            "UPDATE papers SET conv_state='doing', updated_at=? WHERE id=? AND conv_state='queued'",
+            """UPDATE papers SET conv_state='doing', conv_attempts=conv_attempts+1,
+                      updated_at=? WHERE id=? AND conv_state='queued'""",
             (utcnow(), paper_id),
         )
     return cur.rowcount == 1
@@ -60,13 +77,13 @@ def claim_paper(conn: sqlite3.Connection, paper_id: int) -> bool:
 
 def _set_state(conn: sqlite3.Connection, paper_id: int, state: str,
                error: str | None = None, tokens: int = 0) -> None:
+    """只改状态与错误（**不再碰 `conv_attempts`** —— 它由 `claim_paper` 记，见其 docstring）。"""
     with tx(conn):
         conn.execute(
             """UPDATE papers SET conv_state=?, conv_error=?, updated_at=?,
-                      tokens_used = tokens_used + ?,
-                      conv_attempts = conv_attempts + ?
+                      tokens_used = tokens_used + ?
                WHERE id=?""",
-            (state, error, utcnow(), tokens, 1 if state == "doing" else 0, paper_id),
+            (state, error, utcnow(), tokens, paper_id),
         )
 
 

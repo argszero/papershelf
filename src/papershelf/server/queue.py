@@ -51,8 +51,9 @@ POLL_SECONDS = 3.0
 def recover_stuck(conn: sqlite3.Connection) -> int:
     """启动恢复：`doing` → `queued`（上一个进程死在中途的文献）。返回复位篇数。
 
-    ⚠️ 只改状态、不动 `conv_attempts`：那份工作在上一进程里**没有跑完**，
-    不该消耗重试额度（`convert_paper` 自己会在开始和结束各记一次 attempts）。
+    ⚠️ 这里**不动 `conv_attempts`**：本函数只是把状态放回队列，不制造新的尝试。
+    真正的尝试由 `claim_paper` 记（认领即 +1，2026-09-15 修）—— 所以"被重启杀掉的那篇"
+    会在**重新被认领时**计一次，而不是在这里计。恢复本身零成本。
     """
     from .db import tx, utcnow
 

@@ -29,6 +29,11 @@ const SORTS: Array<{ k: Sort; label: string }> = [
   { k: 'title', label: '标题' },
 ]
 
+/** 确认框里指代这篇文献的方式。`original` 是上传时的文件名占位（⑲），念出来毫无信息。 */
+function paperLabel(p: Paper): string {
+  return p.title && p.title !== 'original' ? `《${p.title}》` : `文献 #${p.id}`
+}
+
 export function LibraryPage() {
   const { plan, papers, loading, reload } = usePlan()
   const [params, setParams] = useSearchParams()
@@ -80,7 +85,7 @@ export function LibraryPage() {
   // 文案必须点名**连带消失的东西** —— 译文、笔记、分享里看到的内容都靠这篇，
   // 只说"删除文献？"会让人以为只是从列表里去掉。
   const remove = useCallback(async (p: Paper) => {
-    const name = p.title && p.title !== 'original' ? `《${p.title}》` : `文献 #${p.id}`
+    const name = paperLabel(p)
     if (!window.confirm(`删除${name}？其译文、笔记与该文献的图片都会一并删除，此操作不可撤销。`)) return
     setBusy(p.id)
     try {
@@ -88,6 +93,25 @@ export function LibraryPage() {
       await reload()
     } catch (e) {
       window.alert(e instanceof Error ? e.message : '删除失败')
+    } finally { setBusy(null) }
+  }, [reload])
+
+  // 重新提取（宿主 2026-09-15）：清掉这篇的解析缓存，从头再跑一遍管线。
+  // ⚠️ 与「重新转换」不是一回事：后者会命中解析缓存（指纹 = PDF hash + 解析版本号），
+  //    等于什么都没重来。这里连笔记与划痕一起作废 —— 新解析的块 id 与文本都会变，
+  //    旧批注留着只会挂到别的句子上。确认框必须点名**代价**（token + 不可撤销）。
+  const reextract = useCallback(async (p: Paper) => {
+    const name = paperLabel(p)
+    if (!window.confirm(
+      `重新提取${name}？\n\n` +
+      '将清空该篇的解析缓存，从 PDF 重新解析并重跑整篇原文校对（有 token 成本）；\n' +
+      '该篇的译文、笔记与划痕都会作废。此操作不可撤销。')) return
+    setBusy(p.id)
+    try {
+      await api.reextractPaper(p.id)
+      await reload()
+    } catch (e) {
+      window.alert(e instanceof Error ? e.message : '重新提取失败')
     } finally { setBusy(null) }
   }, [reload])
 
@@ -154,10 +178,18 @@ export function LibraryPage() {
                           {/* 删除同样只给写权限态。确认框在 handler 里，
                               不在这里（`stopPropagation` 是防止点删除时顺带进阅读器）。 */}
                           {!readonly && (
-                            <button className="t-edit t-del" title="删除这篇文献"
-                                    aria-label={`删除《${p.title || p.id}》`}
-                                    disabled={busy === p.id}
-                                    onClick={(e) => { e.stopPropagation(); void remove(p) }}>删除</button>
+                            <>
+                              {/* 重新提取：解析缓存**没有失效机制**（指纹 = PDF hash + 解析版本号），
+                                  单篇想"重来一遍"只有这条路。转换中禁用（后端也 409 兜底）。 */}
+                              <button className="t-edit t-re" title="清空解析缓存，从 PDF 重新解析（译文、笔记与划痕会作废）"
+                                      aria-label={`重新提取《${p.title || p.id}》`}
+                                      disabled={busy === p.id || p.conv_state === 'doing' || p.conv_state === 'queued'}
+                                      onClick={(e) => { e.stopPropagation(); void reextract(p) }}>重新提取</button>
+                              <button className="t-edit t-del" title="删除这篇文献"
+                                      aria-label={`删除《${p.title || p.id}》`}
+                                      disabled={busy === p.id}
+                                      onClick={(e) => { e.stopPropagation(); void remove(p) }}>删除</button>
+                            </>
                           )}
                         </div>
                         <div className="t-sub">{p.authors || '未提取到作者'}</div>

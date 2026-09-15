@@ -1391,6 +1391,7 @@ seed 成本回归 / 重试 / 部分进度 / 续跑 / 催办。
 | ㉛ | `pipeline/markup.py`（`prose_html` + `.o` 锚点）、`server/db.py`（`highlights` 重做 + sid→区间迁移）、`server/routers/highlights.py`、`server/routers/notes.py`（`ensure_highlight` 自动补划痕）、`web/src/marks.ts`、`web/src/pages/Reader.tsx` | 划痕 = 任意字符区间 + 四支不带含义的笔；浮条 / 就地菜单；区间笔记 + **写选区笔记自动高亮**；擦划痕只解绑笔记；**工具栏不常驻色板、`rt-s` 副标题已删（㉛ 修订二）** |
 | ㉜ | `pipeline/parse.py`（`_reading_order` 分区 + `_gutter` 覆盖度剖面；`PARSE_VERSION` → **5**）、`tests/test_parse_order.py` | 混合版式（通栏页眉 + 双栏正文）不再被一刀切成单栏 → 两栏逐行交错的"读得通但读不通"消失 |
 | ㉝ | `pipeline/proofread.py`（agent + 工具层 + 护栏）、`server/converter.py`（①c 接线 + `ok_pages` 续跑 + 计数累加）、`server/config.py`（`PAPERSHELF_PROOFREAD*`）、`tests/test_proofread.py` | 原文校对 = LLM agent（读页图 + 读/改抽取结果）；页级续跑；成本由 `PROOFREAD_THINKING` + seed 可疑清单 + 每页两轮护栏三条压住 |
+| ㉞ | `server/routers/papers.py`（`POST /papers/{id}/reextract`，`/convert` 也归零计数）、`server/converter.py`（`claim_paper` 认领即计数、`_set_state` 不再碰 `conv_attempts`）、`web/src/pages/Library.tsx` + `api.ts` + `styles.css`（`.t-re`）、`tests/test_reextract.py`（8 项） | **解析缓存必须有单篇失效出口**（宿主：「没有失效机制是不合理的」）：文献库「删除」旁边加「重新提取」→ 删这一篇的 `doc_cache` 行 + 作废它的笔记/划痕 + `conv_attempts` 归零 + 重新排队；**语义 = 全部作废、从零重跑**（宿主选 A）。顺带修掉**护栏空转**：`conv_attempts` 原本恒为 0 |
 
 ### 本轮实现中新定的小决策（未改 ①–㉓）
 

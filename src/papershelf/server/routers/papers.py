@@ -273,12 +273,72 @@ def retrigger(paper_id: int, background: BackgroundTasks,
     if paper["conv_state"] == "doing":
         raise HTTPException(status.HTTP_409_CONFLICT, "该文献正在转换中")
     with tx(conn):
-        conn.execute("UPDATE papers SET conv_state='queued', conv_error=NULL WHERE id=?", (paper_id,))
+        # `conv_attempts` 归零：**人工主动重试不该被自动护栏挡住**。
+        # `docs/design.md` 的原话是「超限置 failed **待人工重试**」—— 人工重试若不能重置
+        # 计数，这句话就是空话（用户点到第 4 次会永远得到"超过最大重试次数"）。
+        # ⚠️ 修 `claim_paper` 之前计数恒为 0，这条护栏从未生效（2026-09-15 一并修）。
+        conn.execute(
+            "UPDATE papers SET conv_state='queued', conv_error=NULL, conv_attempts=0 WHERE id=?",
+            (paper_id,),
+        )
     fingerprint = None
     if paper["pdf_path"] and Path(paper["pdf_path"]).exists():
         fingerprint = _pdf_fingerprint(Path(paper["pdf_path"]))
     background.add_task(convert_paper, paper_id, fingerprint)
     return {"ok": True, "conv_state": "queued"}
+
+
+@router.post("/papers/{paper_id}/reextract", status_code=202)
+def reextract(paper_id: int, background: BackgroundTasks,
+              conn: sqlite3.Connection = Depends(get_conn),
+              user: dict[str, Any] = Depends(current_user)) -> dict[str, Any]:
+    """**重新提取**（宿主 2026-09-15）：清掉解析缓存，从头再跑一遍管线。
+
+    ## 为什么必须有这个入口：`doc_cache` 原本**没有失效机制**
+
+    指纹 = `sha256("parse-v{PARSE_VERSION}" + PDF 字节)`，PDF 一字未改就**永远命中**；
+    唯一的失效手段是改代码里的 `PARSE_VERSION` —— 那是**全库一起失效**，代价是所有篇目
+    一起重做 LaTeX 化与翻译。于是「这一篇的解析/校对结果我不满意，重来一次」这类
+    **单篇诉求没有任何出口**（界面上的「重新转换」同样会命中缓存，等于什么都没重来）。
+
+    ## 语义 = **全部作废，从零重跑**（宿主选 A）
+
+    - `doc_cache` 行删除 → 重新解析、**全页重跑 ①c 校对**（`ok_pages` 就存在缓存里）、
+      公式重新 LaTeX 化、按需重译；
+    - `notes` / `highlights` **立即删除**：它们锚在 `(block_id, lang, start, end)` 上，
+      新解析出来的块 id 与文本都会变，留着只会指到别的字上 —— 那比"没了"更坏
+      （用户看到自己的批注挂在不相关的句子上）；
+    - 译文：新转换成功时由 `save_doc` 整篇覆盖；`zh_source='human'` 的人工修订只在
+      **同一次运行的翻译循环内**豁免，跨运行不保留 → 一并作废（决策⑯ 的既定例外）；
+    - `conv_attempts` 归零：这是用户主动发起的新一轮，不该被上一轮的失败次数挡住；
+    - 磁盘上的旧图片资产**不删**：新解析会按 `p{page}_img{n}` 同名覆盖，删了反而让
+      "转换期间/转换失败"时旧图裂掉（残留的孤儿 PNG 无害）。
+
+    ⚠️ 这是**有 token 代价**的操作（≈ 校对 + 公式 + 翻译整篇），确认框里说清。
+    """
+    paper = require_paper(conn, paper_id, user)
+    if paper["conv_state"] == "doing":
+        raise HTTPException(status.HTTP_409_CONFLICT, "该文献正在转换中")
+
+    fingerprint = None
+    pdf = Path(paper["pdf_path"]) if paper["pdf_path"] else None
+    if pdf is not None and pdf.exists():
+        fingerprint = _pdf_fingerprint(pdf)
+
+    with tx(conn):
+        if fingerprint:
+            conn.execute("DELETE FROM doc_cache WHERE fingerprint=?", (fingerprint,))
+        conn.execute("DELETE FROM notes WHERE paper_id=?", (paper_id,))
+        conn.execute("DELETE FROM highlights WHERE paper_id=?", (paper_id,))
+        conn.execute(
+            """UPDATE papers SET conv_state='queued', conv_error=NULL, conv_attempts=0,
+                      updated_at=? WHERE id=?""",
+            (utcnow(), paper_id),
+        )
+    log.info("paper=%s 重新提取：解析缓存已清（fingerprint=%s…）/ 笔记与划痕作废 → 重新排队",
+             paper_id, fingerprint[:12] if fingerprint else "无（arXiv 路线）")
+    background.add_task(convert_paper, paper_id, fingerprint)
+    return {"ok": True, "conv_state": "queued", "cache_cleared": bool(fingerprint)}
 
 
 @router.get("/papers/{paper_id}/export")
