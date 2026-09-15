@@ -68,6 +68,8 @@ export interface Paper {
   status_at: string | null
   progress: number
   progress_mode: 'auto' | 'manual'
+  /** 「最近阅读」（⑰ 补充）：只有阅读器滚动上报写它；从没读过为 null。 */
+  last_read_at: string | null
   conv_state: ConvState
   conv_error: string | null
   created_at: string

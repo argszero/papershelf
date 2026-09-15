@@ -108,6 +108,7 @@ export function BoardPage() {
           )}
 
           <p className="meta" style={{ marginTop: 16 }}>
+            在阅读器里滚动会<b>自动</b>把「待读」推进到「在读」（「读懂没有」仍然只能手动标）；
             拖到「已读」或「已整理」会把进度锁到 100%（⑰ 手动优先）；拖回「待读」则清零重来。
           </p>
         </div>

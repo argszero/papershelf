@@ -197,21 +197,37 @@ def patch_paper(paper_id: int, body: PaperPatch, conn: sqlite3.Connection = Depe
     if body.progress is not None:
         if not 0 <= body.progress <= 100:
             raise HTTPException(status.HTTP_400_BAD_REQUEST, "进度须在 0-100")
+        row = conn.execute("SELECT status, progress, progress_mode FROM papers WHERE id=?",
+                           (paper_id,)).fetchone()
         # ⑰：手动锁定后，滚动上报不得把它降下来（手动优先）
-        if body.status_ is None:
-            row = conn.execute("SELECT progress, progress_mode FROM papers WHERE id=?",
-                               (paper_id,)).fetchone()
-            if row and row["progress_mode"] == "manual":
-                raise HTTPException(status.HTTP_409_CONFLICT, "已标记已读，进度已锁定")
-            # ⚠️ auto 模式下进度**只增不减**（踩过）：前端滚动上报是节流的，
-            #    从底部快速回到顶部时"最后由下往上"的那次上报会把 100% 拽回 3%，
-            #    进度条像坏了一样往回退。自动累计的语义就是"读到过哪里"，
-            #    回退没有任何含义；要往回改就手动把状态设为「在读」。
-            if row and body.progress <= int(row["progress"] or 0) and row["progress_mode"] == "auto":
-                return paper_public(dict(conn.execute(
-                    "SELECT * FROM papers WHERE id=?", (paper_id,)).fetchone()))
-        sets.append("progress=?")
-        args.append(body.progress)
+        if body.status_ is None and row and row["progress_mode"] == "manual":
+            raise HTTPException(status.HTTP_409_CONFLICT, "已标记已读，进度已锁定")
+        # ⑰ 补充（2026-09-15，宿主：「我有篇文章读了 13%，为什么『在读』还是 0 篇」）：
+        # 这条路径 = **阅读器滚动上报**，也就是"此刻正在读"。所以：
+        #  ① 记 `last_read_at`（「最近阅读」的**唯一**数据来源；改标题/改标签/拖看板都不写它，
+        #     于是这个字段只可能表示"最后一次真正阅读"）。
+        #  ② 还在「待读」就自动翻到「在读」——"开始读了"这件事滚动位置是知道的；
+        #     而"读懂没有"仍然只有人知道，所以「已读/已整理」**不自动**，仍旧只能手动拖。
+        #  ③ `status_at` **只在翻转的那一刻**盖一次，不能每次滚动都盖：
+        #     否则它退化成"最近滚动时间"，看板列内排序与总览那条"停摆"提醒全会失真。
+        if body.status_ is None and row is not None:
+            sets.append("last_read_at=?")
+            args.append(utcnow())
+            if row["status"] == "unread" and row["progress_mode"] == "auto":
+                sets += ["status=?", "status_at=?"]
+                args += ["reading", utcnow()]
+        # ⚠️ auto 模式下进度**只增不减**（踩过）：前端滚动上报是节流的，
+        #    从底部快速回到顶部时"最后由下往上"的那次上报会把 100% 拽回 3%，
+        #    进度条像坏了一样往回退。自动累计的语义就是"读到过哪里"，
+        #    回退没有任何含义；要往回改就手动把状态设为「在读」。
+        #    ⚠️ 只跳过 `progress` 的写入 —— 上面的 `last_read_at` 与状态翻转照常生效
+        #    （往下读还是翻回来，都是在读这篇）。
+        if body.status_ is None and row and row["progress_mode"] == "auto" \
+                and body.progress <= int(row["progress"] or 0):
+            pass
+        else:
+            sets.append("progress=?")
+            args.append(body.progress)
     if sets:
         sets.append("updated_at=?")
         args += [utcnow(), paper_id]

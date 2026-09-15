@@ -372,7 +372,7 @@ function PaceFig({ pace }: { pace: Pace }) {
       </div>
       <p className="meta" style={{ marginTop: 10 }}>
         按「被标记为已读/已整理」的时间统计（当前计划内 {pace.total} 次）。
-        在阅读器里滚动只累计进度，不改状态 —— 所以这里的低值不代表没在读。
+        在阅读器里滚动只会把「待读」推进到「在读」、不会替你判定读完 —— 所以这里的低值不代表没在读。
       </p>
     </>
   )
@@ -407,13 +407,16 @@ function buildAttention(papers: Paper[]) {
     })
   }
 
+  /* 「停摆」必须看**最近阅读**（`last_read_at`），不能看 `status_at`：
+     后者是"进入『在读』这个状态"的时间 —— 自动翻转后它只盖一次，
+     一个人天天读同一篇也会被它报成"停摆 21 天"。 */
   const stuck = papers.filter((p) => p.status === 'reading' && p.progress > 0 && p.progress < 100
-    && (daysSince(p.status_at || p.created_at) ?? 0) >= 21)
+    && (daysSince(p.last_read_at || p.status_at || p.created_at) ?? 0) >= 21)
   if (stuck.length) {
     out.push({
       Icon: IconFile, tone: 'warn',
       title: `${stuck.length} 篇「在读」已停摆 21 天以上`,
-      sub: `最近更新：${relTime(stuck[0].status_at || stuck[0].created_at)} · ${stuck[0].title || `文献 #${stuck[0].id}`}`,
+      sub: `最近阅读：${relTime(stuck[0].last_read_at || stuck[0].status_at || stuck[0].created_at)} · ${stuck[0].title || `文献 #${stuck[0].id}`}`,
       to: '/board',
     })
   }

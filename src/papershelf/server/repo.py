@@ -71,6 +71,10 @@ def paper_public(r: dict[str, Any]) -> dict[str, Any]:
         "source": r["source"], "source_ref": r["source_ref"],
         "status": r["status"], "status_at": r["status_at"],
         "progress": r["progress"], "progress_mode": r["progress_mode"],
+        # 「最近阅读」（⑰ 补充，2026-09-15）：只有滚动上报写它。
+        # ⚠️ 别和 `status_at` 混用 —— 后者是**进入当前状态**的时间（翻「在读」时也只盖一次）；
+        # 前者是**最后一次真正阅读**的时间。看板排序用后者，总览"停摆"提醒用前者。
+        "last_read_at": r["last_read_at"] if "last_read_at" in r.keys() else None,
         "conv_state": r["conv_state"], "conv_error": r["conv_error"],
         "created_at": r["created_at"],
     }

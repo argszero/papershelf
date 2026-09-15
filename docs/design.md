@@ -103,8 +103,11 @@ papers(
   arxiv_html  INTEGER DEFAULT 0,           -- 是否走 arXiv HTML 直达（⑱）
   status      TEXT NOT NULL DEFAULT 'unread',   -- unread|reading|read|reviewed (⑰)
   status_at   TEXT,                        -- 状态变更时间戳（⑰ 节奏图数据源）
+                                           -- ⚠️ 自动翻「在读」时**只在翻转那一刻**盖一次（㊱）
   progress    INTEGER NOT NULL DEFAULT 0,  -- 0-100（⑰ 滚动自动；标记已读→100）
   progress_mode TEXT DEFAULT 'auto',       -- auto（滚动）| manual（已读锁定）
+  last_read_at TEXT,                       -- 「最近阅读」（㊱）：**只有滚动上报写它**
+                                           -- ⚠️ 别拿 updated_at 代替：那个被任何 PATCH 刷新
   conv_state  TEXT NOT NULL DEFAULT 'none',-- none|queued|doing|done|failed (②)
   conv_error  TEXT,
   conv_attempts INTEGER DEFAULT 0,
@@ -737,7 +740,7 @@ services:
 | 10 | 版权警示 | ✅ 已落地且**位置已调整**（2026-09-11）：README 不再提（与开源项目本身无关）；改由**注册用户协议**约束（服务端强校验 + `users.consent_version/consent_at` 留档），运维事项写在 `docs/install.md` §9 |
 | 11 | 自检失败呈现 | ✅ **全链已落地**：`conv_state=failed` + `conv_error` + `POST /papers/{id}/convert` 重试；文献表里**直接展示失败原因全文**（不是 tooltip），未配 LLM 时报"该改哪个环境变量"而不是"疑似漏译" |
 | 12 | 人工修订保护 | ✅ **已落地**：转换与重译都跳过 `zh_source='human'` 的块（`converter.py` / `cli.latex` 均只清「英文真变过」的块）|
-| 13 | 进度回落语义 | ✅ **已落地并简化**：滚动上报**只增不减**（回退对"读到过哪里"没有意义，且节流上报会把 100% 拽回去，实测踩到）；状态降回「在读」→ `progress_mode` 回 `auto`；标回「未读」→ 进度清零（否则出现"未读 但 80%"的自相矛盾） |
+| 13 | 进度回落语义 | ✅ **已落地并简化**：滚动上报**只增不减**（回退对"读到过哪里"没有意义，且节流上报会把 100% 拽回去，实测踩到）；状态降回「在读」→ `progress_mode` 回 `auto`；标回「未读」→ 进度清零（否则出现"未读 但 80%"的自相矛盾）。**㊱（2026-09-15）补充**：滚动上报 = 此刻正在读 → 自动把「待读」翻成「在读」并记 `last_read_at`；「已读/已整理」仍只能手动（"读懂没有"只有人知道）|
 | 14 | 标签词表 | v1 自由标签（⑲）；v2 可加"计划内标签自动补全"，不强制受控 |
 
 ### 公式渲染为什么最终选了 MathML（而非 KaTeX 本地化）

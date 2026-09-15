@@ -113,6 +113,10 @@ CREATE TABLE IF NOT EXISTS papers (
   status_at     TEXT,
   progress      INTEGER NOT NULL DEFAULT 0,        -- 0-100（⑰）
   progress_mode TEXT NOT NULL DEFAULT 'auto',      -- auto | manual（⑰ 已读锁定）
+  -- 「最近阅读」（⑰ 补充，2026-09-15）：**只有阅读器滚动上报进度时才写**。
+  -- 为什么不复用 `updated_at`：任何 PATCH 都会刷新它（改标题、改标签、拖看板…），
+  -- 那记的是"最近一次改动"而不是"最近一次阅读"，两个字段会被混成一句话。
+  last_read_at  TEXT,
   conv_state    TEXT NOT NULL DEFAULT 'none',      -- none|queued|doing|done|failed（②）
   conv_error    TEXT,
   conv_attempts INTEGER NOT NULL DEFAULT 0,
@@ -326,7 +330,17 @@ def _migrate(conn: sqlite3.Connection) -> None:
     # 再看 `pdf_path` —— 后者落盘时被加了时间戳前缀，单看它认不出占位符。
     # 仍认不出的行一律保持 `0`（不覆盖）：宁可让用户手动点一次编辑，
     # 也不能擅自覆盖他可能手填过的标题。
-    if "title_is_placeholder" not in {r["name"] for r in conn.execute("PRAGMA table_info(papers)")}:
+    # 「最近阅读」列（⑰ 补充，2026-09-15）。存量行的回填**只做有证据的那些**：
+    # `progress > 0` 只可能来自阅读器滚动上报，而滚动上报恰好会刷新 `updated_at`，
+    # 所以对这些行 `updated_at` 就是「最后一次与这篇交互」的近似值
+    # （若此后又编辑过元数据会偏晚一点 —— 这是近似，不是精确值，宁可偏晚也不留空，
+    #  否则会出现"进度 13% 但最近阅读：未读"的自相矛盾）。
+    # `progress = 0` 的行一律留 NULL（= 从没读过），不编时间戳。
+    pcols = {r["name"] for r in conn.execute("PRAGMA table_info(papers)")}
+    if "last_read_at" not in pcols:
+        conn.execute("ALTER TABLE papers ADD COLUMN last_read_at TEXT")
+        conn.execute("UPDATE papers SET last_read_at=updated_at WHERE progress > 0")
+    if "title_is_placeholder" not in pcols:
         conn.execute("ALTER TABLE papers ADD COLUMN title_is_placeholder INTEGER NOT NULL DEFAULT 1")
         conn.execute("UPDATE papers SET title_is_placeholder = 0")
         for r in conn.execute("SELECT id, title, pdf_path, source_ref FROM papers").fetchall():

@@ -12,13 +12,19 @@ import { useCallback, useMemo, useState } from 'react'
 import { Link, useNavigate, useSearchParams } from 'react-router-dom'
 
 import { api } from '../api'
-import { CONV, clip, isDone, relTime, STATUS, STATUS_ORDER } from '../vocab'
+import { CONV, clip, fmtDate, isDone, relTime, STATUS, STATUS_ORDER } from '../vocab'
 import { Pill } from '../components'
 import { PaperMetaDrawer } from './PaperMetaDrawer'
 import { useLink, useReadonly } from '../shareContext'
 import { NoPlan, TopBar } from '../shell'
 import { usePlan } from '../planContext'
 import type { Paper, PaperStatus } from '../types'
+
+/** 只到「月-日」：文献库单元格很窄，年份在这个场景没有信息量（都是今年入库的）。 */
+const shortDay = (iso: string | null | undefined): string => {
+  const d = fmtDate(iso)
+  return d === '—' ? '—' : d.slice(5)
+}
 
 type Sort = 'recent' | 'year' | 'progress' | 'title'
 
@@ -211,9 +217,17 @@ export function LibraryPage() {
                             {CONV[p.conv_state].label}
                           </span>
                         ) : p.conv_state === 'done' ? (
-                          <span className="meta" style={{ color: 'var(--st-read)' }}>
-                            已生成 · {relTime(p.status_at || p.created_at)}
-                          </span>
+                          /* 「已生成」与原型一致（原型这格只有这两个字；`· N 天前` 是复刻时
+                             自己加的，2026-09-15 按宿主意见去掉 —— 那读的是**阅读状态**时间戳，
+                             拿去显示"中文版生成时间"是**语义错位**：用户读一次它就变成"今天"）。
+                             宿主：「实际上创建时间和最近阅读时间才是需要的」——
+                             一行放不下，走本表既有的一行两段式（标题/作者、年份/期刊同款）。 */
+                          <div>
+                            <div className="t-cv">已生成</div>
+                            <div className="t-sub">
+                              创建 {shortDay(p.created_at)} · 最近阅读 {p.last_read_at ? relTime(p.last_read_at) : '未读'}
+                            </div>
+                          </div>
                         ) : p.conv_state === 'failed' ? (
                           <button className="chip danger" disabled={busy === p.id}
                                   onClick={() => void convert(p)}>
@@ -267,7 +281,8 @@ export function LibraryPage() {
           </div>
 
           <p className="meta" style={{ marginTop: 12 }}>
-            进度条在阅读器里滚动时自动累计（只增不减）；手动标记「已读」会锁到 100%。
+            进度条在阅读器里滚动时自动累计（只增不减），并会自动把「待读」推进到「在读」；
+            手动标记「已读」会锁到 100%。
           </p>
         </div>
       </div>

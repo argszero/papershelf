@@ -377,6 +377,9 @@ select.input { width: auto; }
 @media (hover: none) { .ptable .t-edit { opacity: 1; } }
 .ptable .t-sub { font-family: var(--font-mono); font-size: 11px; color: var(--muted); margin-top: 3px; }
 .ptable .t-year { font-family: var(--font-mono); font-size: 12.5px; color: var(--fg); }
+/* 「中文版」列的第一行（已生成 / 待转换 / 失败…）。绿色表示这篇已经能读了，
+   与 `.t-year` 同字号同字重，让该列与「发表」列的骨架一致。 */
+.ptable .t-cv { font-family: var(--font-mono); font-size: 12.5px; color: var(--st-read); }
 .ptable .t-venue { font-size: 12px; color: var(--muted); }
 .ptable .t-tags { display: flex; gap: 4px; flex-wrap: wrap; max-width: 190px; }
 .ptable .num-col { text-align: right; font-family: var(--font-mono); font-variant-numeric: tabular-nums; }
