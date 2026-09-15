@@ -192,7 +192,7 @@ DOM 是历史遗留、API 已 401；拿它当验收对象会得出完全错误�
 **已上生产**（`f0b3357`，bundle `index-CmmAH-c3.js`）：部署前备份 DB（`…bak.20260915-102645`）、`compose pull` + `up -d`、health=healthy、日志零 ERROR、队列休眠（无待转）；生产真浏览器三模式实测 466 块 / 仅中文 441 块有中文文字（仅原文 0）→ 修复生效；文献库三按钮（编辑/重新提取/删除）已在线。
 
 ### 最近一轮（2026-09-15 上午，续）
-**注册白名单加 `.ac.cn`**（`957770b`，CI 绿，镜像 `latest`/`sha-957770b` 双 200，**未上生产**）：
+**注册白名单加 `.ac.cn`**（`957770b`，CI 绿；**已上生产**，镜像 revision `c954a4d`）：
 宿主「注册邮箱，除了 edu.cn 外，再添加对 .ac.cn 的支持」。默认值 → `edu.cn,ac.cn`；
 比对逻辑 `domain == d or domain.endswith("." + d)` **没动**（子域天然命中）；
 顺带修 Admin 页写死的「开放注册限 .edu.cn」。护栏 `test_registration_allowlist_default_includes_ac_cn`
@@ -200,7 +200,7 @@ DOM 是历史遗留、API 已 401；拿它当验收对象会得出完全错误�
 - **端到端实测（本地 8012）**：自写无依赖 SMTP 收信槽（`tmp/smtp_sink.py`，asyncio 40 行）临时接进 `.env`
   → 注册页提示「edu.cn、ac.cn」→ `acas@ict.ac.cn` 真发码 → 用收到的码完成注册并登录；
   `gmail.com` / `notedu.cn` 被拒且提示带 ac.cn。**测试用户与临时 env 已全部清掉**。
-- ⚠️ **生产 `.env` 显式写死 `=edu.cn`，会盖掉新默认** → 要真放宽必须改生产 env + 重启容器（待宿主点头）。
+- ⚠️ 生产 `.env` 显式写死 `=edu.cn` 会盖掉新默认 → **已按宿主点头改生产 env 并重启**：备份 `.env.bak.20260915-111010` + DB、`ALLOWLIST=edu.cn,ac.cn`、镜像 `c954a4d` 上线、health=healthy、错误 0、公网 `allowed_domains=[edu.cn, ac.cn]`；生产真浏览器实测注册页提示「edu.cn、ac.cn」＋ `wl-probe@cas.ac.cn` 真发码（DB 出现码行）＋ gmail 被拒（探针码行已删）。
 - 采坑：本地 2525 端口被**上一轮遗留的** `tmp/fake_smtp.py` 占着（跑了 3 天）→ 换 2531；
   tmp/ 里的老脚本进程会一直占端口，收信槽别复用固定端口。
 
