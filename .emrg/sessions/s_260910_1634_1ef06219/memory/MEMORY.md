@@ -189,6 +189,6 @@
 旧 bundle（`index-dSVAYd3W.js`）＋ 已不存在的旧数据集（合成演示论文）＋ 已失效会话，
 DOM 是历史遗留、API 已 401；拿它当验收对象会得出完全错误的结论。
 → 先 `list_tabs()` 比对 `script[src]` 的 bundle 指纹与当前 `static/`，再决定信不信。
-另：**生产仍是旧 revision**（`9713f09`，bundle `index-dSVAYd3W.js`），修复未上生产。
+**已上生产**（`f0b3357`，bundle `index-CmmAH-c3.js`）：部署前备份 DB（`…bak.20260915-102645`）、`compose pull` + `up -d`、health=healthy、日志零 ERROR、队列休眠（无待转）；生产真浏览器三模式实测 466 块 / 仅中文 441 块有中文文字（仅原文 0）→ 修复生效；文献库三按钮（编辑/重新提取/删除）已在线。
 
 _Last updated: 2026-09-15T10:30:00+08:00_

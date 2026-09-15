@@ -46,7 +46,7 @@ Index: `/Users/argszero/scm/github.com/argszero/papershelf/.emrg/memory/MEMORY.m
 | `localdev-node-asdf` | reference | [localdev-node-asdf.md](localdev-node-asdf.md) | **本机开发环境的两处坑**：①**node 在 asdf 下、不在 PATH**（`~/.asdf/installs/nodejs/26.5.0/bin`；`brew` 里没有、`python -m tsc` 报的 `No module named tsc` 是**假线索**）→ 前端必须 `export PATH=…:$PATH && npx tsc -b && npx vite build`；产物落 `src/papershelf/static/`，`emptyOutDir` 会删旧 bundle → **浏览器缓存的旧 index.html 指向已 404 的旧 JS**（表现为「改完刷新还是老界面」）→ 必须 `Page.reload(ignoreCache=True)` 硬刷；②**macOS 无 `setsid`/`timeout`** → 用 `(nohup sh scripts/dev.sh &)` + `curl health`；重启前先确认 PID 是 `papershelf.cli serve --port 8012`，**别误杀 emrg server** |
 | `m5-replicate-prototype` | decision | **[m5-replicate-prototype.md](m5-replicate-prototype.md)** | **M5 = 复刻原型（计划内视图）✅ 已落地**。①推翻了旧文档"总览/文献库/看板是跨计划视图、v1 刻意收窄"（实测原型 L1479 `papers()=activePlan().papers`，**没有跨计划聚合** → 实为**漏做**）；②**验收修掉 7 个真缺陷**（Share 页引用已删类名→无样式、移动端侧栏被藏死、搜索框与 URL 不同步、切换器格式、自造图例、大纲错显 H 徽标、新建按钮）；③**教训：复刻任务里"删旧样式"必须与"迁移页面"同步核对**（先删后迁会静默降级）；④**PDF 分页容器 ✅ 已落地**（宿主选 A，2026-09-11）：解析阶段给**每个块**盖 `payload.page`（`_paged_adder`）+ `doc_cache` 指纹混入 `PARSE_VERSION`（不混则永远命中旧解析产物、分页静默不出现）+ 阅读器/分享/导出三处同版式；⑤**顺带修掉既有真缺陷**：懒加载图无 `width/height` → 整篇高度事后上浮 7.3k px → **大纲跳转偏位 7.5k px**（把页 section 拍平后同样复现，证明与分页无关；已用资产宽高占位修掉） |
 | `ci-publish-pipeline-defect` | decision | **[ci-publish-pipeline-defect.md](ci-publish-pipeline-defect.md)** | **CI 全绿却静默删掉了刚发布的镜像**（2026-09-11，修于 `c0a7996`）。`cleanup` 那个 `actions/delete-package-versions@v5`（`delete-only-untagged-versions:false` + 保护名单只认 `latest`/数字 + `min-versions-to-keep:0`）把 `latest`/`sha-<commit>` 一起删了 → GHCR 全 404、包页面「No tagged versions found」、部署机 pull 只能 not found。时序铁证：`merge` 推 latest 成功 → `smoke` 拉 latest 起容器成功 → cleanup 打印「deleted till now: 8」。**教训：破坏性清理的失败模式是"静默删交付物"，应对是直接禁止而非调参；校验必须放在所有会改远端状态的步骤之后（"刚推成功"不等于"还在"）**。已换成只读 `verify` + `tests/test_workflow_guard.py` 5 条护栏。|
-| `ui-interaction-real-events` | reference | **[ui-interaction-real-events.md](ui-interaction-real-events.md)** | **验收 UI 交互必须用真实输入事件**（2026-09-13，㉛ 修订 `350f33f` 的教训）。拖选收尾浏览器**还会补一个 `click`** → 挂在 `click` 上的"点别处收浮条"把 `mouseup` 刚点亮的浮条当场收掉（「浮条一闪即没」，主路径不可用）；**合成事件（`dispatchEvent`/`el.click()`）跳过真实序列 `mouseup→click`，所以上一轮"真浏览器全绿"照样漏**。实操：CDP `Input.dispatchMouseEvent`（`_response_timeout=30`）、**必须先 `activate_tab`**（后台标签收不到输入事件，日志全空 ↔ 像"事件没挂上"）、"一闪即没"用 `MutationObserver` 拍增删、取点用 `getClientRects()[0]`（跨行时 rect 中点在行间空隙）。同族：假 SMTP／只看截图不量 computed style —— **验收要跑在最接近真实的那一层** |
+| `ui-interaction-real-events` | reference | **[ui-interaction-real-events.md](ui-interaction-real-events.md)** | **验收 UI 交互必须用真实输入事件**（2026-09-13，㉛ 修订 `350f33f` 的教训）。拖选收尾浏览器**还会补一个 `click`** → 挂在 `click` 上的"点别处收浮条"把 `mouseup` 刚点亮的浮条当场收掉（「浮条一闪即没」，主路径不可用）；**合成事件（`dispatchEvent`/`el.click()`）跳过真实序列 `mouseup→click`，所以上一轮"真浏览器全绿"照样漏**。实操：CDP `Input.dispatchMouseEvent`（`_response_timeout=30`）、**必须先 `activate_tab`**（后台标签收不到输入事件，日志全空 ↔ 像"事件没挂上"）、"一闪即没"用 `MutationObserver` 拍增删、取点用 `getClientRects()[0]`（跨行时 rect 中点在行间空隙）。同族：假 SMTP／只看截图不量 computed style —— **验收要跑在最接近真实的那一层**。**同类病例二（2026-09-15，`19c6f25`）：「仅中文」正文全空白** —— `styles.css` 藏 `.lang-zh .t-en` × `Reader.tsx` 只按 `dual` 渲染中文栏 = 两栏同时不可见；**标题还在**（走 `.b-zh` 内联分支）是完美伪装；判据 = 逐块量 `display!=='none' && getClientRects().length` + `innerText`；附带修好「仅中文下划不了重点」（`.b-inline[data-lang=zh]` 不存在 ⇒ 划痕没坐标系）；护栏 `test_style_guard.py::test_zh_only_mode_always_renders_the_chinese_column`（红-绿验证过） |
 | `mailer-gmail-ip-rotation` | reference | **[mailer-gmail-ip-rotation.md](mailer-gmail-ip-rotation.md)** | **发信可靠性：Gmail 的 DNS 池是有偏的**（2026-09-11 生产实测）。4 个 IP 里 `173.194.43.108` **37.5% 概率被抽中且 100% 连不通** → **单次尝试失败率 37.5%**；`smtplib` 只解析一次，所以**必须重试**（3 次仍剩 5.27%，实测每 8 次失败 1 次 → 改为 **5 次 = 0.74%**，`_TIMEOUT=6s`，最坏 ~34s）。**本地测不出来的原因有两道屏障**：假 SMTP 服务器（不轮转）+ 测试夹具把 `mailer._send` 整个换掉（不走 SMTP 层）→ 补 `tests/test_mailer.py` 专打被绕过的那层。**通用教训：换外部服务方就换了一套网络拓扑；抽一个资源、连一个资源且有不可达分支的必须重试；重试次数要先测失败率再算 p^n** |
 | `llm-402-quota-swallowed` | reference | **[llm-402-quota-swallowed.md](llm-402-quota-swallowed.md)** | **「一半没译文」真凶是 LLM 池子欠费（402）**（2026-09-11）。911 块只译出 154 块、391 块「待校对」，不是管线 bug —— `aitokenpool` 侧 `balance <= 0 → 402 点数余额不足`（上游调用前预检），而 `translator.translate_blocks` 把 `_chat` 异常**整段吞掉**（`continue`），配额型错误不会自愈 → 每片都失败 → 全篇空白却显示「转换成功」。**排查判据**：`tokens_used` 与块数量级脱节。查余额：`GET /api/wallet`（key 自带身份）；生产 token 库在容器 `aitokenpool:/data/aitokenpool.db`（容器内无 python3/sqlite3，要 `docker cp` 出来用宿主查）|
 | `prod-nginx-two-layers` | reference | **[prod-nginx-two-layers.md](prod-nginx-two-layers.md)** | **上传 413 真凶是内层 nginx**（2026-09-11）。链路有**两个** nginx：外层 `nginxproxy/nginx-proxy` + 内层 `website` 容器（`nginx:alpine`）。**改外层 `client_max_body_size` 无效**，必须改内层 bind-mount 的 `/root/app/ali.args.fun/nginx/default.conf`（已加 `256m`，备份 `.bak.20260911-2003`，持久）。应用本身无限制。**定案方法**：`docker logs website` 报 `client intended to send too large body: 14680272 bytes` → 拦截在内层。**仓库代码零改动，全在生产服务器**。教训：**宿主截图不能自证时刻**，要用 nginx access log 的 UTC 时间戳对齐（那次 413 是 11:58:55 UTC；12:03 reload 后同一请求变 401；12:08 真 39MB PDF → 201）|
@@ -309,7 +309,21 @@ Index: `/Users/argszero/scm/github.com/argszero/papershelf/.emrg/sessions/s_2609
   生产 `revision`=该提交、healthy、health 200、bundle 指纹未变 `index-5320WwVc.js`。
 - ⚠️ 遗留待宿主决定：gh token 现在多了 `delete_repo` + `delete:packages` 权限，是否收回。
 
-_Last updated: 2026-09-13T19:55:00+08:00_
+### 最近一轮（2026-09-15 上午）
+**「重新提取」上线**（`ee60c73`）：文献库每篇「删除」旁加按钮 = 删该篇 `doc_cache` + 作废笔记/划痕 +
+`conv_attempts` 归零重排队（宿主选 A：全部作废、从零重跑）；顺带修 `conv_attempts` 护栏空转（认领即 +1）。
+**「仅中文」正文全空白修复**（`19c6f25`）：`styles.css` 藏 `.lang-zh .t-en` × `Reader.tsx` 只按 `dual`
+渲染中文栏 → 两栏同时不可见（34 段可见文字 0；标题还在 = 完美伪装）。修法 = 拆 `dual` / `showZh`，
+仅中文一律渲染中文栏（免中文块回落原文），顺带修好该模式划不了重点；真浏览器三模式实测 34/34；
+护栏 `test_style_guard.py` 红-绿验证；全量 286 passed。
+
+**采坑（本轮）**：宿主浏览器里那个 `127.0.0.1:8012/reader/1` 标签页是**化石** ——
+旧 bundle（`index-dSVAYd3W.js`）＋ 已不存在的旧数据集（合成演示论文）＋ 已失效会话，
+DOM 是历史遗留、API 已 401；拿它当验收对象会得出完全错误的结论。
+→ 先 `list_tabs()` 比对 `script[src]` 的 bundle 指纹与当前 `static/`，再决定信不信。
+另：**生产仍是旧 revision**（`9713f09`，bundle `index-dSVAYd3W.js`），修复未上生产。
+
+_Last updated: 2026-09-15T10:30:00+08:00_
 
 
 **To read a memory**: use the `read` tool with the full path.
