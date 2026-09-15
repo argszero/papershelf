@@ -47,7 +47,9 @@ from .model import Doc, make_block_id
 #   v5 → 抽取文本**确定性清洗**（连字 ﬁ/ﬂ → fi/fl、`\xa0` → 空格，见 `clean_text`）
 #   v6 → 「加粗小标题 + 正文」被并成一块的**行级拆分**（见 `_split_runin_heads`）：
 #        此前 `Abstract` / `Keywords` 这类具名小标题**根本不存在于产物里**
-PARSE_VERSION = 6
+#   v7 → 给**栏间被切开的续段**盖 `payload["seam"]` 戳（见 `_column_spill_seams`）：
+#        只是**标记**、不自动合并 —— "该不该并"要看页图（①c 校对 agent 的活）
+PARSE_VERSION = 7
 
 # 页面上下边缘（比例），落在其中的短文本块视为页眉/页脚候选
 EDGE_TOP, EDGE_BOTTOM = 0.075, 0.925
@@ -370,6 +372,18 @@ def _extent(blocks: list[dict[str, Any]]) -> float:
     return total
 
 
+def _page_gutter(blocks: list[dict[str, Any]], width: float, height: float) -> float | None:
+    """本页的栏间空白（只在**正文带**里量）—— 单一来源，避免两处各量一把尺子。
+
+    调用方：`_reading_order`（排序）与 `_column_spill_seams`（找栏间续段）。
+    两者必须用**同一个** gutter，否则"按它排的序"和"按它标的缝"会错位。
+    """
+    core = [b for b in blocks
+            if b["bbox"][3] > height * _MARGIN_BAND
+            and b["bbox"][1] < height * (1 - _MARGIN_BAND)]
+    return _gutter(core, width)
+
+
 def _reading_order(
     blocks: list[dict[str, Any]], width: float, height: float
 ) -> list[dict[str, Any]]:
@@ -393,10 +407,7 @@ def _reading_order(
     # 拿它们算剖面等于给 gutter 打钉子）。**通栏块由 `_gutter` 内部迭代剔除** ——
     # 所以这里不必预先筛窄块，只把页边带摘掉即可。这个 gutter 随后既用来判
     # "哪些边缘块其实是通栏页眉"，也用来分栏，两处口径一致。
-    core = [b for b in blocks
-            if b["bbox"][3] > height * _MARGIN_BAND
-            and b["bbox"][1] < height * (1 - _MARGIN_BAND)]
-    gutter = _gutter(core, width)
+    gutter = _page_gutter(blocks, width, height)
     body = [b for b in blocks if not _marginal(b, width, height, gutter)]
     runs: list[tuple[str, list[dict[str, Any]]]] = []
     for b in _by_y(body):
@@ -426,6 +437,68 @@ def _reading_order(
     for b in [x for x in _by_y(edge) if _edge_band(x, height) == "top"][::-1]:
         out.insert(0, b)
     out.extend([x for x in _by_y(edge) if _edge_band(x, height) != "top"])
+    return out
+
+
+# ── 「栏间续段」：一句话被两栏的切缝劈成两个块 ────────────────────────────────
+# 宿主 2026-09-15 实测报（paper 1 第 22 页）：左栏末块 `… and RL; however, each of`
+# 与右栏首块 `the above sections does not talk about…` 是**同一句话**，却被抽成两个块 ——
+# 译文于是也断成两半（两半各自翻译，中文读起来中间那句没头没尾）。
+#
+# ⚠️ 这里**只标记、不自动合并**（宿主选 B）：判据的两条都只是"疑似"，
+#    "该不该并"要看页图（①c 校对 agent 的活）。标记放在块的 `payload["seam"]`，
+#    agent 在 `read_blocks` 里能看到，合并用 `merge_block`（它本来就能并入页内上一块）。
+#
+# 判据必须**几何 + 文字两条同时成立**（缺一条就被噪声淹掉，实测）：
+#   * 只用文字规则（前块无句末标点 + 后块小写起）：37 页报 **73** 处 ——
+#     大半是**表格行**（第 18 页整张大表逐行中招）和页眉/水印夹在中间；
+#   * 只用几何规则（左右栏接缝）：37 页报 **20** 处，但"左栏正常收句、右栏另起一段"
+#     也落在同一条缝上，会被误标。
+_RE_SENT_END = re.compile(r"""[.!?:;)\]"'\u201d\u2019\u3002\uff01\uff1f]\s*$""")
+_RE_STARTS_CONT = re.compile(r"^[a-z(]")
+
+
+def _looks_like_continuation(tail_prev: str, head_next: str) -> bool:
+    """两块**像不像同一句话被切开**（判据的**单一来源**）。
+
+    解析阶段（`_column_spill_seams` 盖 `payload["seam"]`）与校对阶段
+    （`merge_block` 合并后的复量提醒）都读它 —— 两处各写一遍，迟早一个说"像"、
+    另一个说"不像"，agent 收到的就是自相矛盾的信号。
+    """
+    tail_prev, head_next = (tail_prev or "").rstrip(), (head_next or "").lstrip()
+    if not tail_prev or not head_next:
+        return False
+    return not _RE_SENT_END.search(tail_prev) and bool(_RE_STARTS_CONT.match(head_next))
+
+
+def _side(block: dict[str, Any], gutter: float) -> str:
+    """块在栏间空白的哪一侧（按**中心**判，与 `_columns` 同一口径）。"""
+    return "L" if (block["bbox"][0] + block["bbox"][2]) / 2 < gutter else "R"
+
+
+def _column_spill_seams(
+    ordered: list[dict[str, Any]], width: float, height: float, gutter: float | None
+) -> dict[int, str]:
+    """返回 `{id(块): 理由}` —— 疑似「栏间被切开的续段」的**后一块**。
+
+    ⚠️ 在**最终阅读顺序**上扫描相邻对（不是在原始块列表上）：分栏页里
+    唯一可能发生这种切开的地方就是「左栏末块 → 右栏首块」这条接缝，
+    而它在正确的阅读顺序里恰好是一对**相邻**块。用 `id()` 作键是因为此时块还没有
+    稳定 ID（`b-0001` 要等 `_finalize` 重编）。
+    """
+    if gutter is None:
+        return {}
+    out: dict[int, str] = {}
+    for a, b in zip(ordered, ordered[1:]):
+        if a.get("type") != 0 or b.get("type") != 0:
+            continue                       # 图（或图注）两侧不构成"半句话"
+        if _marginal(a, width, height, gutter) or _marginal(b, width, height, gutter):
+            continue                       # 页眉/页脚/页码不属于正文流
+        if _side(a, gutter) != "L" or _side(b, gutter) != "R":
+            continue                       # 只有「左栏 → 右栏」这条缝会切开一句话
+        if not _looks_like_continuation(_block_text(a), _block_text(b)):
+            continue                       # 左栏收句了 / 右栏大写起 → 这是正常的换栏
+        out[id(b)] = "col-spill"
     return out
 
 
@@ -929,6 +1002,10 @@ def parse_pdf(
         add = _paged_adder(doc, page_no)
 
         ordered = _reading_order(text_blocks + image_blocks, width, heights[page_no - 1])
+        # 「栏间续段」只在**这一页的阅读顺序**上才看得出来（要左右栏的接缝），
+        # 所以在这里算好、随块一起盖进 payload（见 `_column_spill_seams`）。
+        seams = _column_spill_seams(ordered, width, heights[page_no - 1],
+                                    _page_gutter(ordered, width, heights[page_no - 1]))
         captions, caption_blocks = _pair_captions_by_geometry(image_blocks, text_blocks)
 
         for b in ordered:
@@ -989,7 +1066,11 @@ def parse_pdf(
                 add(f"h{level}", clean, section=section, level=level)
                 continue
 
-            add("p", " ".join(text.split()), section=section)
+            blk = add("p", " ".join(text.split()), section=section)
+            # 疑似「栏间被切开的续段」→ 盖戳（**只标记**，"该不该并"交给①c 校对 agent，
+            # 见 `_column_spill_seams`）。
+            if id(b) in seams:
+                blk.payload["seam"] = seams[id(b)]
 
     src.close()
     return _finalize(doc)

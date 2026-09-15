@@ -49,7 +49,7 @@ from typing import Any
 import httpx
 
 from .model import Block, Doc, make_block_id
-from .parse import clean_text
+from .parse import _looks_like_continuation, clean_text
 
 log = logging.getLogger("papershelf.pipeline.proofread")
 
@@ -200,6 +200,27 @@ def _artifact_tags(text: str) -> list[str]:
     return tags
 
 
+def _seam_tag(block: Any) -> str | None:
+    """块的「栏间续段」标记（解析阶段盖的 `payload["seam"]`）。"""
+    if block.payload.get("seam"):
+        return "续段"
+    return None
+
+
+def _block_tags(block: Any) -> list[str]:
+    """这一块上程序能量到的**全部**标签（字符串事实 + 解析阶段盖的几何戳）。
+
+    单一来源：`read_blocks` 的 `flags`、`_suspect_pages` 的页级计数、
+    `check_artifacts` 的明细都读它 —— 三处各写一遍迟早会漂（一个说这页有可疑、
+    另一个列不出来）。
+    """
+    text = block.en if block.type != "figure" else (block.payload.get("caption") or "")
+    tags = _artifact_tags(text)
+    if tag := _seam_tag(block):
+        tags.append(tag)
+    return tags
+
+
 def _suspect_pages(doc: Doc) -> dict[str, int]:
     """`{页号: 可疑块数}` —— **只给页级计数**。
 
@@ -207,11 +228,14 @@ def _suspect_pages(doc: Doc) -> dict[str, int]:
     **2.7k tokens**，而 seed 是**每一轮都要重发**的 —— 37 页 78 轮 ≈ 白烧 21 万 tokens，
     换来的只是省掉一两轮探索。详情因此下移到**当页的工具结果**里（`read_blocks` 每块带
     `flags`、`check_artifacts` 给整页明细），它们只存在于"当前几轮"的上下文里。
+
+    ⚠️ 计数里**必须带上「续段」**（2026-09-15 宿主：「还要校对分块分的对不对」）——
+    它来自解析阶段量出的几何事实，页级计数是 agent 唯一能看出"这一页有栏间切缝"的入口；
+    漏了它，`suspect_pages` 会给出"这页没问题"的**假阴性**。
     """
     counts: dict[str, int] = {}
     for b in doc.blocks:
-        text = b.en if b.type != "figure" else (b.payload.get("caption") or "")
-        if _artifact_tags(text):
+        if _block_tags(b):
             page = str(int(b.payload.get("page") or 0))
             counts[page] = counts.get(page, 0) + 1
     return counts
@@ -227,7 +251,14 @@ SYSTEM_PROMPT = """你是学术论文的**原文抽取校对 agent**。
 
 - **文字**：行末断词（`vari- ous` → `various`）、连字、上下标、错字、多余空格（引用编号
   `[ 12 ]` → `[12]`、句点前空格）、被版面切碎的公式片段。
-- **块结构**：一句话被拆成两块（应合并）、一段被并成一块（应切分）、重复块（应删除）。
+- **块结构**（宿主 2026-09-15：「还要校对**分块**分得对不对，尽量不要把一句话拆分到两个段里」）：
+  一句话被拆成两块（应合并）、一段被并成一块（应切分）、重复块（应删除）。
+  抽取常按**版面几何**切块，因此两栏页面上「左栏末块 + 右栏首块」很容易把**同一句话**
+  劈成两个段落 —— 中文译文于是也断成两截。程序**已经把这种接缝量出来了**：
+  `read_blocks` / `check_artifacts` 里带 `seam` 的块，就是「它前面那块是**左栏末块**」的
+  右栏首块。对照页图判断：前块末尾**没有句末标点**（`. ! ? :` 等）而本块**从小写字母或
+  左括号起** ⇒ 是同一句被切开 → `merge_block` 合并；前块正常收句 ⇒ 那只是正常的换栏，
+  **不要动**。`merge_block` 只能并入**本页上一块**，正好就是这种情形。
 - **块类型**：这一块到底是**标题**还是**段落**（`p` / `h2` / `h3` / `h4`）。
   判据是页图上的**字体、字号、加粗、是否独占一行**；标题/段落判错时用 `set_block_type` 改。
 - **阅读顺序**：这一页正确的读序（先上后下、先左栏后右栏、通栏块在其所在位置）。
@@ -457,7 +488,9 @@ class ProofreadTools:
                "parts": {"type": "array", "items": {"type": "string"},
                          "description": "切分后的各段文本（≥2 段，逐字来自论文）"},
                "reason": {"type": "string"}}, ["id", "parts"]),
-            f("merge_block", "把某块**并入页内上一块**（它是上一块被切断的续写）。",
+            f("merge_block", "把某块**并入页内上一块**（它是上一块被切断的续写）。"
+                             "两栏页面上最常见：`read_blocks` 里带 `seam` 的右栏首块 = 左栏末块"
+                             "那句话的续写（先看页图确认前块没正常收句，再合并）。",
               {"id": {"type": "string"}, "reason": {"type": "string"}}, ["id"]),
             f("delete_block", "删除**重复**块（同一页里另有块已包含它的内容）。",
               {"id": {"type": "string"}, "reason": {"type": "string"}}, ["id"]),
@@ -532,8 +565,14 @@ class ProofreadTools:
             item = {"id": b.id, "type": b.type, "chars": len(text),
                     "bbox": b.payload.get("bbox"),
                     "text": text[:BLOCK_PREVIEW] + ("…" if len(text) > BLOCK_PREVIEW else "")}
-            if flags := _artifact_tags(text):
-                item["flags"] = flags                            # 就地把程序量到的可疑点带上
+            if flags := _block_tags(b):
+                item["flags"] = flags                            # 就地带上程序量到的可疑点
+            if b.payload.get("seam"):
+                # 「续段」是**几何事实**：解析阶段量出这条栏间切缝可疑（前一块在左栏、
+                # 末尾没有句末标点；本块在右栏、从小写起）。判"是不是同一句话"要看页图。
+                item["seam"] = ("本块位于右栏开头，而它前一块是左栏末块 —— 疑似同一句话被"
+                                "栏间切开的续段。看页图核对：若确认是同一句，用 merge_block 合并；"
+                                "若前块本就正常收句，则不要动。")
             out.append(item)
             used += min(len(text), BLOCK_PREVIEW)
             if used >= BLOCKS_CALL_CHARS and len(out) < len(bs) - off:
@@ -561,19 +600,23 @@ class ProofreadTools:
         if not bs:
             return ToolOut(f"第 {page} 页没有文本块。")
         hints: dict[str, list[str]] = {}
+        seams: dict[str, str] = {}
         for b in bs:
             text = b.en if b.type != "figure" else (b.payload.get("caption") or "")
             if got := _artifacts(text):
                 hints[b.id] = got
-            if len(hints) >= MAX_HINT_BLOCKS:
+            if b.payload.get("seam"):
+                seams[b.id] = "疑似被栏间切开的续段（前一块是左栏末块）：确认是同一句话就 merge_block"
+            if len(hints) + len(seams) >= MAX_HINT_BLOCKS:
                 break
-        if not hints:
+        if not hints and not seams:
             return ToolOut(f"第 {page} 页没有程序能量出的可疑片段（但你仍需对照图像自行核对）。")
         return ToolOut(json.dumps({
-            "page": page, "suspicious": hints,
+            "page": page, "suspicious": hints, "seams": seams,
             "note": "这些是程序量出的**事实**，不一定是错：行末断词要看图判断是断字（合并）"
-                    "还是词内连字符（保留，如 three-dimensional、long- and short-term）。"
-                    "每一条都要有结论：改就 edit_block，不改就算了；",
+                    "还是词内连字符（保留，如 three-dimensional、long- and short-term）；"
+                    "`seams` 里的块要对照页图看**分块**对不对（跨栏一句话被切成两段 → 合并）。"
+                    "每一条都要有结论：改就 edit_block / merge_block，不改就算了；",
         }, ensure_ascii=False))
 
     # 写 ──────────────────────────────────────────────────────────────────
@@ -664,11 +707,20 @@ class ProofreadTools:
         if prev is None or prev.type == "figure":
             self.stats.rejected += 1
             return ToolOut("合并被拒绝：这一页里没有可并入的前一块（它是本页第一块）。", error=True)
-        prev.en = clean_text((prev.en.rstrip() + " " + b.en.lstrip()).strip())
+        tail_prev, head_b = prev.en.rstrip(), b.en.lstrip()   # 合并前留证据（合并后就分不出来了）
+        prev.en = clean_text((tail_prev + " " + head_b).strip())
         self.doc.blocks.remove(b)
         self.stats.merged += 1
         log.info("  ⇥ %s 并入 %s（%s）", b.id, prev.id, a.get("reason") or "")
-        return ToolOut(f"{b.id} 已并入 {prev.id}。")
+        # ⚠️ **软提醒，不是拒绝**：合并是**不可逆的语义决定**，而"这到底是不是同一句话"
+        # 只有看图的人（agent）知道。这里只用**和标记同一套判据**复量一遍：
+        # 前块已收句 + 本块大写起 ⇒ 不太像同一句 —— 那时把话说清（怎么拆回来），
+        # 而不是硬拦（硬拦会让 agent 在真正需要合并时无路可走：没有别的工具能连两块）。
+        out = f"{b.id} 已并入 {prev.id}。"
+        if not _looks_like_continuation(tail_prev, head_b):
+            out += (" ⚠️ 程序复量后**不太像**同一句（前一块读作已收句、或本块以大写起）。"
+                    "你若是有意合并就忽略这条；若是并错了，用 `split_block` 拆回两段。")
+        return ToolOut(out)
 
     def _t_delete_block(self, a: dict) -> ToolOut:
         b = self._find(str(a.get("id") or ""))
@@ -880,9 +932,13 @@ class Proofreader:
         if skip:
             task += (f" 注意：第 {sorted(skip)} 页**上次已经校对过**，本次不用再看"
                      f"（但如果它们的顺序/结构影响了本页的判断，你仍然可以 read_page 复查）。")
-        task += (" `suspect_pages` 是程序按字符串规则量出的**页级可疑计数**（键是页号，值是可疑块数）："
+        task += (" `suspect_pages` 是程序量出的**页级可疑计数**（键是页号，值是可疑块数）："
                  "具体是哪些块、可疑在哪，`read_blocks` 的每块 `flags` 字段里就有（`check_artifacts` "
-                 "给整页明细）。按「每页两轮」做：一轮看图看块，一轮把全部改动 + mark_page_done 提交。")
+                 "给整页明细）。⚠️ 计数里**混着两类**：字符串规则的（断词/引用空格）与"
+                 "**几何的**「续段」—— 后者是被栏间切开的续段（一句话分成两块），"
+                 "`flags` 里显示为 `续段`、整块说明在 `read_blocks` 的 `seam` 字段；"
+                 "看到它必须**对照页图核对分块**。按「每页两轮」做：一轮看图看块，"
+                 "一轮把全部改动 + mark_page_done 提交。")
         return [
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": task},
