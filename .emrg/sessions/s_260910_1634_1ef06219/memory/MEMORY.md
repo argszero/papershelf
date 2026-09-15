@@ -177,4 +177,18 @@
   生产 `revision`=该提交、healthy、health 200、bundle 指纹未变 `index-5320WwVc.js`。
 - ⚠️ 遗留待宿主决定：gh token 现在多了 `delete_repo` + `delete:packages` 权限，是否收回。
 
-_Last updated: 2026-09-13T19:55:00+08:00_
+### 最近一轮（2026-09-15 上午）
+**「重新提取」上线**（`ee60c73`）：文献库每篇「删除」旁加按钮 = 删该篇 `doc_cache` + 作废笔记/划痕 +
+`conv_attempts` 归零重排队（宿主选 A：全部作废、从零重跑）；顺带修 `conv_attempts` 护栏空转（认领即 +1）。
+**「仅中文」正文全空白修复**（`19c6f25`）：`styles.css` 藏 `.lang-zh .t-en` × `Reader.tsx` 只按 `dual`
+渲染中文栏 → 两栏同时不可见（34 段可见文字 0；标题还在 = 完美伪装）。修法 = 拆 `dual` / `showZh`，
+仅中文一律渲染中文栏（免中文块回落原文），顺带修好该模式划不了重点；真浏览器三模式实测 34/34；
+护栏 `test_style_guard.py` 红-绿验证；全量 286 passed。
+
+**采坑（本轮）**：宿主浏览器里那个 `127.0.0.1:8012/reader/1` 标签页是**化石** ——
+旧 bundle（`index-dSVAYd3W.js`）＋ 已不存在的旧数据集（合成演示论文）＋ 已失效会话，
+DOM 是历史遗留、API 已 401；拿它当验收对象会得出完全错误的结论。
+→ 先 `list_tabs()` 比对 `script[src]` 的 bundle 指纹与当前 `static/`，再决定信不信。
+另：**生产仍是旧 revision**（`9713f09`，bundle `index-dSVAYd3W.js`），修复未上生产。
+
+_Last updated: 2026-09-15T10:30:00+08:00_
