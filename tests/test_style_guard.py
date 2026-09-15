@@ -378,3 +378,37 @@ def test_sidebar_has_no_standalone_reader_entry() -> None:
     assert "to: '/reader'" not in shell, "侧栏又出现了独立的阅读器入口"
     # 但进阅读器时侧栏要停在「文献库」上（原型 L1665 同款行为）
     assert "'library'" in shell, "阅读器态应把侧栏高亮落到文献库"
+
+
+def test_zh_only_mode_always_renders_the_chinese_column() -> None:
+    """「仅中文」模式必须**一律渲染** `.t-zh` —— 与 CSS 藏掉的 `.t-en` 配套，缺一即开天窗。
+
+    2026-09-15 真缺陷（宿主：「"仅中文"时，显示不对」）：两侧条件互相打架 ——
+
+      - `styles.css`：`.lang-zh .t-en { display: none !important }`（藏英文栏）
+      - `Reader.tsx`：渲染中文栏的条件写成了 `mode === 'dual' && !wide`
+
+    叠加结果：**仅中文模式下正文段落全部空白**（实测 34 个段落，可见文字 0 个，
+    `.blk-p` 高度 14px 只剩内边距）。标题之所以看着正常，是因为它走 `.b-zh`
+    内联 span 那条分支，恰好不受影响 —— 所以"看到标题还在"会是完美的伪装。
+
+    这种错**一屏截图看不出来**（页面上有东西），必须逐段量 `innerText` 才现形；
+    所以钉一条静态护栏，把 CSS 与 JSX 的耦合固定住。
+    """
+    css = CSS.read_text(encoding="utf-8")
+    tsx = (WEB / "pages" / "Reader.tsx").read_text(encoding="utf-8")
+
+    naked = re.sub(r"/\*.*?\*/", "", css, flags=re.S)
+    assert ".lang-zh .t-en" in naked, "CSS 不再隐藏 .lang-zh 下的 .t-en（前提变了，请复核本护栏）"
+
+    assert "const dual = mode === 'dual' && !wide" in tsx, (
+        "双栏排版条件变了；请确认「仅中文」分支仍会渲染中文栏")
+    assert "const showZh = mode === 'zh' || dual" in tsx, (
+        "渲染中文栏的条件不是「仅中文一律渲染」—— `.lang-zh` 下 English 栏被 CSS 藏了，"
+        "只按 dual 渲染会让整段正文空白（2026-09-15 真缺陷）")
+    assert "{showZh && <div className=\"t-zh\">" in tsx, "中文栏没有挂在 showZh 上"
+
+    # 免中文块（references / 纯公式 / 版权页脚）在仅中文下要回落原文而不是留白，
+    # 标题同理 —— 两个回落条件都必须保留 `mode === 'zh'` 这条出口。
+    assert "!wide || mode === 'zh'" in tsx, "标题在仅中文 + 无译文时会渲染成空白"
+    assert "meta.title_zh || mode === 'zh'" in tsx, "文档标题在仅中文 + 无译文时会渲染成空白"

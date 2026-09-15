@@ -92,14 +92,32 @@ export function DocBlock({ b, mode, assets, selected, flash, onPick }: {
   onPick?: (blockId: string) => void
 }) {
   const wide = b.no_zh || !(b.zh || '').trim()
-  const visible = mode === 'dual' && !wide
+  /** 是否用**双栏网格**排版（只有对照模式 + 该块确实有译文时才并排）。 */
+  const dual = mode === 'dual' && !wide
+  /** 是否渲染中文那一栏。
+   *
+   * ⚠️ **不能只用 `mode === 'dual'`**（2026-09-15 真缺陷）：`styles.css` 在 `.lang-zh`
+   * 下把 `.t-en` 藏了（`.lang-zh .t-en { display: none !important }`），所以仅中文模式
+   * 若不渲染中文栏，屏幕上就是**一片空白** —— 实测 34 个正文段落的可见文字为 0
+   * （`.blk-p` 高度 14px，只剩内边距）。真浏览器逐段核对才发现的，光看"有渲染"看不出来。
+   *
+   * 仅中文模式**一律渲染**（哪怕这页没有译文）：`markup.render_block` 在没有 `zh` 时
+   * 回落英文原文且不渲染空白，所以"没译文的块"会显示一次原文 —— 这比开天窗好，
+   * 也与服务端"中文视图绝不空白"的口径一致。
+   *
+   * 附带好处：`.b-inline[data-lang="zh"]` 是划痕的坐标系（㉛），不渲染它，
+   * 仅中文模式下连划重点都用不了（选区根本没有落点）。
+   */
+  const showZh = mode === 'zh' || dual
 
   if (b.type.startsWith('h')) {
     const lvl = Math.min(3, Math.max(1, b.level || 2))
     return (
       <h2 className={`doc-h lvl${lvl}`} data-b={b.id}>
         {mode !== 'zh' && <span className="b-en">{b.en}</span>}
-        {mode !== 'en' && wide === false && <span className="b-zh">{b.zh || b.en}</span>}
+        {/* 仅中文模式即使标题没译文也要渲染（回落原文）—— 否则整个标题空白。
+            对照模式仍然只在有译文时给右栏，免得同一行英文出现两次。 */}
+        {mode !== 'en' && (!wide || mode === 'zh') && <span className="b-zh">{b.zh || b.en}</span>}
       </h2>
     )
   }
@@ -114,7 +132,7 @@ export function DocBlock({ b, mode, assets, selected, flash, onPick }: {
                    width={dim?.width} height={dim?.height} />
             : <div className="fig-frame"><span className="frame-ic"><IconImage /></span></div>}
         </div>
-        <figcaption className={`cap${visible ? ' dual' : ''}`}>
+        <figcaption className={`cap${dual ? ' dual' : ''}`}>
           {mode !== 'zh' && <span className="b-en">{b.en || String(b.payload?.caption || '')}</span>}
           {mode !== 'en' && <span className="b-zh">{b.zh || b.en || String(b.payload?.caption || '')}</span>}
         </figcaption>
@@ -144,7 +162,7 @@ export function DocBlock({ b, mode, assets, selected, flash, onPick }: {
 
   // 正文 / 摘要 / 公式 / 参考文献：内容与排版全部由服务端渲染（含 `<mark>`）。
   return (
-    <div className={`blk blk-p${visible ? ' dual' : ' wide'}${selected ? ' is-sel' : ''}${flash ? ' is-flash' : ''}`}
+    <div className={`blk blk-p${dual ? ' dual' : ' wide'}${selected ? ' is-sel' : ''}${flash ? ' is-flash' : ''}`}
          data-b={b.id}
          tabIndex={0} role="button" aria-label="选中此块"
          onKeyDown={(e) => {
@@ -153,7 +171,7 @@ export function DocBlock({ b, mode, assets, selected, flash, onPick }: {
            onPick?.(b.id)
          }}>
       <div className="t-en"><BlockBody block={b} lang="en" /></div>
-      {visible && <div className="t-zh"><BlockBody block={b} lang="zh" /></div>}
+      {showZh && <div className="t-zh"><BlockBody block={b} lang="zh" /></div>}
     </div>
   )
 }
@@ -704,7 +722,11 @@ export function ReaderPage() {
                     </p>
                     <h1 className="doc-title">
                       {mode !== 'zh' && <span className="b-en">{String(meta.title_en || title)}</span>}
-                      {mode !== 'en' && meta.title_zh && <span className="b-zh">{String(meta.title_zh)}</span>}
+                      {/* 仅中文模式：没有中文标题就回落英文（否则整行标题空白）。
+                          对照模式保持原样（有中文才给右栏），避免同一行出现两次英文。 */}
+                      {mode !== 'en' && (meta.title_zh || mode === 'zh') && (
+                        <span className="b-zh">{String(meta.title_zh || meta.title_en || title)}</span>
+                      )}
                     </h1>
                     {meta.authors && <p className="doc-authors">{String(meta.authors)}</p>}
                     {Array.isArray(meta.affiliations) && (meta.affiliations as string[]).length > 0 && (
