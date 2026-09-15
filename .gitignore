@@ -21,6 +21,9 @@ src/papershelf/static/index.html
 web/node_modules/
 web/dist/
 
+# 本地开发日志（`sh scripts/dev.sh` 会写在这里）
+.dev.log
+
 # ── EMRG agent 运行时（与姊妹项目一致） ──────────────────────────
 # 不提交：运行日志、演化产物、LLM 原始记录、会话临时文件
 .emrg/emrg-*.log
