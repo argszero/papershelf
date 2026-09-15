@@ -17,12 +17,15 @@ fitz 抽出的数学是 **Unicode 文本且间距被拆散**（`L f V ( x ) := �
 
 from __future__ import annotations
 
+import logging
 import re
 
 from .markup import render_block
 from .model import Block
 from .translator import Translator
 from .validate import _WORD_RE, equation_numbers, extract_blocks, latex_problems
+
+log = logging.getLogger("papershelf.pipeline.equations")
 
 # 数学符号（Unicode 数学区、希腊字母、常见运算符）
 _MATH_CHARS = (
@@ -109,8 +112,10 @@ class Latexizer(Translator):
 
         done = 0
         retried = 0
-        for ci, chunk in enumerate(self.chunk(targets, max_blocks, max_chars), start=1):
-            log(f"  · 公式切片 {ci}：{len(chunk)} 块（{sum(len(b.en) for b in chunk)} 字符）")
+        chunks = self.chunk(targets, max_blocks, max_chars)
+        log(f"  · 公式 LaTeX 化开始：{len(targets)} 块含数学，共 {len(chunks)} 个切片")
+        for ci, chunk in enumerate(chunks, start=1):
+            log(f"  · 公式切片 {ci}/{len(chunks)}：{len(chunk)} 块（{sum(len(b.en) for b in chunk)} 字符）")
             pending = self._attempt(chunk, log=log)
             if pending:
                 retried += 1
@@ -122,7 +127,8 @@ class Latexizer(Translator):
 
         if self.failed:
             log(f"  ⚠️ {len(self.failed)} 块 LaTeX 化后保真校验仍不过 → 回落原文本并标「待校对」")
-        return {"blocks": len(targets), "chunks": ci, "retried": retried, "failed": len(self.failed)}
+        return {"blocks": len(targets), "chunks": len(chunks), "retried": retried,
+                "failed": len(self.failed), "done": done}
 
     def _attempt(self, chunk: list[Block], *, log=print) -> list[str]:
         """送一次模型并逐块校验，返回**未通过**的块 ID（原文本尚未被改写）。"""

@@ -10,7 +10,6 @@
 from __future__ import annotations
 
 import re
-import statistics
 from collections import Counter
 from pathlib import Path
 from typing import Any
@@ -29,7 +28,24 @@ from .model import Doc, make_block_id
 # v3（2026-09-14）：阅读顺序从「整页二选一（单栏/双栏）」改为**分区**处理
 # （通栏段 + 窄块段 + 栏间空白剖面），修掉**混合版式**下两栏逐行交错
 # （生产 paper 12 首页正文首句错位即此例）。
-PARSE_VERSION = 3
+#
+# v4（2026-09-14）：v3 在纸上成立但**实际仍有大量页面交错**（实测 12 篇语料 265 页，
+# 逐页比对发现 62 页仍在两栏间来回跳，宿主看到的"格式乱了"就是这些页）。三处修正：
+#   ① **页眉/页脚不再参与分段**（`_marginal`）：它们的宽度不按"栏"来
+#      （`x 252.6–544.3` 只有 49% 页宽，因为页码占了左侧），会被当成"窄块"留在分栏段里
+#      把 gutter 打钉子 → 分栏失败。判据改用**贴页边 + 横跨本页实测 gutter**。
+#   ② `_gutter` **迭代剔除跨栏块**（XY-cut 经典做法）：一张通栏图 + 一行通栏页眉就够
+#      让最小覆盖度超过上限（`_MAX_BRIDGE_RATIO` 是**比例**，块少时塌成常数 1，
+#      而通栏块数不随之变少）→ 探测放弃。**页面越稀疏越容易中招**。
+#   ③ gutter 取**同分点里最靠页中**的那个：栏间空白必在中间，取最左同分点会落进
+#      左栏内部（B7-01 第 24 页：`[208, 252]` 整段覆盖度都是 1，208 是左栏内缘）。
+# 另：一侧只有 1 个块时，若它**纵向占满这段**（`_coverage ≥ 0.5`）也算一整栏
+# （B7-01 第 8 页右栏整段被 PDF 抽成 1 个块）。
+# 实测：栏跳变好 **62 页**、变差 **0 页**、持平 203 页（265 页语料逐页比对）。
+# 版本历史（混入缓存指纹：语义一变，旧解析产物自动失效、下次转换重建）
+#   v4 → 分栏阅读顺序（gutter 探测 + 迭代剔通栏块 + 覆盖度兜底；实测好 62 页 / 差 0 页）
+#   v5 → 抽取文本**确定性清洗**（连字 ﬁ/ﬂ → fi/fl、`\xa0` → 空格，见 `clean_text`）
+PARSE_VERSION = 5
 
 # 页面上下边缘（比例），落在其中的短文本块视为页眉/页脚候选
 EDGE_TOP, EDGE_BOTTOM = 0.075, 0.925
@@ -47,6 +63,9 @@ _GUTTER_EDGE_TOP, _GUTTER_EDGE_BOTTOM = 0.09, 0.91
 _MAX_BRIDGE_RATIO = 0.06
 # 分栏后每栏至少这么多块，否则不分（防止把单栏页的缩进项切坏）。
 _MIN_COL_BLOCKS = 2
+# 版面边角带（比例）：落在距页顶/页底这条带内的块**可能是**页眉/页脚/页码/水印。
+# 它只用来判断"该不该参与分段/分栏"（见 `_marginal`），不决定取舍。
+_MARGIN_BAND = 0.05
 
 # 章节编号模式（IEEE/学术常见）：顶层「I. / II.」，次级「A. / B.」，深层「1.1 / 2.3.1」
 _RE_H2 = re.compile(r"^([IVX]{1,6})\.\s+\S")
@@ -78,8 +97,36 @@ def _spans(block: dict[str, Any]) -> list[dict[str, Any]]:
     return out
 
 
+# PDF 里 `ﬁ` 是**一个字形**（U+FB01），不是 `f`+`i` 两个字符 —— 展开是纯字符串替换、
+# 没有任何歧义，所以**不该交给模型**（实测：不处理时模型只挑它注意到的几处，残留一半）。
+# 同类的还有不换行空格 `\xa0`（会让"标题里带一个看不见的空格"，影响检索与排版）。
+_LIGATURES = {
+    "\ufb00": "ff", "\ufb01": "fi", "\ufb02": "fl", "\ufb03": "ffi",
+    "\ufb04": "ffl", "\ufb05": "st", "\ufb06": "st",
+    "\u2010": "-", "\u2011": "-", "\u00ad": "",   # 连字符变体 / 软连字符（直接删）
+}
+_SPACES = {"\xa0": " ", "\u2009": " ", "\u202f": " ", "\u200b": ""}
+
+
+def clean_text(text: str) -> str:
+    """抽取文本的**确定性**清洗：连字展开 + 特殊空格归一（不做需要判断的事）。
+
+    「行末断词该不该合并」（`vari- ous` → `various`，但 `three- dimensional` → `three-dimensional`）
+    要靠看图才能定，那是 ①c 视觉校对的活；这里只做**换掉字符**这种没有歧义的部分。
+    """
+    if not text:
+        return text
+    for src, dst in _LIGATURES.items():
+        if src in text:
+            text = text.replace(src, dst)
+    for src, dst in _SPACES.items():
+        if src in text:
+            text = text.replace(src, dst)
+    return text
+
+
 def _block_text(block: dict[str, Any]) -> str:
-    return " ".join(s.get("text", "") for s in _spans(block)).strip()
+    return clean_text(" ".join(s.get("text", "") for s in _spans(block)).strip())
 
 
 def _max_size(block: dict[str, Any]) -> float:
@@ -92,48 +139,210 @@ def _is_bold(block: dict[str, Any]) -> bool:
     return bool(fonts) and all(("Bold" in f) or ("black" in f.lower()) for f in fonts)
 
 
+def _body_size(raw_pages: list[list[dict[str, Any]]]) -> float:
+    """正文基准字号 = 按**字符数加权**的中位数（不是按块数的中位数）。
+
+    ## 为什么必须加权（2026-09-14 生产实测）
+
+    原实现取「每块最大字号」的中位数。问题不在中位数，在**权重**：
+    页眉/页脚/页码/脚注（8.5pt）块数多但每块很短，正文（10pt）块数少但每块很长。
+    实测 B3-01：8.5pt 有 **359 块 / 58.5k 字符**、10pt 有 124 块 / **85k 字符** ——
+    按块数取中位数得 8.5，按字符数得 10.0。
+
+    基准取错 1.5pt 的后果不是"稍微不准"，而是**`body_size + 1.0` 那条兜底规则
+    把正文段落整段判成 h2 标题**（10.0 ≥ 8.5 + 1.0），而 `size ≥ body_size * 1.8`
+    又再也认不出真正的文章标题。实测同一份 PDF：8.5 → 37 个"标题"（含 6 个整段正文），
+    10.0 → 30 个（全部正确）。**标题误判会污染大纲、`section` 归属与阅读器导航。**
+    """
+    counts: Counter[float] = Counter()
+    for blocks in raw_pages:
+        for b in blocks:
+            if b.get("type") != 0:
+                continue
+            size = _max_size(b)
+            text = _block_text(b)
+            if size and text:
+                counts[round(size, 1)] += len(text)      # 权重 = 字符数
+    if not counts:
+        return 10.0
+    total = sum(counts.values())
+    acc = 0
+    for size in sorted(counts):
+        acc += counts[size]
+        if acc >= total / 2:
+            return size
+    return 10.0
+
+
 def _by_y(blocks: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return sorted(blocks, key=lambda b: (round(b["bbox"][1], 1), b["bbox"][0]))
 
 
-def _columns(blocks: list[dict[str, Any]], width: float, height: float
-             ) -> list[list[dict[str, Any]]] | None:
-    """把 blocks 按「栏间空白(gutter)」切成若干栏；切不出来返回 None。
+def _edge_band(block: dict[str, Any], height: float) -> str | None:
+    """块贴在**页顶带**还是**页底带**：返回 `"top"` / `"bottom"` / `None`。
 
-    找 gutter 用**覆盖度剖面**，不是「相邻块间隙 ≥ N」那种邻接扫描 ——
-    后者会被**溢出栏间的公式碎片**骗过：B5-01 第 7 页右栏从 x=300.9 起、
-    而左栏一道公式的 `≤ 0` 一直伸到 299.2，真正的空白只剩 1.7pt，
-    任何像样的间隙阈值都扫不出来（实测：那页 55 个块被当成"一栏"）。
-    剖面则处处成立：真栏内任意 x 都被大量块横跨，只有 gutter 接近 0。
+    ⚠️ 判据是块**起始**落在顶带内、或块**结束**落在底带内 —— **不是"整块都在带内"**。
+    实测教训（2026-09-14，这条判据第一版写错过）：期刊页眉高约 10pt 而从 `y≈32` 起，
+    上边距带高 39pt，于是 `y1 = 41 > 39` → 旧判据**全部返回 False**，
+    「摘掉页眉页脚再分栏」这个修复**静默不生效**（页面顺序看起来毫无变化）。
+    贴边是根据"贴"这个动作定义的：块的**一条边**贴住页面边缘即可。
     """
-    # 只统计**正文带**里的块：页眉/页脚/页码常常正落在两栏之间的空白里，
-    # 拿它们算剖面等于给 gutter 打钉子（B2-03 第 24 页的页码 "186" 就卡在栏间）。
-    body = [b for b in blocks
-            if b["bbox"][3] > height * _GUTTER_EDGE_TOP and b["bbox"][1] < height * _GUTTER_EDGE_BOTTOM]
-    if len(body) < 2 * _MIN_COL_BLOCKS:
-        return None
+    if block["bbox"][1] <= height * _MARGIN_BAND:
+        return "top"
+    if block["bbox"][3] >= height * (1 - _MARGIN_BAND):
+        return "bottom"
+    return None
 
-    lo, hi = width * _GUTTER_CENTER[0], width * _GUTTER_CENTER[1]
-    best_x, best_cov = None, None
-    x = lo
-    while x <= hi:
-        cov = sum(1 for b in body if b["bbox"][0] < x < b["bbox"][2])
-        if best_cov is None or cov < best_cov:
-            best_x, best_cov = x, cov
-        x += 0.5
-    if best_x is None:
-        return None
-    # 允许极少数块横跨（公式溢出/跨栏小图），但不许"半个正文都横跨"
-    if best_cov > max(1, int(len(body) * _MAX_BRIDGE_RATIO)):
-        return None
 
+def _marginal(block: dict[str, Any], width: float, height: float,
+              gutter: float | None = None) -> bool:
+    """是不是**版面边角**块（页码/期刊页眉/出版社页脚/水印），不属于正文流。
+
+    判据故意取得很窄（必须 "贴页顶/页底" **且** "横向不是一栏正文的宽度"）：
+    - 块起于页顶带或终于页底带（`_edge_band`），**且**
+    - 横向满足三者之一：**极短**（页码/水印）／**横跨这一页的栏间空白**
+      （`gutter`，期刊页眉那种通栏一行）／**几乎占满页宽**（单栏页的页眉页脚）。
+
+    ⚠️ **"横跨 gutter"必须用页面实测的 gutter，不能用"宽 > 70% 页宽"代替**：
+    实测 B7-01 第 2 页页眉是 `x 252.6–544.3`（仅 49% 宽）—— 因为页码 `3116`
+    占了页眉左侧那一小段，页眉块被切成"从中间开始"的一行，既不算极短也不算通栏，
+    于是**漏网**、留在 col 段里把 gutter 打钉子 → 分栏失败、两栏逐行交错。
+
+    横向这条同时是**分栏页的护栏**：两栏页里每栏正文宽约 40% 页面宽，
+    既不极短也不跨 gutter，于是顶部/底部的段落不会被误摘出栏流。
+
+    ## 为什么需要它（2026-09-14 实测，v3 的缺陷）
+
+    v3 按「宽度 > 62% 页面宽」区分通栏块与窄块，再对窄块段分栏。但页面**顶部**的
+    通栏页眉（`1052 The International Journal of …`）与**底部**的宽页脚
+    （`Vol.:(0123456789)`）会**夹在分栏段之间**，把整页切成交错的段：
+    实测第 1 页输出成「左栏首段 → 页脚 → 期刊页眉 → 左栏续段 → … → 右栏」，
+    也就是左栏读到一半跳到右栏又跳回来（宿主看到的"格式乱了"）。
+
+    页眉页脚不是正文，本就不该参与分栏或段落流；把它们从**版面分段**里摘掉，
+    顺序里不再出现"中间被边缘块打断"，正文两栏就能连续地一栏读到底。
+
+    ⚠️ 只影响**排列顺序**，不影响块的取舍：真正的过滤仍由 `_running_headers`
+    （跨页重复的短文本）与 `_RE_WATERMARK` 负责，这里不删任何内容。
+    """
+    if _edge_band(block, height) is None:
+        return False
+    x0, x1 = block["bbox"][0], block["bbox"][2]
+    if (x1 - x0) < width * 0.35 or (x1 - x0) > width * 0.7:
+        return True
+    return gutter is not None and x0 < gutter < x1
+
+
+def _columns(blocks: list[dict[str, Any]], gutter: float | None
+             ) -> list[list[dict[str, Any]]] | None:
+    """按栏间空白 `gutter` 把 blocks 切成左右两栏；`gutter is None` 则切不出来。
+
+    `gutter` 由 `_reading_order` 用 `_gutter` 算一次并复用（本页口径统一，
+    也避免每个窄块段各算一次、算出不同的 gutter）。
+    """
+    if gutter is None:
+        return None
     cols: list[list[dict[str, Any]]] = [[], []]
     for b in blocks:
         cx = (b["bbox"][0] + b["bbox"][2]) / 2
-        cols[0 if cx < best_x else 1].append(b)
-    if len(cols[0]) < _MIN_COL_BLOCKS or len(cols[1]) < _MIN_COL_BLOCKS:
-        return None
+        cols[0 if cx < gutter else 1].append(b)
     return [_by_y(c) for c in cols]
+
+
+def _gutter(blocks: list[dict[str, Any]], width: float) -> float | None:
+    """找**栏间空白**(gutter) 的 x 坐标；这组块不像分栏就返回 None。
+
+    用**覆盖度剖面**，不是「相邻块间隙 ≥ N」那种邻接扫描 —— 后者会被**溢出栏间的
+    公式碎片**骗过：B5-01 第 7 页右栏从 x=300.9 起、而左栏一道公式的 `≤ 0`
+    一直伸到 299.2，真正的空白只剩 1.7pt，任何像样的间隙阈值都扫不出来
+    （实测：那页 55 个块被当成"一栏"）。剖面则处处成立：真栏内任意 x 都被大量块
+    横跨，只有 gutter 接近 0。
+
+    ⚠️ 调用方传进来的块**应当只在正文带里**（页眉/页脚/页码常常正落在两栏之间的
+    空白里，拿它们算剖面等于给 gutter 打钉子 —— B2-03 第 24 页的页码 `186` 就卡在
+    栏间）。而**通栏块由本函数自己迭代剔除**（见下），不必调用方预先筛窄块。
+    """
+    if len(blocks) < 2:
+        return None
+
+    def profile(bs: list[dict[str, Any]]) -> tuple[float, int]:
+        """覆盖度最小的 x。**同分时取最靠页中的那个** —— 栏间空白必在中间，
+        取最左边的同分点会落在空白的左边缘（甚至左栏内缘）上。
+        实测 B7-01 第 24 页：左栏右边缘 291.7、页眉右边缘 544.3，`[208, 252]`
+        整段覆盖度都是 1（只有左栏块横跨），取最左同分点得 208.3 —— 那是**左栏内部**，
+        按它切栏会把左栏劈开。
+        """
+        lo, hi = width * _GUTTER_CENTER[0], width * _GUTTER_CENTER[1]
+        best_x, best_cov = lo, None
+        x = lo
+        while x <= hi:
+            cov = sum(1 for b in bs if b["bbox"][0] < x < b["bbox"][2])
+            if best_cov is None or cov < best_cov:
+                best_x, best_cov = x, cov
+            elif cov == best_cov and abs(x - width / 2) < abs(best_x - width / 2):
+                best_x = x
+            x += 0.5
+        return best_x, (best_cov if best_cov is not None else len(bs))
+
+    best_x, best_cov = profile(blocks)
+    # 「容许横跨的块数」在块少时至少给 1（公式溢出/跨栏小图本来就要容忍）。
+    allowed = max(1, int(len(blocks) * _MAX_BRIDGE_RATIO))
+    #
+    # ⚠️ **迭代剔除跨栏块**（XY-cut 的经典做法，实测必需）：
+    # 通栏大图、跨栏一行（页眉/摘要/长图注）会横跨 gutter，把"覆盖度"顶到上限 →
+    # 探测直接放弃 → 退回按 y 排 → 两栏逐行交错。实测 B7-01 第 30 页：
+    # 一张通栏图 + 一行通栏页眉就够让最小覆盖度 = 2（上限恰好是 1），
+    # 而页面上真正需要分栏的只有 8 个正文块。**页面越稀疏越容易中招** ——
+    # 因为 `_MAX_BRIDGE_RATIO` 是比例，块少时它塌成常数 1，而通栏块数并不随之变少。
+    # 所以：把"横跨当前 gutter 的块"摘掉再重算，直到不再超标。
+    while best_cov > allowed:
+        crossers = [b for b in blocks if b["bbox"][0] < best_x < b["bbox"][2]]
+        blocks = [b for b in blocks if b not in crossers]
+        if len(blocks) < 2:
+            return None
+        best_x, best_cov = profile(blocks)
+        allowed = max(1, int(len(blocks) * _MAX_BRIDGE_RATIO))
+
+    left = [b for b in blocks if (b["bbox"][0] + b["bbox"][2]) / 2 < best_x]
+    right = [b for b in blocks if (b["bbox"][0] + b["bbox"][2]) / 2 >= best_x]
+    if not left or not right:
+        return None
+    if min(len(left), len(right)) < _MIN_COL_BLOCKS:
+        # 一侧块数少：只有它**纵向差不多与另一栏齐平**才算「一整栏文字被 PDF 并成一块」。
+        # 实测 B7-01 第 8 页：图下的右栏整段被抽成 **1 个块**（高 188pt / 左栏高 239pt），
+        # 只按块数判定就会得出"这不是两栏"，于是退回按 y 排 → 左栏读一段跳右栏再跳回。
+        # ⚠️ 同一侧**块数 > 1** 时不设门槛：两栏各自成段时"哪侧块少"本就随机
+        #    （实测 4:1 的页面存在），按比例卡会把正常页判成不是分栏。
+        sparse, dense = (left, right) if len(left) < len(right) else (right, left)
+        if _extent(sparse) < _extent(dense) * _COL_SPAN_RATIO:
+            return None
+    return best_x
+
+
+# 一侧块数少时，它**纵向与另一栏齐平**到多少才算「一整栏文字被 PDF 并成一块」。
+# ⚠️ 量的是**两侧各自覆盖的纵向长度之比**，不是"占本组块跨度的比例"：
+#    后者会被页眉/页码这类贴着页边的块把跨度撑到整页高、把比例稀释掉
+#    （实测 B7-01 第 8 页：188pt / 703pt = 0.27 → 判据永远不成立）。
+# ⚠️ 也不能要求"完全齐平"：段落最后一个字块常常明显短于另一栏的末段
+#    （实测该页 188pt vs 239pt = 0.79，而这不是"又一个块"，就是整栏文字）。
+#    0.5 与"两栏各自成段"的常见失衡（4:1 之类，比值仍接近 1）拉得开。
+_COL_SPAN_RATIO = 0.5
+
+
+def _extent(blocks: list[dict[str, Any]]) -> float:
+    """这组块**纵向覆盖的总长度**（区间并集；重叠部分只算一次）。"""
+    spans = sorted((b["bbox"][1], b["bbox"][3]) for b in blocks)
+    total, cur0, cur1 = 0.0, None, None
+    for a, b in spans:
+        if cur1 is None or a > cur1:
+            if cur1 is not None:
+                total += cur1 - cur0
+            cur0, cur1 = a, b
+        else:
+            cur1 = max(cur1, b)
+    if cur1 is not None:
+        total += cur1 - cur0
+    return total
 
 
 def _reading_order(
@@ -148,11 +357,24 @@ def _reading_order(
     这里按 y 把块切成「通栏段 / 窄块段」，各自处理：
     通栏段按 y 排；窄块段尝试分栏（成功则左栏整栏 → 右栏整栏，失败退回按 y）。
     混合版式下封面信息（通栏）因此落在其下的双栏正文之前，不会再错位。
+
+    ⚠️ **版面边角块（页眉/页脚/页码/水印）不参与分段**，只按 y 归位到页首或页尾
+    （`_marginal`）。它们夹在正文段之间会把整页切成交错的段（实测第 1 页输出
+    「左栏首段 → 页脚 → 页眉 → 左栏续段 → 右栏」）。正文两栏因此能连续读到底。
     """
     if not blocks:
         return []
+    # 先找本页的 gutter：只在**正文带**里看（页眉/页脚/页码常正落在栏间，
+    # 拿它们算剖面等于给 gutter 打钉子）。**通栏块由 `_gutter` 内部迭代剔除** ——
+    # 所以这里不必预先筛窄块，只把页边带摘掉即可。这个 gutter 随后既用来判
+    # "哪些边缘块其实是通栏页眉"，也用来分栏，两处口径一致。
+    core = [b for b in blocks
+            if b["bbox"][3] > height * _MARGIN_BAND
+            and b["bbox"][1] < height * (1 - _MARGIN_BAND)]
+    gutter = _gutter(core, width)
+    body = [b for b in blocks if not _marginal(b, width, height, gutter)]
     runs: list[tuple[str, list[dict[str, Any]]]] = []
-    for b in _by_y(blocks):
+    for b in _by_y(body):
         cls = "full" if (b["bbox"][2] - b["bbox"][0]) > width * _SPAN_RATIO else "col"
         if runs and runs[-1][0] == cls:
             runs[-1][1].append(b)
@@ -164,12 +386,21 @@ def _reading_order(
         if cls == "full":
             out.extend(_by_y(group))
             continue
-        cols = _columns(group, width, height)
+        cols = _columns(group, gutter)
         if cols:
             for col in cols:
                 out.extend(col)
         else:
             out.extend(_by_y(group))
+
+    # 边角块归位：贴页顶的（页眉/页码在上）排到最前，贴页底的收到最后
+    # （它们不属于正文流，但也不能被丢掉 —— 期刊页眉与脚注是阅读器里可见的内容）。
+    # ⚠️ 贴页顶的按 y **倒序**逐个 insert(0) —— 连续 insert(0) 会把顺序反过来，
+    #    倒序插才能得到正序（期刊页眉在页码上方时，页眉先出现）。
+    edge = [x for x in blocks if _marginal(x, width, height, gutter)]
+    for b in [x for x in _by_y(edge) if _edge_band(x, height) == "top"][::-1]:
+        out.insert(0, b)
+    out.extend([x for x in _by_y(edge) if _edge_band(x, height) != "top"])
     return out
 
 
@@ -280,7 +511,7 @@ def _text_without_logo(block: dict[str, Any], body_size: float) -> str:
         for s in _spans(block)
         if s.get("text", "").strip() and not _is_decoration(s, body_size)
     ]
-    return " ".join(keep).strip()
+    return clean_text(" ".join(keep).strip())
 
 
 def _size_without_logo(block: dict[str, Any], body_size: float) -> float:
@@ -506,15 +737,8 @@ def parse_pdf(
     if title_hint:
         doc.meta["title_en"] = title_hint
 
-    # 正文字号（用于标题判定）
-    sizes: list[float] = []
-    for blocks in raw_pages:
-        for b in blocks:
-            if b.get("type") == 0:
-                s = _max_size(b)
-                if s:
-                    sizes.append(s)
-    body_size = statistics.median(sizes) if sizes else 10.0
+    # 正文字号（用于标题判定）—— 按字符数加权的中位数，见 `_body_size` 的实测说明
+    body_size = _body_size(raw_pages)
 
     section = ""
     pending_figure = None

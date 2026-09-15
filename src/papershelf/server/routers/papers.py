@@ -93,6 +93,8 @@ async def upload(
                  "unread", utcnow(), "queued", utcnow(), utcnow()),
             )
             paper_id = int(cur.lastrowid)
+        log.info("paper=%s 已入库（用户 %s 上传 %s，%.1f MB，plan=%s），排队等待转换",
+                 paper_id, user["email"], name, len(data) / 1e6, plan_id)
         created.append(paper_public(dict(conn.execute("SELECT * FROM papers WHERE id=?", (paper_id,)).fetchone())))
         if background_convert:
             background.add_task(convert_paper, paper_id, _pdf_fingerprint(target))
@@ -120,6 +122,7 @@ def import_arxiv(
              utcnow(), utcnow()),
         )
         paper_id = int(cur.lastrowid)
+    log.info("paper=%s 已入库（arXiv:%s，plan=%s），排队等待转换", paper_id, ref, plan_id)
     background.add_task(convert_paper, paper_id, None)
     row = dict(conn.execute("SELECT * FROM papers WHERE id=?", (paper_id,)).fetchone())
     return paper_public(row)

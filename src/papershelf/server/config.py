@@ -54,11 +54,55 @@ class Settings:
     max_concurrency: int = field(default_factory=lambda: _int("PAPERSHELF_MAX_CONCURRENCY", 2))
     token_budget_per_paper: int = field(default_factory=lambda: _int("PAPERSHELF_TOKEN_BUDGET", 400_000))
     max_conv_attempts: int = field(default_factory=lambda: _int("PAPERSHELF_MAX_ATTEMPTS", 3))
+
+    # ── 原文抽取校对（VLM agent，管线 ①c）──
+    # 宿主 2026-09-14：「LLM 需要用于提取后的校对更新，要校对文字、格式，所有能校对的都要校对」，
+    # 且要求**以 agent 方式**做（给工具：读页图 / 读抽取结果 / 改抽取结果，让它自己逐页核对）。
+    # 代价实测：3 页论文 ≈ 11 轮 / 3–6 万 tokens（整页图 + 推理模型），37 页 ≈ 与整篇翻译同级，
+    # 所以给一个显式开关；关掉即退回纯几何解析。
+    proofread: bool = field(default_factory=lambda: _bool("PAPERSHELF_PROOFREAD", True))
+    # 渲染 DPI：太低看不清上下标（校对就白做），太高图像太大拖慢调用。130 实测可用。
+    proofread_dpi: int = field(default_factory=lambda: _int("PAPERSHELF_PROOFREAD_DPI", 130))
+    # **单次** LLM 调用的输出预算：推理模型给不足会把预算全烧在思考上、content 返回空串
+    # （实测 8192 必空）。注意这是"一次调用"的预算，不是整篇的。
+    proofread_max_tokens: int = field(default_factory=lambda: _int("PAPERSHELF_PROOFREAD_MAX_TOKENS", 32000))
+    # agent 轮数上限：一次工具调用算一轮。3 页论文实测 11 轮，37 页给足余量。
+    proofread_max_rounds: int = field(default_factory=lambda: _int("PAPERSHELF_PROOFREAD_MAX_ROUNDS", 400))
+    # 整篇校对的累计 token 预算（最后一道成本护栏：轮数没超、但模型开始兜圈子时挡在这里）。
+    proofread_token_budget: int = field(
+        default_factory=lambda: _int("PAPERSHELF_PROOFREAD_TOKEN_BUDGET", 1_500_000)
+    )
+    # 不配视觉模型也能开机（校对失败只记日志、不阻塞转换）。
+    proofread_model: str = field(
+        default_factory=lambda: os.environ.get("PAPERSHELF_PROOFREAD_MODEL", "")
+    )
+    # 思考预算：`minimal`（默认）/ `off` / `low` / `auto`。
+    # 池子里的视觉模型是**推理模型**，同一请求实测（2026-09-14）：
+    #   auto → completion 2001 tokens / 10.0s；`minimal` → 693 / 3.7s；`off` → 80 / 1.1s。
+    # 但**要看 agent 整篇的效果，不看单次调用** —— 3 页真实论文实测（改了 12 块的同一篇）：
+    #   auto 16 轮 / 106,709 tokens；`off` 13 轮 / 81,369；`minimal` 8 轮 / 60,665。
+    # agent 的成本 ≈ 轮数 × 每轮输出，所以这一个参数直接决定"37 页能不能跑完"。
+    # 默认 `minimal`（留一点推理余量，质量与 `auto` 一致但便宜一半）；`off` 留给成本吃紧时。
+    proofread_thinking: str = field(
+        default_factory=lambda: os.environ.get("PAPERSHELF_PROOFREAD_THINKING", "minimal")
+    )
     # 常驻转换队列（server/queue.py）：启动恢复 `doing` + 轮询排空 `queued`。
     # 关掉它 = 退回"只在请求线程里跑"，重启即丢队列（2026-09-12 事故的成因）。
     # 测试默认关（避免后台线程与用例互相干扰），由 conftest 显式设置。
     queue_enabled: bool = field(default_factory=lambda: _bool("PAPERSHELF_QUEUE", True))
     queue_interval: float = field(default_factory=lambda: _float("PAPERSHELF_QUEUE_INTERVAL", 3.0))
+
+    # ── 日志（运维可观测性）──
+    # 踩过（2026-09-14 生产）：「一直显示转换中」汇报上来之后，容器日志里**一行应用日志都没有** ——
+    # 代码里写了 `log.info`（队列启动/切片进度/元数据…），但从未 `basicConfig`，
+    # 根 logger 没有 handler，`lastResort` 只放 WARNING 及以上 → 所有 INFO 被静默丢弃。
+    # 一个跑了 7 分钟、花了 19 万 token 的转换，对外完全不可见。
+    log_level: str = field(default_factory=lambda: (os.environ.get("PAPERSHELF_LOG_LEVEL") or "INFO").upper())
+    # 每篇文献单独落一份 `<data_dir>/logs/p<id>.log`：事后按文献排障不必翻容器全量日志。
+    log_per_paper: bool = field(default_factory=lambda: _bool("PAPERSHELF_LOG_PER_PAPER", True))
+    # uvicorn 的 HTTP access log（每请求一行）：默认留着重定向到 DEBUG 级，
+    # 想看时把 `PAPERSHELF_LOG_LEVEL=DEBUG` 即可，不必改代码。
+    log_access: bool = field(default_factory=lambda: _bool("PAPERSHELF_LOG_ACCESS", True))
 
     # ── 注册与邮箱（决策⑭⑮）──
     email_allowlist: str = field(default_factory=lambda: os.environ.get("PAPERSHELF_EMAIL_DOMAIN_ALLOWLIST", "edu.cn"))
@@ -95,6 +139,10 @@ class Settings:
         return self.data_dir / "papers"
 
     @property
+    def logs_dir(self) -> Path:
+        return self.data_dir / "logs"
+
+    @property
     def smtp_configured(self) -> bool:
         """⑮：SMTP 配全才开放自助注册；未配则自动降级为「管理员开号」。"""
         return bool(self.smtp_host and self.smtp_from)
@@ -110,6 +158,7 @@ class Settings:
     def ensure_dirs(self) -> None:
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.papers_dir.mkdir(parents=True, exist_ok=True)
+        self.logs_dir.mkdir(parents=True, exist_ok=True)
 
 
 _settings: Settings | None = None

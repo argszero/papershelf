@@ -14,6 +14,7 @@ import json
 import logging
 import sqlite3
 import threading
+import time
 from pathlib import Path
 from typing import Any
 
@@ -109,15 +110,26 @@ def convert_paper(paper_id: int, fingerprint: str | None = None) -> None:
             if not claim_paper(conn, paper_id):
                 log.info("跳过 paper=%s（已被其它路径认领）", paper_id)
                 return
-            try:
-                doc, tokens = _run(conn, dict(fresh), settings, fingerprint)
-            except Exception as exc:                       # noqa: BLE001
-                log.exception("转化失败 paper=%s", paper_id)
-                _set_state(conn, paper_id, "failed", f"{type(exc).__name__}: {exc}")
-                return
+            # 从「认领后」到「落库」的全过程，额外抄一份到 `<data>/logs/p<id>.log`
+            # （运维按篇排障：容器日志是混流的，事后问"第 12 篇经历了什么"要翻半天）。
+            from .logging_setup import paper_log
 
-            save_doc(conn, paper_id, doc)
-            _writeback_meta(conn, paper_id, dict(fresh), doc.meta, tokens)
+            t0 = time.monotonic()
+            with paper_log(paper_id, settings.logs_dir, enabled=settings.log_per_paper):
+                log.info("paper=%s 开始转换（第 %s 次尝试，来源=%s，PDF=%s）", paper_id,
+                         int(fresh["conv_attempts"]) + 1, fresh["source"],
+                         Path(str(fresh["pdf_path"] or "")).name or "—")
+                try:
+                    doc, tokens = _run(conn, dict(fresh), settings, fingerprint)
+                except Exception as exc:                   # noqa: BLE001
+                    log.exception("paper=%s 转换失败（%.1fs）", paper_id, time.monotonic() - t0)
+                    _set_state(conn, paper_id, "failed", f"{type(exc).__name__}: {exc}")
+                    return
+
+                save_doc(conn, paper_id, doc)
+                _writeback_meta(conn, paper_id, dict(fresh), doc.meta, tokens)
+                log.info("paper=%s 转换完成：%d 块 / %d tokens / 用时 %.1fs（状态已置 done）",
+                         paper_id, len(doc.blocks), tokens, time.monotonic() - t0)
     finally:
         conn.close()
 
@@ -196,6 +208,18 @@ def _is_placeholder_title(paper: dict[str, Any]) -> bool:
                                 pdf_path=paper.get("pdf_path"))
 
 
+def _pending_proofread_pages(doc: Doc, ok_pages) -> list[int]:
+    """①c 还需要校对的页 = **有抽取结果的页** − 已校对过（`ok_pages`）的页。
+
+    ⚠️ 判据是"**还剩哪些页**"，不是"有没有页校过"：预算用尽 / 上游 504 都会留下
+    "校了一半"的 `ok_pages`；按"有页校过就整篇跳过"处理的话，剩下的页**永远不会**被校对，
+    而界面上却显示"已完成"（比报错更坏 —— 静默的半成品）。
+    空白页（没有块的页）不算 —— agent 没有可核对的东西，永远标记不了它们。
+    """
+    have = {int(b.payload.get("page") or 0) for b in doc.blocks} - {0}
+    return sorted(have - {int(p) for p in (ok_pages or ())})
+
+
 def _run(conn: sqlite3.Connection, paper: dict, settings, fingerprint: str | None) -> tuple[Doc, int]:
     """真正跑管线，返回 (Doc, tokens)。"""
     # ── ⓪ 未配 LLM 就别开始 ──────────────────────────────────────────────
@@ -222,13 +246,79 @@ def _run(conn: sqlite3.Connection, paper: dict, settings, fingerprint: str | Non
             cached = row["doc_json"] if row else None
         if cached:
             doc = Doc.from_json(cached)
+            log.info("① 解析：命中解析缓存（fingerprint=%s…），跳过 PDF 解析", fingerprint[:12])
         else:
+            t_parse = time.monotonic()
             doc = parse_pdf(pdf_path, assets_dir=settings.papers_dir / f"p{paper['id']}/assets")
             # arXiv/上传的元数据提示：文件名常含标题，交给后续元数据抽取
             if paper.get("source_ref"):
                 doc.meta.setdefault("source_ref", paper["source_ref"])
+            log.info("① 解析完成：%s 页 / %d 块 / %d 图 / 用时 %.1fs",
+                     doc.meta.get("pages"), len(doc.blocks), len(doc.assets),
+                     time.monotonic() - t_parse)
 
     tokens = 0
+
+    # ── ①c 原文抽取校对（VLM agent，宿主 2026-09-14）—— 必须在公式 LaTeX 化与翻译之前 ──
+    # 只有 PDF 路线有「渲染页图」可比对；arXiv 路线走官方 HTML（原生结构化，没有抽取误差）。
+    # 命中解析缓存时**只补做没校过的页**：缓存里存的可能是校对前的旧产物（存量文献），
+    # 但校对很贵（整页图 + 推理模型，一篇 37 页 ≈ 与整篇翻译同级），不能每次重跑都重买一遍 ——
+    # 上次哪些页已校对成功记在 `doc.meta["proofread"]["ok_pages"]`（也随缓存落库）。
+    proofread_pdf = None if paper["source"] == "arxiv" else Path(paper["pdf_path"] or "")
+    prev_pf = doc.meta.get("proofread") or {}
+    done_pages = set(prev_pf.get("ok_pages") or ())
+    want_pf = settings.proofread and proofread_pdf is not None and proofread_pdf.exists()
+    pending = _pending_proofread_pages(doc, done_pages)
+    # ⚠️ 判据必须是"**是不是所有页都校过**"，不能是"有没有页校过"：预算用尽 / 上游中断都会
+    # 留下"校了一半"的 `ok_pages`，那时该做的是**接着校剩下的页**，而不是整篇跳过
+    # （跳过 = 剩下的页永远没人校对，而且 UI 上看起来是"已完成"）。
+    if want_pf and not pending:
+        log.info("①c 原文校对：%d 页全部已校对过，跳过（不重复计费）", len(done_pages))
+    elif want_pf:
+        from ..pipeline.proofread import Proofreader
+
+        t_pf = time.monotonic()
+        pf_cfg = LLMConfig(base_url=settings.llm_base_url, api_key=settings.llm_api_key,
+                           model=settings.proofread_model or settings.llm_model)
+        pf = Proofreader(pf_cfg, dpi=settings.proofread_dpi,
+                         max_tokens=settings.proofread_max_tokens,
+                         max_rounds=settings.proofread_max_rounds,
+                         token_budget=settings.proofread_token_budget,
+                         thinking=settings.proofread_thinking)
+        try:
+            stats = pf.proofread_doc(doc, proofread_pdf, skip_pages=done_pages)
+            tokens += stats.tokens
+            # 续跑时把上一次的计数**累加**进来（否则界面上"文字修订 3 块"会突然变小，
+            # 看起来像校对白做了）；`failed` 只记本次 —— 它决定下次是否还重试。
+            def _cum(key: str, now: int) -> int:
+                return (prev_pf.get(key) or 0) + now if done_pages else now
+
+            ok_pages = sorted(done_pages | set(stats.ok_pages))
+            doc.meta["proofread"] = {
+                "pages": len(ok_pages),
+                "ok_pages": ok_pages,
+                "reordered": _cum("reordered", stats.reordered),
+                "text_fixed": _cum("text_fixed", stats.text_fixed),
+                "merged": _cum("merged", stats.merged),
+                "split": _cum("split", stats.split),
+                "deduped": _cum("deduped", stats.dropped),
+                "rejected": _cum("rejected", stats.rejected),
+                "rounds": _cum("rounds", stats.rounds),
+                "tool_calls": _cum("tool_calls", stats.tool_calls),
+                "failed": stats.failed,
+                "tokens": _cum("tokens", stats.tokens),
+                "unreviewed": stats.unreviewed,
+                "notes": stats.notes,
+                "stopped": stats.stopped,
+            }
+            log.info("①c 原文校对（agent）完成：%s / 本次 %d 页 / 用时 %.1fs",
+                     stats.summary(), stats.pages, time.monotonic() - t_pf)
+            for note in stats.notes:
+                log.info("①c 校对记录：%s", note)
+        except Exception as exc:                         # noqa: BLE001 — 校对失败不该毁掉整篇转换
+            log.warning("①c 原文校对整体失败（已跳过，不影响其余步骤）：%s", exc)
+    else:
+        log.info("①c 原文校对：未启用或无 PDF 原件，跳过")
 
     # ── ② 公式 LaTeX 化（决策㉓）—— 必须在翻译之前 ──
     cfg = LLMConfig(base_url=settings.llm_base_url, api_key=settings.llm_api_key,
@@ -237,11 +327,17 @@ def _run(conn: sqlite3.Connection, paper: dict, settings, fingerprint: str | Non
     # 全文无公式的论文在这里完全不会碰 LLM —— 转换仍然应当成功（只是没译文）。
     if any(looks_math(b.en, block_type=b.type)
            for b in doc.blocks if not b.payload.get("latexized")):
+        t_lz = time.monotonic()
         lz = Latexizer(cfg)
-        lz.latexize(doc.blocks, log=lambda *a: log.info(*a))
+        stats = lz.latexize(doc.blocks, log=lambda *a: log.info(*a))
         tokens += lz.tokens_used
+        log.info("② 公式 LaTeX 化完成：%d 块 / %d 切片 / 正式改写 %d / 重试 %d / 失败回落 %d / 用时 %.1fs",
+                 stats.get("blocks", 0), stats.get("chunks", 0), stats.get("done", 0),
+                 stats.get("retried", 0), stats.get("failed", 0), time.monotonic() - t_lz)
+    else:
+        log.info("② 公式 LaTeX 化：无含数学的块，跳过（未调用 LLM）")
 
-    # 解析+公式的成果先缓存（下次同 PDF 可直接复用）
+    # 解析 + 原文校对 + 公式的成果先缓存（下次同 PDF 可直接复用）
     if fingerprint:
         with tx(conn):
             conn.execute(
@@ -254,18 +350,25 @@ def _run(conn: sqlite3.Connection, paper: dict, settings, fingerprint: str | Non
     # 放在翻译**之前**：这些是首屏信息，用户打开文献库时就要看到；
     # 万一后面翻译抛异常，元数据也已经写进 doc.meta 了。
     # ⚠️ 必须早于下面的 doc_cache 失效判断之外 —— 它是**与解析无关**的一步。
+    t_mx = time.monotonic()
     mx = MetadataExtractor(cfg)
     doc.meta.update(mx.extract(doc.blocks, candidates=doc.meta.get("title_candidates"),
                                log=lambda *a: log.info(*a)))
     tokens += mx.tokens_used
+    log.info("②b 元数据抽取完成：title=%r / 用时 %.1fs",
+             doc.meta.get("title_en") or doc.meta.get("title_zh"), time.monotonic() - t_mx)
 
     # ── ③ 翻译（术语表来自计划设置，决策⑫）──
     row = conn.execute("SELECT glossary FROM plan_settings WHERE plan_id=?",
                        (paper["plan_id"],)).fetchone()
     glossary = json.loads(row["glossary"]) if row and row["glossary"] else []
+    t_tr = time.monotonic()
     tr = Translator(cfg, glossary)
     texts = tr.translate_blocks(doc.blocks, log=lambda *a: log.info(*a))
     tokens += tr.tokens_used
+    log.info("③ 翻译完成：%d 块需译 / 待校对 %d 块 / 用时 %.1fs",
+             len(tr.ordered(doc.blocks)), len(getattr(tr, "needs_review", []) or []),
+             time.monotonic() - t_tr)
     for b, text in zip(Translator.ordered(doc.blocks), texts):
         if b.zh_source == "human":
             continue                      # ⑯：人工修订不被覆盖
@@ -275,8 +378,11 @@ def _run(conn: sqlite3.Connection, paper: dict, settings, fingerprint: str | Non
     # ── ④ 标记保真校验（决策④）──
     # ⚠️ 必须 typeset=False：校验器比对的是带标记的 LaTeX 源码（\tag{12} 写在里面），
     #    渲染成 MathML 后编号会变，校验就变成苹果对橘子。
+    t_v = time.monotonic()
     report = validate(en_html(doc, typeset=False), _zh_html(doc, typeset=False))
     enforce_report(report, doc)
+    log.info("④ 标记保真校验：通过（漏译 %d 块已标待校对）/ 用时 %.1fs",
+             len(report.untranslated), time.monotonic() - t_v)
     return doc, tokens
 
 

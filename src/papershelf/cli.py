@@ -204,6 +204,14 @@ def serve(
     """启动服务端（决策⑨ 单体：API + 前端静态产物同进程）。"""
     import uvicorn
 
+    # ⚠️ **必须在 uvicorn.run 之前**配置日志：uvicorn 只配自己的 logger，
+    # 从不碰 root；此前没有任何一处 basicConfig，导致 `papershelf.*` 的 log.info
+    # 全部被静默丢弃（生产实测：一次 7 分钟 / 19 万 token 的转换在日志里完全不可见）。
+    from .server.config import get_settings
+    from .server.logging_setup import setup_logging
+
+    s = get_settings()
+    setup_logging(s.log_level, access_log=s.log_access)
     uvicorn.run("papershelf.server.app:app", host=host, port=port, reload=reload)
 
 

@@ -71,6 +71,17 @@ def pending(conn: sqlite3.Connection) -> list[dict[str, Any]]:
         "SELECT * FROM papers WHERE conv_state='queued' ORDER BY created_at, id").fetchall()]
 
 
+def inflight_counts(conn: sqlite3.Connection) -> dict[str, int]:
+    """`conv_state` → 篇数。给"队列到底在不在动"提供一眼可读的快照。
+
+    为什么要它：生产汇报「一直显示转换中」时，日志里连"有几篇在跑"都没有，
+    运维只能猜。轮询每轮打一次这个快照，配合 `convert_paper` 的开始/完成行，
+    整条时间线自洽可查。
+    """
+    return {str(r["conv_state"]): int(r["n"]) for r in conn.execute(
+        "SELECT conv_state, COUNT(*) AS n FROM papers GROUP BY conv_state")}
+
+
 def _fingerprint_for(paper: dict[str, Any]):
     """与路由里 `_pdf_fingerprint` 同源：有 PDF 才算指纹（arXiv 路线走 None）。"""
     from pathlib import Path
@@ -273,8 +284,26 @@ class ConversionQueue:
     def _loop(self) -> None:
         while not self._stop.is_set():
             try:
+                # 每轮先把全景打出来（有无排队、几篇在跑），再交付 —— 顺序很重要：
+                # 交付期间状态会变，先打快照才能与随后的「开始转换 paper=N」对上。
+                self._log_round()
                 run_once(self.settings, runner=self.runner, pool=self._pool)
             except Exception:             # noqa: BLE001
                 log.exception("队列轮询异常（继续下一轮）")
             # ⚠️ 用 Event.wait 而不是 time.sleep：stop() 时能立刻退出，不必等满一个周期。
             self._stop.wait(self.interval)
+
+    def _log_round(self) -> None:
+        """有活干时才打（空转每 3 秒一行会把日志刷成噪声 —— 那正是可观测性反噬的老毛病）。"""
+        from .db import connect
+
+        try:
+            conn = connect(self.settings)
+        except Exception:                 # noqa: BLE001
+            return
+        try:
+            counts = inflight_counts(conn)
+        finally:
+            conn.close()
+        if counts.get("queued", 0) + counts.get("doing", 0):
+            log.info("队列状态：%s", "，".join(f"{k}={v}" for k, v in sorted(counts.items())))

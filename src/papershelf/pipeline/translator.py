@@ -10,8 +10,10 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import re
+import time
 from dataclasses import dataclass
 
 import httpx
@@ -19,6 +21,10 @@ import httpx
 from .markup import render_block
 from .model import Block
 from .validate import expects_chinese, extract_blocks, validate
+
+# 管线模块自己持 logger（不继承调用方）：`server/logging_setup.py` 给 root 挂 handler，
+# 所以 CLI 与容器里都直接可见；线程级 handler（`paper_log`）会把它们抄进单篇日志。
+log = logging.getLogger("papershelf.pipeline.translator")
 
 SYSTEM_PROMPT = """你是学术论文翻译专家，服务于中文科研人员精读英文文献。
 
@@ -127,12 +133,22 @@ class Translator:
             ],
         }
         headers = {"Authorization": f"Bearer {self.cfg.api_key}", "Content-Type": "application/json"}
+        t0 = time.monotonic()
         with httpx.Client(timeout=self.cfg.timeout) as client:
-            resp = client.post(f"{self.cfg.base_url}/chat/completions", json=payload, headers=headers)
-            resp.raise_for_status()
+            try:
+                resp = client.post(f"{self.cfg.base_url}/chat/completions", json=payload, headers=headers)
+                resp.raise_for_status()
+            except Exception as exc:
+                # 每次失败的调用都要留痕：`translate_blocks` 对调用异常是 `continue`，
+                # 若这里不打，一次网络/配额故障在日志里会表现为"切片忽然变少"（生产踩过 402 吞掉）。
+                log.warning("LLM 调用失败（model=%s，用时 %.1fs）：%s",
+                            self.cfg.model, time.monotonic() - t0, exc)
+                raise
             data = resp.json()
         usage = data.get("usage") or {}
         self.tokens_used += int(usage.get("total_tokens") or 0)
+        log.debug("LLM 调用成功：model=%s，tokens=%s，用时 %.1fs",
+                  self.cfg.model, usage.get("total_tokens"), time.monotonic() - t0)
         return _clean(data["choices"][0]["message"]["content"])
 
     # ── 分块 ──────────────────────────────────────────────────────────────
@@ -178,15 +194,22 @@ class Translator:
         # 注意：上下文仍取自**完整** ordered，只有待翻集合被收窄（断点续跑不影响上下文质量）
 
         index = {b.id: i for i, b in enumerate(ordered)}
-        for ci, chunk in enumerate(self.chunk(todo, max_blocks, max_chars), start=1):
+        chunks = self.chunk(todo, max_blocks, max_chars)
+        # 「进度」必须能回答"还剩多少"：只打「切片 3」看不出是 3/45 还是 3/4
+        # （生产汇报「一直显示转换中」时，日志里连总数都没有，无从判断是否在进行）。
+        log(
+            f"  · 翻译开始：{len(todo)}/{len(ordered)} 块需翻译，共 {len(chunks)} 个切片"
+            f"（{sum(len(b.en) for b in todo)} 字符）"
+        )
+        for ci, chunk in enumerate(chunks, start=1):
             first, last = index[chunk[0].id], index[chunk[-1].id]
             before = ordered[first - 1] if first > 0 else None
             after = ordered[last + 1] if last + 1 < len(ordered) else None
-            log(f"  · 切片 {ci}：{len(chunk)} 块（{sum(len(b.en) for b in chunk)} 字符）")
+            log(f"  · 切片 {ci}/{len(chunks)}：{len(chunk)} 块（{sum(len(b.en) for b in chunk)} 字符）")
             try:
                 out = self._chat(self._user_prompt(chunk, before, after))
             except Exception as exc:  # 网络/接口异常 → 记录并跳过，交由后续重译
-                log(f"    ! 调用失败：{exc}")
+                log(f"    ! 切片 {ci} 调用失败，已跳过（{len(chunk)} 块将在校验后定点重译）：{exc}")
                 continue
             got_order, got_text = extract_blocks(out)
             for b in chunk:

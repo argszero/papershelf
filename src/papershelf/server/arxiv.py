@@ -45,10 +45,13 @@ def import_arxiv_doc(paper: dict, settings) -> Doc:
     arxiv_id, version = normalize_ref(paper.get("source_ref") or "")
     out_dir = settings.papers_dir / f"p{paper['id']}"
     out_dir.mkdir(parents=True, exist_ok=True)
+    log.info("arXiv：解析 %s%s（优先官方 HTML，无则回落 PDF）", arxiv_id, version or "")
 
     html = _fetch_html(arxiv_id, version)
     if html:
+        log.info("arXiv：命中官方 HTML（原生 LaTeX，不花 token 做公式）")
         return _from_html(html, arxiv_id, version, paper, settings)
+    log.info("arXiv：改用 PDF 路线（%s%s）", arxiv_id, version or "")
 
     # ── 回落：下载 PDF，走与上传相同的管线 ──
     pdf_path = out_dir / f"{arxiv_id}{version}.pdf"

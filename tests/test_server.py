@@ -1022,3 +1022,22 @@ def test_converged_untranslated_blocks_do_not_fail_the_paper(settings):
         enforce_report(Report(out_of_order=["b-0001"], ok=False), doc)
     with pytest.raises(RuntimeError):
         enforce_report(Report(tag_imbalance={"div": 1}, ok=False), doc)
+
+
+def test_pending_proofread_pages_resumes_a_half_done_paper():
+    """⚠️ 回归（2026-09-14）：判据若是"有页校过就跳过"，半成品会**永远**停在那里。
+
+    预算用尽 / 上游 504 都会留下"校了一半"的 `ok_pages` —— 那时该接着校剩下的页。
+    """
+    from papershelf.pipeline.model import Block, Doc
+    from papershelf.server.converter import _pending_proofread_pages
+
+    doc = Doc()
+    for i, page in enumerate((1, 2, 3), start=1):
+        doc.blocks.append(Block(id=f"b-{i:04d}", type="p", en="text", payload={"page": page}))
+    assert _pending_proofread_pages(doc, []) == [1, 2, 3]
+    assert _pending_proofread_pages(doc, [1, 2]) == [3]      # 接着校第 3 页，不是整篇跳过
+    assert _pending_proofread_pages(doc, [1, 2, 3]) == []    # 全都校过才算完
+    # 页的集合由"哪几页有块"决定（哪怕块文本是空的）
+    doc.blocks.append(Block(id="b-0004", type="p", en="", payload={"page": 99}))
+    assert _pending_proofread_pages(doc, [1, 2, 3]) == [99]

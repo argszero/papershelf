@@ -83,7 +83,23 @@ def _lifespan(app: FastAPI):
 
 def create_app() -> FastAPI:
     settings = get_settings()
+    # ⚠️ 日志必须在**任何业务动作之前**配好：`init_db`/`ensure_admin` 都会打日志，
+    # 晚一步配就等于把启动阶段（最容易出错的一段）的日志丢掉。
+    # `serve` 里也调了一次（同一入口，幂等）；这里再调是为了覆盖
+    # `uvicorn papershelf.server.app:app`（不经 CLI）与测试直接建 app 的用法。
+    from .logging_setup import setup_logging
+
+    setup_logging(settings.log_level, access_log=settings.log_access)
     init_db(settings)
+    # 启动摘要：排障时先看这几行就够判断"实例是以什么配置跑起来的"。
+    # ⚠️ **绝不打印密钥**（`llm_api_key` / `secret` / `smtp_pass` 一律只报"有无"）。
+    log.info("启动配置：data=%s base_url=%s queue=%s 并发=%s max_attempts=%s "
+             "llm=%s model=%s smtp=%s 自助注册=%s 日志级别=%s（每篇日志=%s）",
+             settings.data_dir, settings.base_url,
+             settings.queue_enabled, settings.max_concurrency, settings.max_conv_attempts,
+             (settings.llm_base_url or "未配置"), settings.llm_model,
+             ("已配置" if settings.smtp_configured else "未配置"), settings.open_registration,
+             settings.log_level, settings.log_per_paper)
     if settings.admin_email:
         conn = connect(settings)
         try:
