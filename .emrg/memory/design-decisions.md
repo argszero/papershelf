@@ -282,6 +282,17 @@ toast('已加入 N 篇到「' + pl.name + '」');    // L2143
 - ⑧ 服务端统一 Key → 注册门槛是**成本闸门**，故邮箱验证不可省
 - ⑩⑪ 匿名只读分享**不受注册限制影响**（访客无需注册）
 
+### 修订（2026-09-15 宿主：「注册邮箱，除了 edu.cn 外，再添加对 .ac.cn 的支持」）
+- **默认白名单 → `edu.cn,ac.cn`**（`.ac.cn` = 科研院所，如 `cas.ac.cn` / `imr.ac.cn`）。
+- **比对逻辑没动**：一直是 `domain == d or domain.endswith("." + d)` —— 子域天然命中
+  （`stu.pku.edu.cn` 命中 `edu.cn`），`ac.cn` 只是多一项**后缀**。
+- 只改了默认值 + `.env.example` + `docs/install.md`；顺带修掉 Admin 页写死的
+  「开放注册限 .edu.cn」（白名单是环境变量，前端写死域名会与实际配置对不上）。
+- ⚠️ **部署者显式配了 `PAPERSHELF_EMAIL_DOMAIN_ALLOWLIST` 时，默认值不生效** ——
+  生产 `.env` 里那条 `=edu.cn` 会盖掉新默认，**必须改 env 并重启容器**才真的放宽。
+- 测试钉两点：子域必须命中，且后缀比对**不能退化成 `endswith(d)`**
+  （`notedu.cn` / `evil-ac.cn` / `edu.cn.evil.com` 必须拒绝）。
+
 ---
 
 ## ⑮ 邮箱验证 = SMTP 可选 + 自动降级  `c1e6b5d3`
