@@ -299,6 +299,7 @@ def _run(conn: sqlite3.Connection, paper: dict, settings, fingerprint: str | Non
                 "ok_pages": ok_pages,
                 "reordered": _cum("reordered", stats.reordered),
                 "text_fixed": _cum("text_fixed", stats.text_fixed),
+                "retyped": _cum("retyped", stats.retyped),
                 "merged": _cum("merged", stats.merged),
                 "split": _cum("split", stats.split),
                 "deduped": _cum("deduped", stats.dropped),

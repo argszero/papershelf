@@ -143,6 +143,69 @@ def test_split_block_needs_two_parts(tools):
     assert out.error and tools.stats.rejected == 1
 
 
+# ── ⑤ 类型修订（`set_block_type`）────────────────────────────────────────────
+# 宿主 2026-09-15：「agent 要告诉它保证样式和排版的一致性是很重要的」。
+# 起因：`Abstract` 这类标题被 PyMuPDF 并进摘要段落，**agent 当时没有任何工具能表达
+# "这是标题"**（`edit_block` 只改文字、`split_block` 还沿用原类型）→ 覆盖面被工具清单砍掉。
+
+def test_set_block_type_promotes_paragraph_to_heading(tools):
+    tools.doc.blocks[0].en = "Abstract"
+    out = tools.call("set_block_type", {"id": "b-0001", "type": "h2", "reason": "加粗、独占一行"})
+    assert not out.error and tools.stats.retyped == 1
+    b = tools.doc.blocks[0]
+    assert (b.type, b.level, b.en) == ("h2", 2, "Abstract")     # 类型变了、文字没动
+
+
+def test_set_block_type_downgrade_and_noop(tools):
+    tools.doc.blocks[0].en = "1 Introduction"
+    tools.call("set_block_type", {"id": "b-0001", "type": "h3"})
+    assert (tools.doc.blocks[0].type, tools.doc.blocks[0].level) == ("h3", 3)
+    out = tools.call("set_block_type", {"id": "b-0001", "type": "h3"})
+    assert not out.error and "已经是" in out.text and tools.stats.retyped == 1
+
+
+def test_set_block_type_refuses_h1_and_alien_types(tools):
+    for bad in ("h1", "figure", "div", ""):
+        out = tools.call("set_block_type", {"id": "b-0001", "type": bad})
+        assert out.error, bad
+    assert tools.stats.retyped == 0
+    assert tools.doc.blocks[0].type == "p"                      # 一个都没改进去
+
+
+def test_set_block_type_refuses_long_paragraph(tools):
+    """长段落不许直接变标题 —— 那是 `split_block` 的活（否则大纲里全是假章节）。"""
+    tools.doc.blocks[0].en = "word " * 60
+    out = tools.call("set_block_type", {"id": "b-0001", "type": "h2"})
+    assert out.error and "标题不该这么长" in out.text and "split_block" in out.text
+    assert tools.stats.retyped == 0 and tools.doc.blocks[0].type == "p"
+
+
+def test_set_block_type_refuses_figure_and_refs(tools):
+    tools.doc.blocks[0].type = "figure"
+    tools.doc.blocks[0].payload["caption"] = "Fig. 1. A figure caption long enough."
+    tools.doc.blocks[1].type = "refs"
+    for bid in ("b-0001", "b-0002"):
+        out = tools.call("set_block_type", {"id": bid, "type": "h2"})
+        assert out.error, bid
+    assert tools.stats.retyped == 0
+
+
+def test_set_block_type_is_advertised_to_the_agent(tools):
+    specs = {s["function"]["name"]: s["function"] for s in tools.specs()}
+    assert "set_block_type" in specs
+    enum = specs["set_block_type"]["parameters"]["properties"]["type"]["enum"]
+    assert enum == ["p", "h2", "h3", "h4"]                       # h1 不给（它是文章标题）
+
+
+def test_prompt_requires_style_consistency():
+    """提示词里必须写明"样式/排版一致性"这条 —— 宿主点名的要求。"""
+    from papershelf.pipeline.proofread import SYSTEM_PROMPT as P
+    assert "样式与排版的一致性" in P
+    assert "同级的标题必须同级" in P
+    assert "拿不准就别改" in P
+    assert "改文字与改类型是两件事" in P
+
+
 def test_merge_block_joins_previous_on_same_page(tools):
     tools.doc.blocks[0].en = "This sentence is continued"
     tools.doc.blocks.insert(1, Block(id="b-0009", type="p", en="and the tail of it.",

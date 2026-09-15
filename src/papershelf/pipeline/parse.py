@@ -45,7 +45,9 @@ from .model import Doc, make_block_id
 # 版本历史（混入缓存指纹：语义一变，旧解析产物自动失效、下次转换重建）
 #   v4 → 分栏阅读顺序（gutter 探测 + 迭代剔通栏块 + 覆盖度兜底；实测好 62 页 / 差 0 页）
 #   v5 → 抽取文本**确定性清洗**（连字 ﬁ/ﬂ → fi/fl、`\xa0` → 空格，见 `clean_text`）
-PARSE_VERSION = 5
+#   v6 → 「加粗小标题 + 正文」被并成一块的**行级拆分**（见 `_split_runin_heads`）：
+#        此前 `Abstract` / `Keywords` 这类具名小标题**根本不存在于产物里**
+PARSE_VERSION = 6
 
 # 页面上下边缘（比例），落在其中的短文本块视为页眉/页脚候选
 EDGE_TOP, EDGE_BOTTOM = 0.075, 0.925
@@ -71,8 +73,31 @@ _MARGIN_BAND = 0.05
 _RE_H2 = re.compile(r"^([IVX]{1,6})\.\s+\S")
 _RE_H3 = re.compile(r"^([A-Z])\.\s+\S")
 _RE_H4 = re.compile(r"^\d+(?:\.\d+){1,3}\.?\s+\S")
-# 无编号但具名的顶层章节
-_RE_H2_NAMED = re.compile(r"^(REFERENCES|REFERENCES\b|ACKNOWLEDGMENT|ACKNOWLEDGEMENT|APPENDIX|CONCLUSION)\b", re.I)
+# 无编号但具名的顶层章节（含 `Abstract` / `Keywords` —— 它们与编号章节同级）
+_RE_H2_NAMED = re.compile(
+    r"^(ABSTRACT|REFERENCES|BIBLIOGRAPHY|ACKNOWLEDGMENTS?|ACKNOWLEDGEMENTS?|"
+    r"APPENDIX|CONCLUSIONS?|KEY\s?WORDS|摘要|关键词)\b", re.I)
+
+# ── 「具名小标题 + 正文」被并成一块的拆分（见 `_split_runin_heads`）─────────────
+# 期刊常把 `Abstract` / `Keywords` 排成**加粗行内标题**，PyMuPDF 的块聚合会把标题行与
+# 紧随其后的正文并成**一个块** → 标题在产物里根本不存在（详见 `_split_runin_heads`）。
+# 这里列出这些「整行文本就等于标题词」的名字（归一化后比对，含中文排版）。
+_NAMED_HEADS = frozenset({
+    "abstract", "keywords", "key words", "references", "bibliography",
+    "acknowledgment", "acknowledgments", "acknowledgement", "acknowledgements",
+    "appendix", "conclusion", "conclusions", "摘要", "关键词",
+})
+# 标题文本长度上限：超过就不可能是标题（宁可漏拆，也不能把正文劈碎）
+_MAX_RUNIN_HEAD_CHARS = 60
+# 拆出来之后剩下的正文至少这么长 —— 否则只是把一个碎片分成两个碎片
+_MIN_RUNIN_BODY_CHARS = 25
+_RE_BOLD_FONT = re.compile(r"bold|black|heavy|semibold", re.I)
+# 句末标点（**不含冒号** —— `Abstract:` 是常见排法，要能拆）
+_RE_TERMINAL_PUNCT = re.compile(r"[.,;!?，。；！？]$")
+# 标题里不该出现的东西：人名/单位行才会有的逗号与分隔点
+_RE_NOT_HEAD_LIKE = re.compile(r"[,;·、]|\bet\s+al\b")
+# 编号前缀（**只剥编号、不要求后半像标题** —— 后半的判据见 `_looks_like_numbered_head`）
+_RE_HEAD_NUM = re.compile(r"^(?:[IVX]{1,6}\.|[A-Z]\.|\d+(?:\.\d+){1,3}\.?)\s+")
 # 小型大写字母（small caps）在 PDF 提取时会插入伪空格：I NTRODUCTION → INTRODUCTION
 _RE_SMALLCAPS = re.compile(r"\b([A-Z]) ([A-Z]{2,})")
 # 纯装饰/标记块（如期刊 logo 里的单字母）
@@ -551,6 +576,148 @@ def _heading_level(block: dict[str, Any], body_size: float) -> int | None:
     return None
 
 
+# ── 「具名小标题 + 正文」被并成一块 → 行级拆开 ─────────────────────────────
+
+def _span_text(span: dict[str, Any]) -> str:
+    return span.get("text") or ""
+
+
+def _norm_head(text: str) -> str:
+    """标题比对用的归一形式：折叠空白、去掉尾部的冒号/句点、转小写。"""
+    t = re.sub(r"\s+", " ", text or "").strip()
+    t = re.sub(r"[\s:：.·]+$", "", t)
+    return t.lower()
+
+
+def _is_bold_span(span: dict[str, Any]) -> bool:
+    return bool(_RE_BOLD_FONT.search(span.get("font") or ""))
+
+
+def _spans_bbox(spans: list[dict[str, Any]]) -> list[float] | None:
+    boxes = [s["bbox"] for s in spans if s.get("bbox")]
+    if not boxes:
+        return None
+    return [min(b[0] for b in boxes), min(b[1] for b in boxes),
+            max(b[2] for b in boxes), max(b[3] for b in boxes)]
+
+
+def _group_lines(pairs: list[tuple[int, dict[str, Any]]]) -> list[tuple[int, list[dict[str, Any]]]]:
+    out: list[tuple[int, list[dict[str, Any]]]] = []
+    for li, s in pairs:
+        if out and out[-1][0] == li:
+            out[-1][1].append(s)
+        else:
+            out.append((li, [s]))
+    return out
+
+
+def _sub_block(block: dict[str, Any],
+               groups: list[tuple[int, list[dict[str, Any]]]]) -> dict[str, Any]:
+    """按「(原行号, spans)」分组造一个最小可用的文本块（bbox 由 spans 重算）。
+
+    只保留后续流程真正用到的键：`type` / `bbox` / `lines`（其余流程看 `lines` 里的
+    `spans`——字体、字号都在里面，标题判定要用）。
+    """
+    lines: list[dict[str, Any]] = []
+    for _, spans in groups:
+        box = _spans_bbox(spans)
+        if box is None:
+            continue
+        lines.append({"bbox": box, "spans": spans, "wmode": 0, "dir": (1, 0)})
+    new = {k: v for k, v in block.items() if k in ("number", "size")}
+    new.update({"type": 0, "bbox": _spans_bbox([s for _, sp in groups for s in sp])
+                or block.get("bbox"), "lines": lines})
+    return new
+
+
+def _looks_like_numbered_head(text: str) -> bool:
+    """`II. Section` / `A. Section` / `1.2 Section` 这类编号标题（用于拆分判据）。
+
+    ⚠️ **不能只看 `_RE_H2/H3/H4`**：`_RE_H3` 是「单大写字母 + 句点」，而**作者名行**
+    天然长这样 —— 实测 B2-02 的 `T. Herzog 1,2 · M. Brandt 1 · …` 就被误判成 `T.`
+    开头的次级标题，作者行被劈成两块。所以剥掉编号后剩下的部分还要**像标题**：
+    不含逗号/分隔点/`et al`（人名与单位行的指纹）、不超 8 个词；`II.`/`A.` 后不带数字。
+    """
+    m = _RE_HEAD_NUM.match(text)
+    if not m:
+        return False
+    rest = text[m.end():].strip()
+    if not rest or _RE_NOT_HEAD_LIKE.search(rest) or len(rest.split()) > 8:
+        return False
+    if (_RE_H2.match(text) or _RE_H3.match(text)) and any(c.isdigit() for c in rest):
+        return False                                          # `A. 1.2 …` 是行号不是标题
+    return True
+
+
+def _split_runin_heads(block: dict[str, Any], body_size: float) -> list[dict[str, Any]]:
+    """把「具名小标题 + 正文」被 PyMuPDF 并成一块的块拆开（返回 1 或 2 个块）。
+
+    ## 为什么必须拆（2026-09-15 宿主实测报「abstract 没识别成标题」）
+
+    页面上 `Abstract` 是**独占一行的加粗小标题**，PyMuPDF 却把它和紧随其后的 16 行摘要
+    正文并成了**一个 17 行的块**。`_heading_level` 的两道闸门（`len(text) > 160 → None`、
+    `_RE_H2_NAMED` 要求 `len(text) < 60`）于是把它判成普通段落 ——
+    **`Abstract` 这个标题在产物里根本不存在**（生产 paper 2 实测 b-0006 = 整段摘要）。
+    `Keywords` 同理，只是更隐蔽：Semibold 的 `Keywords` 与关键词列表在**同一行**。
+
+    ## 判据（宁可漏拆，不许拆错）
+
+    拆错会把一句话劈成两块，破坏左右对照与译文对齐，所以**只拆拆出来一定会被判成标题的**：
+
+    - **A 整行**就是具名标题词（`Abstract` / `Keywords` / `摘要`…）—— 不看加粗
+      （有些排版不加粗；"整行只有这一个词"本身就是足够的判据）；
+    - **B 前导加粗段**是具名标题词、**编号标题**（`II.` / `A.` / `1.2`）或**字号大于正文**。
+
+    两种情形都还要：标题短（≤ `_MAX_RUNIN_HEAD_CHARS`）、不以句末标点收尾、
+    后面确实跟着正文（≥ `_MIN_RUNIN_BODY_CHARS` 字符）。**任何一条不满足就原样返回。**
+
+    这样 B 不会把「**Note** 这是一段话」这种句中加粗（拆出来是 `p`、白碎一块）拆开：
+    那种首行不是具名标题、不匹配编号、字号也没变大 → 不拆。
+    """
+    lines = block.get("lines") or []
+    pairs: list[tuple[int, dict[str, Any]]] = [
+        (li, s) for li, ln in enumerate(lines) for s in (ln.get("spans") or [])
+        if _span_text(s).strip()
+    ]
+    if len(pairs) < 2:
+        return [block]
+
+    first_line = [s for li, s in pairs if li == 0]
+    head: list[dict[str, Any]] = []
+    tail: list[tuple[int, dict[str, Any]]] = []
+    if first_line and _norm_head("".join(_span_text(s) for s in first_line)) in _NAMED_HEADS:
+        head = first_line                                     # A：整行就是具名标题
+        tail = [(li, s) for li, s in pairs if li > 0]
+    else:                                                     # B：前导加粗段
+        i = 0
+        while i < len(pairs) and _is_bold_span(pairs[i][1]):
+            i += 1
+        head = [s for _, s in pairs[:i]]
+        tail = pairs[i:]
+
+    if not head or not tail:
+        return [block]
+    head_text = clean_text(" ".join(_span_text(s) for s in head)).strip()
+    body_text = clean_text(" ".join(_span_text(s) for _, s in tail)).strip()
+
+    if not head_text or len(head_text) > _MAX_RUNIN_HEAD_CHARS:
+        return [block]
+    if len(body_text) < _MIN_RUNIN_BODY_CHARS:
+        return [block]
+    if _RE_TERMINAL_PUNCT.search(head_text):
+        return [block]
+    if _norm_head(head_text) in _NAMED_HEADS:                 # A / B：具名
+        pass
+    elif _looks_like_numbered_head(head_text):                # B：编号标题
+        pass
+    elif max((s.get("size") or 0.0) for s in head) >= body_size + 1.0:
+        pass                                                  # B：字号大于正文
+    else:
+        return [block]
+
+    return [_sub_block(block, [(0, head)]), _sub_block(block, _group_lines(tail))]
+
+
 
 def _pair_captions_by_geometry(
     images: list[dict[str, Any]], texts: list[dict[str, Any]]
@@ -748,6 +915,9 @@ def parse_pdf(
         width = widths[page_no - 1]
         text_blocks = [b for b in blocks if b.get("type") == 0 and _block_text(b)]
         text_blocks = [b for b in text_blocks if _block_text(b) not in headers]
+        # 「加粗小标题 + 正文」被 PyMuPDF 并成一块的，先按行拆开 —— 不拆则 `Abstract`
+        # 这类标题在产物里**根本不存在**（见 `_split_runin_heads`）。
+        text_blocks = [x for b in text_blocks for x in _split_runin_heads(b, body_size)]
         image_blocks = [b for b in blocks if b.get("type") == 1]
 
         # 每个块都**记下自己来自 PDF 第几页**（`payload.page`）——阅读器/导出据此重建

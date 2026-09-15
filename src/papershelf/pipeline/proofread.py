@@ -149,6 +149,12 @@ _MAX_GROWTH_RATIO = 3.0
 _MAX_GROWTH_SLACK = 300
 _MIN_SIMILARITY = 0.55
 
+# 类型修订（`set_block_type`）：允许的层级映射 + 标题长度上限。
+# `h1` **故意不在**：h1 是文章标题（解析阶段就抽进 meta、由页眉渲染），
+# 正文里再出现一个 h1 会让标题重复、并污染大纲（宿主强调「样式与排版的一致性」）。
+_BLOCK_TYPES = {"p": 0, "h2": 2, "h3": 3, "h4": 4}
+_MAX_HEAD_CHARS = 160
+
 _RE_FENCE = re.compile(r"^\s*```(?:json)?\s*|\s*```\s*$", re.M)
 
 # ── 自动检出（"尺子"）：程序能**量**出可疑，但"该不该改"只有看图才知道 ──────
@@ -221,9 +227,26 @@ SYSTEM_PROMPT = """你是学术论文的**原文抽取校对 agent**。
 - **文字**：行末断词（`vari- ous` → `various`）、连字、上下标、错字、多余空格（引用编号
   `[ 12 ]` → `[12]`、句点前空格）、被版面切碎的公式片段。
 - **块结构**：一句话被拆成两块（应合并）、一段被并成一块（应切分）、重复块（应删除）。
+- **块类型**：这一块到底是**标题**还是**段落**（`p` / `h2` / `h3` / `h4`）。
+  判据是页图上的**字体、字号、加粗、是否独占一行**；标题/段落判错时用 `set_block_type` 改。
 - **阅读顺序**：这一页正确的读序（先上后下、先左栏后右栏、通栏块在其所在位置）。
 - **笔记**：抽取**丢失**的内容（图里有的图标/编号/符号而未抽到）在 `finish` 的总结里说明，
   但**不要凭想象补写**到文本里。
+
+## 样式与排版的一致性（宿主强调：这一条最重要）
+
+校对的产物是**一篇读起来版式统一的文档**，不是一堆各自看着合理的块。所以判类型时**不要在单块上
+孤立地看**，要拿它和全篇**同类**比 —— `read_blocks` 会把每块的 `type` 一起给你，比一比就知道：
+
+- 正文的章节标题（`1 Introduction`、`2 Methods`…）是 h2，那么**无编号的具名小节**
+  （`Abstract`、`Keywords`、`Acknowledgements`、`REFERENCES`）就是**同级 h2**；
+- 上一级用 h2、下一级用 h3/h4 —— **同级的标题必须同级**，不许一个 h2 一个 h3；
+- 图注、表注、作者行、单位行、页眉页脚、出版社水印**都不是标题**，别升成 h 级
+  （把作者行或页脚变成 h2，大纲就会长出一堆假章节）。
+
+**拿不准就别改**：层级一旦乱，大纲、章节归属、左右对照的排版全都跟着乱 ——
+这比"某一块看着更像标题"严重得多。改类型用 `set_block_type`，**不要**用它当改文字的替代
+（那用 `edit_block`），反之亦然。
 
 ## 纪律
 
@@ -234,6 +257,8 @@ SYSTEM_PROMPT = """你是学术论文的**原文抽取校对 agent**。
 5. 每页核对完必须 `mark_page_done(page)`；全部完成后 `finish(summary)`。
    还有页没 `mark_page_done` 时 `finish` 会被拒绝，并告诉你还差哪几页。
 6. 工具报错（护栏拒绝）说明你的改法不成立 —— 要么换个改法，要么承认这块没问题，别硬来。
+7. **改文字与改类型是两件事**：`edit_block` 只改文字，`set_block_type` 只改类型；
+   改类型时**一个字都不许动**（正文原样留在块里）。
 
 ## 省成本：每页两轮（这是硬要求）
 
@@ -241,8 +266,9 @@ SYSTEM_PROMPT = """你是学术论文的**原文抽取校对 agent**。
 
 - **第 1 轮（看）**：同一轮里把 `read_page(page)` + `read_blocks(page)` 一起调
   （想同时看放大区就一起调；需要的话再带上 `read_block`）。
-- **第 2 轮（改）**：把这一页**所有** `edit_block` / `split_block` / `merge_block` /
-  `delete_block` / `reorder_page` 和 `mark_page_done(page)` **放在同一轮里一次性提交**。
+- **第 2 轮（改）**：把这一页**所有** `edit_block` / `set_block_type` / `split_block` /
+  `merge_block` / `delete_block` / `reorder_page` 和 `mark_page_done(page)`
+  **放在同一轮里一次性提交**。
 
 别把改动一个一个分轮提交（同一个块反复 `edit_block` 也算）。一页最多两轮；也可以一轮处理两页
 （`read_page(1)` + `read_page(2)`，**一轮最多看两页**，再多会被服务器截掉）。确实需要复看时
@@ -287,6 +313,7 @@ class ProofreadStats:
     failed: int = 0                    # 调用或解析失败、重试用尽
     reordered: int = 0                 # 页数
     text_fixed: int = 0
+    retyped: int = 0                   # 类型修订（`set_block_type`：标题 ↔ 段落）
     merged: int = 0
     split: int = 0
     dropped: int = 0
@@ -301,6 +328,7 @@ class ProofreadStats:
 
     def summary(self) -> str:
         s = (f"{self.pages} 页 / 顺序修订 {self.reordered} 页 / 文字修订 {self.text_fixed} 块"
+             f" / 类型修订 {self.retyped} 块"
              f" / 合并 {self.merged} / 拆分 {self.split} / 去重 {self.dropped}"
              f" / 护栏拒绝 {self.rejected} / {self.rounds} 轮 {self.tool_calls} 次工具"
              f" / 失败 {self.failed} 页 / 跳过 {self.skipped} 页 / {self.tokens} tokens")
@@ -413,6 +441,16 @@ class ProofreadTools:
               {"id": {"type": "string"}, "text": {"type": "string"},
                "reason": {"type": "string", "description": "简述依据（你从图上看到了什么）"}},
               ["id", "text"]),
+            f("set_block_type", "改某块的**类型**：它其实是标题还是段落、几级标题。"
+                                "只在你对照页图**确认**了它被抽错时才改（加粗/独占一行/"
+                                "与全篇同类标题样式一致）。文本一个字都不动。"
+                                "h2 = 顶层章节（与 Abstract、Keywords、REFERENCES 同级），"
+                                "h3 / h4 依次更深。h1 是文章标题（不在正文里，别用）。",
+              {"id": {"type": "string"},
+               "type": {"type": "string", "enum": ["p", "h2", "h3", "h4"],
+                        "description": "p=普通段落；h2/h3/h4=标题层级"},
+               "reason": {"type": "string", "description": "依据：图上什么字体/字号，和谁同级"}},
+              ["id", "type"]),
             f("split_block", "把一块**切成多块**（它其实是多段被并在一起）。parts 是切好后的各段文本。",
               {"id": {"type": "string"},
                "parts": {"type": "array", "items": {"type": "string"},
@@ -552,6 +590,42 @@ class ProofreadTools:
         self.stats.text_fixed += 1
         log.info("  ✎ %s 文字修订：%r → %r（%s）", b.id, old[:60], new[:60], a.get("reason") or "")
         return ToolOut(f"已更新 {b.id}（{len(old)} → {len(new)} 字符）。")
+
+    def _t_set_block_type(self, a: dict) -> ToolOut:
+        """改块的**类型**（标题 ↔ 段落）—— 文字不动。
+
+        宿主 2026-09-15：「agent 要告诉它保证样式和排版的一致性是很重要的」。
+        所以护栏不只是"格式合法"，还要挡掉**会把层级搞乱**的改法：
+        长段落不能变标题（那是 `split_block` 的活）、图片/参考文献条目不能变标题、
+        `h1` 不许用（h1 是文章标题，由 meta 渲染，正文里出现会重复且污染大纲）。
+        """
+        b = self._find(str(a.get("id") or ""))
+        if b is None:
+            return ToolOut(f"没有块 {a.get('id')}", error=True)
+        want = str(a.get("type") or "").strip().lower()
+        if want not in _BLOCK_TYPES:
+            self.stats.rejected += 1
+            return ToolOut(f"类型 {want!r} 不接受。可用：p（段落）/ h2（顶层章节，与 Abstract、"
+                           f"Keywords、REFERENCES 同级）/ h3 / h4。h1 是文章标题（由元数据渲染，"
+                           f"正文里不要用）。", error=True)
+        if b.type in ("figure", "refs"):
+            self.stats.rejected += 1
+            return ToolOut(f"{b.id} 是{b.type}块，不能改类型"
+                           + ("（改图注文字用 `edit_block`）。" if b.type == "figure"
+                              else "（REFERENCES 小标题已由程序标好）。"), error=True)
+        text = (b.en or "").strip()
+        if want != "p" and len(text) > _MAX_HEAD_CHARS:
+            self.stats.rejected += 1
+            return ToolOut(f"拒绝：这一块有 {len(text)} 字符，标题不该这么长 —— "
+                           f"如果它其实是『标题 + 正文』被并在一起，先用 `split_block` 切开，"
+                           f"再给标题那一段调类型。", error=True)
+        if b.type == want:
+            return ToolOut(f"{b.id} 已经是 {want}，无需改动。")
+        old = b.type
+        b.type, b.level = want, _BLOCK_TYPES[want]
+        self.stats.retyped += 1
+        log.info("  ⤴ %s 类型修订：%s → %s（%s）", b.id, old, want, a.get("reason") or "")
+        return ToolOut(f"{b.id}：{old} → {want}（文字未动）。")
 
     def _t_split_block(self, a: dict) -> ToolOut:
         b = self._find(str(a.get("id") or ""))
@@ -917,7 +991,8 @@ class Proofreader:
         done = sorted(impl.done_pages)
         stat = impl.stats
         summary = (f"[进度摘要·自动生成] 已核对完成的页：{done}（共 {impl.page_count} 页）。"
-                   f"累计：文字修订 {stat.text_fixed} 块 / 合并 {stat.merged} / 拆分 {stat.split}"
+                   f"累计：文字修订 {stat.text_fixed} 块 / 类型修订 {stat.retyped} 块"
+                   f" / 合并 {stat.merged} / 拆分 {stat.split}"
                    f" / 去重 {stat.dropped} / 顺序修订 {stat.reordered} 页 / 护栏拒绝 {stat.rejected}。"
                    f"这些改动**已经落库**，不必重做；上面被省略的历史只是那几页的工具往返记录，"
                    f"需要复查就重新 read_page / read_blocks。还没核对的页：{impl.pending_pages}。")
