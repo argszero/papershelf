@@ -107,6 +107,13 @@ def expects_chinese(en_text: str, *, block_type: str = "") -> bool:
         # `\mathrm` / `\text` 里数出词来 → 判「本应有中文」→ 模型给不出中文 →
         # 重译 2 轮仍不合格 → 整篇转换报废（生产实测：一篇 400 块论文因这类块整体 failed）。
         return bool(prose_core(en_text))
+    if block_type == "table":
+        # 表格（决策㊴）：`en_text` 是**网格的裸文本串**（行一行一行、格以 ` | ` 分隔，
+        # 见 `model.table_text`）。判据与正文同一套 —— 只有**纯数字/符号**的表才免译
+        # （那种表把中文塞进格子里只会更糟），有实词就必须有中文。
+        # ⚠️ 这里必须与 translator 的表格通路**同判据**，否则又是「不译 → 判漏译 →
+        # 重译 → 仍不译」的死循环（`translator` 复用本函数，单一来源）。
+        return bool(prose_core(en_text))
     outside = prose_core(en_text)
     if len(outside) >= MIN_WORDS_FOR_ZH:
         return True

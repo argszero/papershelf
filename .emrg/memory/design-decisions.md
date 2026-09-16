@@ -2,7 +2,7 @@
 id: "decisions-master"
 event_at: "2026-09-10T17:52:00+08:00"
 created_at: "2026-09-10T17:52:00+08:00"
-updated_at: "2026-09-16T19:40:00+08:00"
+updated_at: "2026-09-16T20:40:00+08:00"
 type: decision
 scope: project
 status: active
@@ -13,9 +13,10 @@ status: active
 产生方式：宿主与助手**一次一问**逐题澄清（见 `collab-one-question-at-a-time.md`）。
 本文件是**所有设计决策的唯一事实来源**（原先的 11 个单决策碎片文件已 `status: merged` 并入此处）。
 
-> 进度：①–㊳ 全部 ✅（需求澄清完成 + 已落地）→ ㉒ 定的推进方式：**设计文档写到管线即开干**
-> 最近三条：㊱ 「待读→在读」自动翻转 + `last_read_at` · ㊲ ①c 分块校对（栏间续段标记）·
-> **㊳ 凡是有可选文字的块都可划**（标题/参考文献补坐标系 —— 选中标题不弹浮条，2026-09-16）
+> 进度：①–㊴ 全部 ✅（需求澄清完成 + 已落地）→ ㉒ 定的推进方式：**设计文档写到管线即开干**
+> 最近三条：㊲ ①c 分块校对（栏间续段标记）· ㊳ 凡是有可选文字的块都可划（标题补坐标系）·
+> **㊴ 表格重建 = ①c agent 的 `set_table`**（结构交给视觉、认字回文本层 + 逐字来源/形状/不吃正文三护栏，
+> 单元格双语 `rows` + `rows_zh`，2026-09-16）
 
 ---
 
@@ -424,6 +425,10 @@ toast('已加入 N 篇到「' + pl.name + '」');    // L2143
 - **PDF 下载完整性校验**：比对 `content-length` + PIL 检测底部 25% 纯黑占比 >50% 判截断；补全用 `curl -sL -C -` 多轮续传
 - 图片映射用**坐标交叉验证**（双栏：左栏 x≈54 / 右栏 x≈309，按 (y,x) 排序配图注）
 - 表格**坐标级重建**（`get_text()` 会打乱行内单元格顺序，须用 line 级 `x0` 判列）
+  → ⚠️ **2026-09-10 写在这里、直到 2026-09-16 才做**（决策 ㊴）：**写了的没做是真实成本**
+  —— 三周里所有论文的表格都是粘连的散文，还额外白送翻译。**实现路径也换了**：
+  line 级 `x0` 判列在这类「有横线、没竖线」的表上不可用，改由 ①c agent 看页图判结构、
+  **认字回文本层**（见 ㊴）。
 
 ### 范围界定（宿主已接受）
 - **不做 DOI 链接**：非 arXiv 期刊 PDF 反爬严重（ScienceDirect 弹 CAPTCHA、Wiley 有 Cloudflare），自动化成功率低；**反爬是运维问题，不应由产品承担**
@@ -1647,6 +1652,121 @@ DB 与 `.env` 部署前已备份（`papershelf.db.bak.20260916-193210`、`.env.b
 
 ---
 
+## ㊴ 表格重建 = ①c 校对 agent 的 `set_table`（单元格双语网格）（2026-09-16 宿主指示）  `0b155162`
+
+宿主原话（带两张截图）：**「表格和原pdf差异较大」**，并贴出 PDF 原表与我们的渲染做对比。
+
+### 病灶：解析端**从来没有**表格识别 —— 而且设计文档早写了"必须内建"
+
+- `parse.py` 里 `table` 一词**零出现**：`page.get_text()` 按**阅读顺序**吐行，
+  同一行里并排的单元格于是被**粘成一句话**（原件实测 `b-0037` = 「Naive Bayes (BN)
+  Support vector machine (SVM)」—— 那是三列表里同一行的三个格子），列关系**全丢**。
+- 后果不止难看：这串粘连文字**还要送去翻译**（花 token 译一段本不存在的句子），
+  校验也拿它当散文。
+- 数据：生产 paper 1 共 498 块、paper 2 共 909 块，**零 `table` 块**；
+  paper 1 有 3 页真表（p3 / p20 / p21），**7 张表全部中招**。
+- ⚠️ 挫伤点在"**写了的没做**"：设计基线（本文件「必须内建」节）早就写明
+  「**表格坐标级重建**」——两条路径的差异只在于"谁来判结构"，但实现里连入口都没有。
+
+### 为什么程序侧判不了（三条候选路径都试过）
+
+| 路径 | 实测结果 |
+|---|---|
+| A 纯几何（自己切列） | 这些表**有横线、没有竖线** → 没有竖线可分列；靠文字 x 聚类在跨栏/合并格上必错 |
+| B `page.find_tables()` | `lines` / `lines_strict` / `text` **三种策略全抓不到**；`strategy="text"` 更糟 —— 它把**双栏正文**判成 **62×7** 的大表（不可用） |
+| C ①c 校对 agent | **选定**：agent 本来就在**逐页看页图**，判"哪几行是一张表、列怎么分、哪些格纵向合并、跨页怎么算、表注归谁"正是它的强项 |
+
+宿主 2026-09-16 选 **C**。
+
+### C 的红线：**结构交给视觉，认字必须回文本层**
+
+这是本决策最硬的一条 —— 视觉模型看图**默写**必然出小错（单位、上下标、数字），
+而文本层是**零 OCR 误差**的。所以：
+
+- agent 用 `read_blocks` / `read_block` 拿到抽取出的**逐字原文**，用 `read_page(page, region=…)`
+  放大看那一条带**只判结构**；
+- 然后把**块里已有的字**装进格子 —— 一个字都不许新造。
+
+### 护栏三连（每条对应一种可判定的坏结果，全部实测拒收过）
+
+| # | 判据 | 代码 | 拒收后果 |
+|---|---|---|---|
+| ① 逐字来源 | 每个非空格子的文字必须能在**被消费源块的拼接文本**里找到（匹配前做 `_flat` 归一：空白压平 + 去行末断词连字符 + 去软连字符） | `_table_placeable` | 整份 **拒收**（"不能凭记忆/看图默写"） |
+| ② 形状 | `rows` 必须是**等宽**字符串二维数组、≥2 行 × ≥2 列、≤ `_TABLE_MAX_ROWS=80`；`rows_zh` 形状不符 → **回落英文网格**（不拒收） | `grid_shape` / `_TABLE_MAX_ROWS` | 拒收（单行单列请用 `edit_block` / `split_block`） |
+| ③ 不吃正文 | 从源块文本里挖掉"已进格子的字"后，若还剩 **≥4 个实词**的成句片段 → 一定是有段正文被吃进表了 | `_table_residue` | 拒收（表注用 `caption` 传、表外脚注留在原块里） |
+
+还有四条硬边界：`ids` ≥ 2 块、**不许跨页**（跨页按页分开建，程序不替人拼两页的表）、
+`figure`/`table` 块不能当一行、整表全空拒收。
+
+### 提示层：`_table_regions`（几何，纯本地、零 token）
+
+与 ㊲ 的「续段」同一套路：**程序只负责量出可疑处、把 agent 引到那一块去看**，判定仍在 agent。
+判据**两条缺一不可**：
+
+1. **横线**（页宽 ≥25% 的水平 line，经 `_MARGIN_BAND=0.09` 滤掉页眉/页脚带）；
+2. **同一「行」上横着好几段文字**（`_MIN_BAND_LINES=4` / `_MIN_BAND_RATIO=1.6` /
+   `_MIN_BAND_COLS=3` —— 双栏正文只有 2 个 x 起点，表格一行有 3 个以上）。
+
+- 只靠①：**37 页报 20+ 处**（图框边、期刊页眉装饰线全中）；
+- 只靠②：把第 29 页的**双栏正文**报成表；
+- 两条合用：**真表 3 处（p3/p20/p21）、零误报**，`_MAX_TABLE_REGIONS=3` 封顶。
+- ⚠️ **提示只买召回，不替代判据**（㊲ 的对照实验已证明：剥掉标记 agent 照样能合并）。
+
+### 「表格」节的提示词与 agent 实际动作（真数据）
+
+- 提示词新增「表格」节：给出粘连症状（同一行相邻栏被粘成一句）、`set_table` 用法、
+  三条护栏的**用意**（告诉它"为什么拒收"比只报错有用）、以及**反例**（莫把双栏正文当表）。
+- 合成 PDF 真产品路径（paper 4）：agent 自己发现表格 → **先 `edit_block` 把被换行劈开
+  的格子接回** → `set_table` 建 **5×4** 表 → 翻译 → 校验 `ok=True`，共 **26.2s / 46k tokens**。
+- 真论文 paper 1 第 3 页：**7 轮 / 78k tokens**，先 `merge_block` 再建表，产出 **10×3** 网格
+  （首列纵向合并用**空尾格**表达）。
+- **独立通道复核**：另起一个视觉模型（走 `PAPERSHELF_LLM_BASE_URL`）逐格转写，
+  与网格**逐字一致**，含易错格「Bayesian networks … Naive Bayes (BN)」与自成一行
+  的「Q-learning」。
+- 翻译通路：`shape en (10,3) → zh (10,3)`、`validate ok=True`、双 HTML 都是真
+  `<table class="datatable">`。
+
+### 单元格**双语**（宿主选 A）：`rows` + `rows_zh`
+
+- 块 `payload` 同时带 `rows`（英文原文网格）与 `rows_zh`（中文网格），**形状必须一致**；
+  跟随阅读器三模式（中英对照 / 仅原文 / 仅中文）。
+- 前端 `Reader.tsx` 的 table 分支是 **cell-level** 双语（不是块级）：逐格选`en`/`zh`。
+- ⚠️ **中英同形的格子必须只渲染一支**（`CNN`、`99.2%`）—— 原型 `cellHTML` 里就有
+  `.b-any` 这一支，我们的 `Reader.tsx` 漏了 ⇒ 「中英对照」模式下出现 `CNN / CNN` 重影。
+  **对照原型补 `.b-any` + 样式**，并加护栏 `test_identical_table_cells_render_only_once`。
+  （教训：**原型里那些看着多余的 `if` 分支，往往正是一条踩过的坑**。）
+
+### 为什么不改 `parse.py`、不涨 `PARSE_VERSION`
+
+- 表格重建发生在 ①c 阶段（**解析之后、翻译之前**），产物以 `type="table"` 块落在
+  **块级 JSON**（决策⑳ 的"事实来源"）里 —— 解析器**一个字节都不用动**。
+- `PARSE_VERSION` 跟着 `parse.py` 的可观察行为走；本轮没碰解析，**不涨**。
+  （⚠️ 反过来说：**存量文献没有 `table` 块**，要吃这项修复必须走「重新提取」——
+  对生产那两篇 ≈**200 万 tokens** + 译文重译 + 批注重划。**宿主尚未表态，未动。**）
+
+### 实现中新踩的两个坑（都留了测试）
+
+1. **旧单测自己造 `bbox` → 提示层绿着、生产命中 0**：`parse.py` **只在 `figure` 块**上存
+   `payload["bbox"]`，正文块（`p`/`h*`）**根本没有**。旧版 `_table_regions` 拿块 bbox 判
+   "块落在表区里" ⇒ 生产上**永远命中 0 块**、整个提示层静默全空；而单测里
+   `_table_doc()` 自己给块塞了 bbox，于是**一路全绿**。（实测：37 页 `regions` 恒为 0。）
+   → 改成**真几何**（页上横线 + 文本行分段），块号只**按文本位置反推**当线索
+   （`_band_block_ids`），并**把测试改成生产形状**。
+2. **`set_table` 必须"先插后删"**：若先删被消费的块，首块的 `pos` 就不再是它原来的位置，
+   表格块会**跑到别的段落后面**（阅读顺序错乱，而且错得很隐蔽：表还在、只是位置错了）。
+
+### 验收
+
+- 离线回归 **347 passed**（新增 `tests/test_table.py` 6 项 + `test_proofread.py` 的
+  `set_table` 结构/护栏/跨页/表注用例 + `test_style_guard.py` 同形格守卫）。
+- **变异检验三次全红**（去掉 x 起点线索 / 放宽 `_MIN_BAND_COLS` / 关掉页边滤除），
+  确认护栏真的在起作用，不是摆设。
+- 真浏览器（本地 8012，`index-BuC2xeWi.js`，⚠️ **改完前端必须 `npm run build`**——
+  旧 bundle 里表格没有 `.b-en/.b-zh`，看起来像"双语没生效"）：三模式逐格实测，
+  空单元格 0 个、console 零 error。
+
+---
+
 | # | 项 | 说明 |
 |---|---|---|
 | 1 | 会话机制 | 倾向签名 cookie session（Python 单体）；JWT 亦可，未定 |
@@ -1698,6 +1818,7 @@ DB 与 `.env` 部署前已备份（`papershelf.db.bak.20260916-193210`、`.env.b
 | ㉝ | `pipeline/proofread.py`（agent + 工具层 + 护栏）、`server/converter.py`（①c 接线 + `ok_pages` 续跑 + 计数累加）、`server/config.py`（`PAPERSHELF_PROOFREAD*`）、`tests/test_proofread.py` | 原文校对 = LLM agent（读页图 + 读/改抽取结果）；页级续跑；成本由 `PROOFREAD_THINKING` + seed 可疑清单 + 每页两轮护栏三条压住 |
 | ㊲ | `pipeline/parse.py`（`_column_spill_seams` + `_looks_like_continuation` + `_page_gutter` 共用尺子；`PARSE_VERSION` → **7**）、`pipeline/proofread.py`（`_block_tags` 单一来源 / `read_blocks.seam` / `check_artifacts.seams` / `_suspect_pages` 含续段 / 提示词「块结构」/ `merge_block` 软提醒）、`tests/test_block_seams.py`（22 项） | **分块也要校对**（宿主：「尽量不要把一句话拆分到两个段里」）：栏间续段只**标记**、由 agent 看页图判定后 `merge_block`（方案 B）；判据 = 几何 + 文字两条同时成立 |
 | ㊳ | `pipeline/markup.py`（标题 + `refs` 分支改走 `prose()`；新增 `wrap` 参数）、`server/repo.py::public_block`（标题 `wrap=False`，外壳由前端出）、`web/src/pages/Reader.tsx`（`BlockBody` 加 `as='span'`，标题带 `.b-inline[data-lang]`）、`tests/test_markup.py` + `tests/test_highlights.py` + `tests/test_style_guard.py` | **凡是有可选文字的块都可划**（宿主：「标题行，选中后没有笔记工具的弹出 mark-bar」）：标题/`refs` 原先走 `_esc()` → 没锚点没 `<mark>` + 前端没 `.b-inline` ⇒ 浮条根本不出现；两侧各修一半。约束：`<h1..h4>` 外壳只一层（`<h2><h2>` 会被浏览器甩出去）、标题内只能用 `span`；`typeset=False` 时产物逐字不变 |
+| ㊴ | `pipeline/proofread.py`（`set_table` 工具 + `_flat`/`_table_placeable`/`_table_residue` 三护栏 + `_h_rules`/`_table_regions` 表区提示 + 提示词「表格」节）、`pipeline/model.py`（`grid_shape`/`table_text`）、`pipeline/markup.py` + `pipeline/validate.py` + `pipeline/translator.py`（`_fit_grid`/`_table_retry`）+ `server/routers/blocks.py`（表格块通路）、`web/src/pages/Reader.tsx` + `styles.css`（cell-level 双语 + `.b-any`）、`tests/test_table.py`（新，6 项） | **表格重建**（宿主：「表格和原 pdf 差异较大」）：解析端**从来没做过**表格识别，同一行相邻栏的格子被 `get_text()` 粘成一句话、列关系全丢（paper1 498 块 / paper2 909 块，零 `table` 块）。程序侧三条路都不通（无竖线 → 无线可分列；`find_tables()` 三策略全抓不到，`strategy="text"` 把双栏正文判成 62×7）⇒ 交 ①c agent：**视觉只判结构、认字必须回文本层**；护栏三连 = 逐字来源 / 形状一致 / 不吃正文；单元格**双语**（`rows` + `rows_zh`，跟随三模式）；**不动 `parse.py`、不涨 `PARSE_VERSION`**（存量要吃修复须「重新提取」，≈200 万 tokens，未动） |
 | ㉞ | `server/routers/papers.py`（`POST /papers/{id}/reextract`，`/convert` 也归零计数）、`server/converter.py`（`claim_paper` 认领即计数、`_set_state` 不再碰 `conv_attempts`）、`web/src/pages/Library.tsx` + `api.ts` + `styles.css`（`.t-re`）、`tests/test_reextract.py`（8 项） | **解析缓存必须有单篇失效出口**（宿主：「没有失效机制是不合理的」）：文献库「删除」旁边加「重新提取」→ 删这一篇的 `doc_cache` 行 + 作废它的笔记/划痕 + `conv_attempts` 归零 + 重新排队；**语义 = 全部作废、从零重跑**（宿主选 A）。顺带修掉**护栏空转**：`conv_attempts` 原本恒为 0 |
 
 ### 本轮实现中新定的小决策（未改 ①–㉓）

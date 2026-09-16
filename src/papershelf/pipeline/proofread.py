@@ -48,7 +48,7 @@ from typing import Any
 
 import httpx
 
-from .model import Block, Doc, make_block_id
+from .model import Block, Doc, grid_shape, make_block_id, table_text
 from .parse import _looks_like_continuation, clean_text
 
 log = logging.getLogger("papershelf.pipeline.proofread")
@@ -207,21 +207,27 @@ def _seam_tag(block: Any) -> str | None:
     return None
 
 
-def _block_tags(block: Any) -> list[str]:
+def _block_tags(block: Any, extra: set[str] | None = None) -> list[str]:
     """这一块上程序能量到的**全部**标签（字符串事实 + 解析阶段盖的几何戳）。
 
     单一来源：`read_blocks` 的 `flags`、`_suspect_pages` 的页级计数、
     `check_artifacts` 的明细都读它 —— 三处各写一遍迟早会漂（一个说这页有可疑、
     另一个列不出来）。
+
+    `extra` 是**在 ①c 内部现算**的几何戳（目前只有"疑似表区"，见 `_table_regions`）：
+    它们不是在 `parse.py` 里盖的（那样要涨 `PARSE_VERSION`、存量全失效），
+    所以由调用方传进来。
     """
     text = block.en if block.type != "figure" else (block.payload.get("caption") or "")
     tags = _artifact_tags(text)
     if tag := _seam_tag(block):
         tags.append(tag)
+    if extra and block.id in extra:
+        tags.append("表格?")
     return tags
 
 
-def _suspect_pages(doc: Doc) -> dict[str, int]:
+def _suspect_pages(doc: Doc, table_ids: set[str] | None = None) -> dict[str, int]:
     """`{页号: 可疑块数}` —— **只给页级计数**。
 
     ⚠️ 踩过：第一版把**全篇**可疑清单（`{页: {块: 标签}}`）塞进 seed，实测 10.5k 字符 ≈
@@ -231,11 +237,12 @@ def _suspect_pages(doc: Doc) -> dict[str, int]:
 
     ⚠️ 计数里**必须带上「续段」**（2026-09-15 宿主：「还要校对分块分的对不对」）——
     它来自解析阶段量出的几何事实，页级计数是 agent 唯一能看出"这一页有栏间切缝"的入口；
-    漏了它，`suspect_pages` 会给出"这页没问题"的**假阴性**。
+    漏了它，`suspect_pages` 会给出"这页没问题"的**假阴性**。同理**表格**（㊴）：
+    表区是 ①c 现算的几何事实，不并入计数就等于告诉 agent"这页没有表"。
     """
     counts: dict[str, int] = {}
     for b in doc.blocks:
-        if _block_tags(b):
+        if _block_tags(b, table_ids):
             page = str(int(b.payload.get("page") or 0))
             counts[page] = counts.get(page, 0) + 1
     return counts
@@ -261,6 +268,24 @@ SYSTEM_PROMPT = """你是学术论文的**原文抽取校对 agent**。
   **不要动**。`merge_block` 只能并入**本页上一块**，正好就是这种情形。
 - **块类型**：这一块到底是**标题**还是**段落**（`p` / `h2` / `h3` / `h4`）。
   判据是页图上的**字体、字号、加粗、是否独占一行**；标题/段落判错时用 `set_block_type` 改。
+- **表格**（宿主 2026-09-16：「表格和原 pdf 差异较大」）：抽取器**根本不识别表格** ——
+  它按阅读顺序吐行，于是**同一行里相邻栏的格子被粘成一句话**。表现是：`Naive Bayes (BN)`
+  与 `Support vector machine (SVM)` 本属同一行的两格，却被写进同一块；
+  表头行、行列归属也全丢了。这类块现在会带 `表格?` 标记（程序量出的疑似表区，判据是
+  **横线 + 同一行上横着好几段文字**这两条同时成立，见 `check_artifacts` 的 `tables`
+  与 `overview` 的每页 `tables` 计数）。
+  **确认是表格后**（务必先 `read_page(page, region=…)` 放大看那一条带）用 `set_table` 重建：
+  - `ids` = 组成这张表的那些块（同一页、按阅读顺序，**含表头行**）；提示里的 `blocks`
+    只是程序按文字位置**推出来的线索**，别照抄 —— 用 `read_blocks(page)` 对一遍，
+    缺表头行、混进正文段都不行；
+  - `rows` = 网格，**第一行是表头**，一格一段文字；**格子里的字必须逐字来自这些块**
+    （程序逐格核对，找不到就整份拒收 —— 不许你凭图默写、不许翻译、不许补全）；
+  - 单元格里被换行切开的两截要接回同一格（`Convolutional Neural` + `Networks` → 一格）；
+  - 表注（`Table 1. …`）单独放进 `caption` 参数，不要塞进格子当第一行。
+  ⚠️ **反面例子（不要动）**：双栏排版的正文**不是**表格 —— 它读起来是通顺的句子、
+  没有横线、没有列对齐。把整页正文当成一张 62×7 的大表是最典型的误判
+  （`page.find_tables(strategy="text")` 就会这么干，所以程序没用那个 API）。
+  另外：`表格?` 标记只是**嫌疑**（横线也可能是分栏线/页眉线），拿不准就**别改**。
 - **阅读顺序**：这一页正确的读序（先上后下、先左栏后右栏、通栏块在其所在位置）。
 - **笔记**：抽取**丢失**的内容（图里有的图标/编号/符号而未抽到）在 `finish` 的总结里说明，
   但**不要凭想象补写**到文本里。
@@ -299,7 +324,7 @@ SYSTEM_PROMPT = """你是学术论文的**原文抽取校对 agent**。
 - **第 1 轮（看）**：同一轮里把 `read_page(page)` + `read_blocks(page)` 一起调
   （想同时看放大区就一起调；需要的话再带上 `read_block`）。
 - **第 2 轮（改）**：把这一页**所有** `edit_block` / `set_block_type` / `split_block` /
-  `merge_block` / `delete_block` / `reorder_page` 和 `mark_page_done(page)`
+  `merge_block` / `set_table` / `delete_block` / `reorder_page` 和 `mark_page_done(page)`
   **放在同一轮里一次性提交**。
 
 别把改动一个一个分轮提交（同一个块反复 `edit_block` 也算）。一页最多两轮；也可以一轮处理两页
@@ -346,6 +371,7 @@ class ProofreadStats:
     reordered: int = 0                 # 页数
     text_fixed: int = 0
     retyped: int = 0                   # 类型修订（`set_block_type`：标题 ↔ 段落）
+    tabled: int = 0                    # 表格重建（`set_table`：几块 → 一张表）
     merged: int = 0
     split: int = 0
     dropped: int = 0
@@ -360,7 +386,7 @@ class ProofreadStats:
 
     def summary(self) -> str:
         s = (f"{self.pages} 页 / 顺序修订 {self.reordered} 页 / 文字修订 {self.text_fixed} 块"
-             f" / 类型修订 {self.retyped} 块"
+             f" / 类型修订 {self.retyped} 块 / 表格重建 {self.tabled} 张"
              f" / 合并 {self.merged} / 拆分 {self.split} / 去重 {self.dropped}"
              f" / 护栏拒绝 {self.rejected} / {self.rounds} 轮 {self.tool_calls} 次工具"
              f" / 失败 {self.failed} 页 / 跳过 {self.skipped} 页 / {self.tokens} tokens")
@@ -388,6 +414,8 @@ class ProofreadTools:
         self.stats = ProofreadStats()
         self._src = None                       # 惰性打开（`fitz` 只在真要用图时载入）
         self._cache: dict[tuple, str] = {}     # (page, region, dpi) → base64
+        self._tbl: dict[int, list[dict]] | None = None      # 页 → 疑似表区（几何现算）
+        self._tbl_ids: set[str] | None = None               # 表区盖住的块号（缓存）
         self.finished = False
 
     # ── PDF ──────────────────────────────────────────────────────────────
@@ -415,6 +443,34 @@ class ProofreadTools:
 
     def _find(self, block_id: str) -> Block | None:
         return next((b for b in self.doc.blocks if b.id == block_id), None)
+
+    # ── 疑似表区（几何，㊴）───────────────────────────────────────────────
+    def table_regions(self, page: int) -> list[dict]:
+        """该页的疑似表区（惰性算一次、按页缓存 —— 纯本地计算，不花 token）。"""
+        if self._tbl is None:
+            self._tbl = {}
+        if page not in self._tbl:
+            try:
+                self._tbl[page] = _table_regions(self.src[page - 1], self._page_blocks(page))
+            except Exception as exc:                           # noqa: BLE001 — 提示层失败不该毁掉校对
+                log.debug("疑似表区几何计算失败（第 %d 页）：%s", page, exc)
+                self._tbl[page] = []
+        return self._tbl[page]
+
+    @property
+    def table_hint_ids(self) -> set[str]:
+        """被表区盖住的块号（喂给 `_suspect_pages` 的页级计数与 `flags`）。"""
+        if self._tbl_ids is None:
+            out: set[str] = set()
+            for page in range(1, self.page_count + 1):
+                for reg in self.table_regions(page):
+                    out.update(reg["ids"])
+            self._tbl_ids = out
+        return self._tbl_ids
+
+    def _tags(self, b: Block) -> list[str]:
+        """`_block_tags` + ①c 现算的几何戳（疑似表区；**已经是表格的块不再提示**）。"""
+        return _block_tags(b, self.table_hint_ids if b.type != "table" else None)
 
     def _render(self, page: int, region=None, dpi: int | None = None) -> str:
         """渲染某页（或其中一块区域）为 base64 PNG。`region` 为页内**比例** [x0,y0,x1,y1]。"""
@@ -494,6 +550,20 @@ class ProofreadTools:
               {"id": {"type": "string"}, "reason": {"type": "string"}}, ["id"]),
             f("delete_block", "删除**重复**块（同一页里另有块已包含它的内容）。",
               {"id": {"type": "string"}, "reason": {"type": "string"}}, ["id"]),
+            f("set_table", "把**表格**的若干块重建成一张真表格（解析器不会识别表格，它把这些行"
+                           "按阅读顺序吐成段落，同一行里相邻栏的格子被粘成一句话）。"
+                           "ids = 要消费掉的块号（同一页、连续的那几行，表头行也在里面）；"
+                           "rows = 网格，**第一行是表头**，每个格子一行文字。"
+                           "⚠️ 格子里必须是**你已经在这些块里读到的原文**（一字不改、不翻译、"
+                           "不补全）：程序会逐格核对，找不到就整份拒收。"
+                           "caption 填表注原文（如 `Table 1. Performance ...`）若不打算单独保留它。",
+              {"ids": {"type": "array", "items": {"type": "string"},
+                       "description": "被消费掉的块号（同一页；按阅读顺序）"},
+               "rows": {"type": "array", "items": {"type": "array", "items": {"type": "string"}},
+                        "description": "网格：第一行是表头；每行列数必须相同"},
+               "caption": {"type": "string", "description": "表注原文，可空"},
+               "reason": {"type": "string", "description": "依据：图上这是什么表、列怎么分的"}},
+              ["ids", "rows"]),
             f("reorder_page", "重排某页的阅读顺序。ids 必须是该页**全部块号的一个排列**"
                               "（一个不多、一个不少）。",
               {"page": page, "ids": {"type": "array", "items": {"type": "string"}},
@@ -532,14 +602,18 @@ class ProofreadTools:
             bs = self._page_blocks(p)
             pages.append({"page": p, "blocks": len(bs),
                           "chars": sum(len(b.en) + len(b.payload.get("caption") or "") for b in bs),
-                          "done": p in self.done_pages})
+                          "done": p in self.done_pages,
+                          # 疑似表区数量（几何现算）：agent 靠它决定"先看哪几页"，
+                          # 否则 37 页里那 4 张表全靠它自己扫出来（实测它扫不出来 —— 宿主
+                          # 报缺陷时，agent 早就"核对完成"过那几页了）。
+                          "tables": len(self.table_regions(p))})
         pending = [x["page"] for x in pages if x["blocks"] and not x["done"]]
         return ToolOut(json.dumps({
             "pdf_pages": self.page_count, "blocks": len(self.doc.blocks),
             "pages": pages, "pending_pages": pending,
             # 提醒 agent 先做什么，省得它盲猜（提示词里也说了，这里是就近提醒）
             "hint": "先 read_page 看图 + read_blocks 看抽取结果 + check_artifacts 看程序量出的可疑处，"
-                    "再动手改，最后 mark_page_done。",
+                    "再动手改，最后 mark_page_done。`tables>0` 的页请务必放大看那一条带。",
         }, ensure_ascii=False))
 
     def _t_read_page(self, a: dict) -> ToolOut:
@@ -565,7 +639,7 @@ class ProofreadTools:
             item = {"id": b.id, "type": b.type, "chars": len(text),
                     "bbox": b.payload.get("bbox"),
                     "text": text[:BLOCK_PREVIEW] + ("…" if len(text) > BLOCK_PREVIEW else "")}
-            if flags := _block_tags(b):
+            if flags := self._tags(b):
                 item["flags"] = flags                            # 就地带上程序量到的可疑点
             if b.payload.get("seam"):
                 # 「续段」是**几何事实**：解析阶段量出这条栏间切缝可疑（前一块在左栏、
@@ -601,23 +675,42 @@ class ProofreadTools:
             return ToolOut(f"第 {page} 页没有文本块。")
         hints: dict[str, list[str]] = {}
         seams: dict[str, str] = {}
+        hint_ids = self.table_hint_ids
+        regions = self.table_regions(page)
         for b in bs:
             text = b.en if b.type != "figure" else (b.payload.get("caption") or "")
             if got := _artifacts(text):
                 hints[b.id] = got
             if b.payload.get("seam"):
                 seams[b.id] = "疑似被栏间切开的续段（前一块是左栏末块）：确认是同一句话就 merge_block"
+            if b.id in hint_ids and b.type != "table":
+                hints.setdefault(b.id, []).append("落在**疑似表区**里（横线 + 同一行并排文字量出来的）")
             if len(hints) + len(seams) >= MAX_HINT_BLOCKS:
                 break
-        if not hints and not seams:
+        tables = self._table_hint(regions)
+        if not hints and not seams and not tables:
             return ToolOut(f"第 {page} 页没有程序能量出的可疑片段（但你仍需对照图像自行核对）。")
         return ToolOut(json.dumps({
-            "page": page, "suspicious": hints, "seams": seams,
+            "page": page, "suspicious": hints, "seams": seams, "tables": tables,
             "note": "这些是程序量出的**事实**，不一定是错：行末断词要看图判断是断字（合并）"
                     "还是词内连字符（保留，如 three-dimensional、long- and short-term）；"
-                    "`seams` 里的块要对照页图看**分块**对不对（跨栏一句话被切成两段 → 合并）。"
-                    "每一条都要有结论：改就 edit_block / merge_block，不改就算了；",
+                    "`seams` 里的块要对照页图看**分块**对不对（跨栏一句话被切成两段 → 合并）；"
+                    "`tables` 是程序量出的疑似表区（横线 + 同一行并排文字，两条同时成立），"
+                    "用 read_page(page, region=…) 放大看那一条带 —— 确认是表格就用 set_table 重建。"
+                    "每一条都要有结论：改就 edit_block / merge_block / set_table，不改就算了；",
         }, ensure_ascii=False))
+
+    @staticmethod
+    def _table_hint(regions: list[dict]) -> list[dict]:
+        """表区提示：给 agent 一句人话 + 可直接用的放大 region。"""
+        return [{
+            "y": [r["y0"], r["y1"]], "blocks": r["ids"],
+            "zoom": f"read_page(page, region={r['region']})",
+            "hint": "这一段有表格横线、且同一行上横着好几段文字（表格的几何特征）："
+                    "`blocks` 是程序按文字位置推出来的线索，仅供参考；先放大看这一条带，"
+                    "再用 read_blocks(page) 逐块对一遍（含表头行），确认是同一张表的几行就用 "
+                    "set_table 重建；若本来就是通顺的正文/公式，不要动。",
+        } for r in regions]
 
     # 写 ──────────────────────────────────────────────────────────────────
     def _t_edit_block(self, a: dict) -> ToolOut:
@@ -721,6 +814,104 @@ class ProofreadTools:
             out += (" ⚠️ 程序复量后**不太像**同一句（前一块读作已收句、或本块以大写起）。"
                     "你若是有意合并就忽略这条；若是并错了，用 `split_block` 拆回两段。")
         return ToolOut(out)
+
+    def _t_set_table(self, a: dict) -> ToolOut:
+        """把若干小块重建成**一张表格块**（决策㊴，宿主 2026-09-16：「表格和原 pdf 差异较大」）。
+
+        ## 为什么是 agent 干这件事
+        解析器（`parse.py`）零表格识别 —— 它按阅读顺序吐行，于是同一行里相邻栏的格子
+        被粘成一句话（`Naive Bayes (BN) Support vector machine (SVM)`），列关系全丢。
+        程序侧的候选方案都试过：`page.find_tables()` 三种策略全抓不到这种**有横线没竖线**
+        的表；`strategy="text"` 会把双栏正文当成 62×7 的大表（这正是提示词里的反例）。
+        而 agent 本来就在逐页看图，判"哪几行是一张表、列怎么分、哪些格要合并"是它的强项。
+
+        ## 但**认字**不交给它
+        图只用来判结构；格子里必须填它已经在块里读到的字（文本层是零 OCR 误差的）。
+        三条护栏（逐字来源 / 形状 / 不吃正文）各自对应一种可判定的坏结果，见模块里
+        `_table_placeable` 与 `_table_residue` 的说明。
+        """
+        ids = [str(x) for x in (a.get("ids") or [])]
+        ids = list(dict.fromkeys(ids))                    # 去重且保序（顺序=阅读顺序）
+        if len(ids) < 2:
+            self.stats.rejected += 1
+            return ToolOut("建表被拒绝：ids 至少要两块（一行一列的「表」其实是段落，用 edit_block）。",
+                           error=True)
+        blocks: list[Block] = []
+        for i in ids:
+            b = self._find(i)
+            if b is None:
+                self.stats.rejected += 1
+                return ToolOut(f"建表被拒绝：没有块 {i}", error=True)
+            blocks.append(b)
+        pages = {int(b.payload.get("page") or 0) for b in blocks}
+        if len(pages) != 1:
+            self.stats.rejected += 1
+            return ToolOut(f"建表被拒绝：ids 跨了 {sorted(pages)} 页。跨页表请**按页分开建**"
+                           f"（每页一张），程序不替你把两页的表拼起来。", error=True)
+        for b in blocks:
+            if b.type in ("figure", "table"):
+                self.stats.rejected += 1
+                return ToolOut(f"建表被拒绝：{b.id} 是 {b.type} 块，不能作为表格的一行"
+                               + ("（它已经是表格了）。" if b.type == "table" else "。"), error=True)
+
+        rows_in = a.get("rows")
+        shape = grid_shape(rows_in)
+        if not shape:
+            self.stats.rejected += 1
+            return ToolOut("建表被拒绝：rows 必须是**等宽的字符串二维数组**"
+                           "（每行列数相同、第一行是表头）。", error=True)
+        n_rows, n_cols = shape
+        if n_rows < 2 or n_cols < 2:
+            self.stats.rejected += 1
+            return ToolOut(f"建表被拒绝：{n_rows} 行 × {n_cols} 列 —— 至少 2 行 2 列才叫表格；"
+                           f"单行/单列的内容请用 edit_block 或 split_block 处理。", error=True)
+        if n_rows > _TABLE_MAX_ROWS:
+            self.stats.rejected += 1
+            return ToolOut(f"建表被拒绝：{n_rows} 行太多了（多半是把整页正文当成了表）。", error=True)
+        rows = [[clean_text(c).strip() for c in row] for row in rows_in]
+        caption = clean_text(a.get("caption")).strip() if isinstance(a.get("caption"), str) else ""
+        if not any(c for row in rows for c in row):
+            self.stats.rejected += 1
+            return ToolOut("建表被拒绝：整张表都是空格子。", error=True)
+
+        src = "\n".join(b.en for b in blocks)
+        placed = [c for row in rows for c in row] + ([caption] if caption else [])
+        # ① 逐字来源：每个格子的文字必须能在被消费的源块里找到
+        missing = [c for c in [x for row in rows for x in row if x.strip()]
+                   if not _table_placeable(src, c)]
+        if missing:
+            self.stats.rejected += 1
+            return ToolOut("建表被拒绝：这些格子的文字在源块里**找不到**"
+                           f"（不能凭记忆/看图默写）：{[m[:40] for m in missing[:5]]}"
+                           f"。请逐字复制块里的原文；若缺字，先用 edit_block 把该块改对。", error=True)
+        # ③ 不吃正文：源块里不许有成句的文字没被装进格子
+        for b in blocks:
+            left = _table_residue(b.en, placed)
+            if left:
+                self.stats.rejected += 1
+                return ToolOut(f"建表被拒绝：{b.id} 里还有没进格子的文字：{left[:8]}。"
+                               f"要么把它们也填进对应格子，要么**别把它列进 ids**"
+                               f"（表注用 caption 传，表外脚注留在原块里别动）。", error=True)
+
+        first = blocks[0]
+        pos = self.doc.blocks.index(first)
+        nb = Block(id=_next_id(self.doc), type="table",
+                   en=table_text(rows, caption), section=first.section,
+                   payload={"rows": rows, "caption": caption, "src_ids": ids,
+                            "page": int(first.payload.get("page") or 0),
+                            "bbox": first.payload.get("bbox")})
+        # ⚠️ **先插后删**（顺序不能反）：若先删掉那几个块，`pos` 就已经不是它原来的位置了
+        # （被消费的块里若有排在被消费序列之前的…实测会把表格块甩到页尾 —— 阅读顺序错乱，
+        # 而且错得很隐蔽：表格还在，只是跑到别的段落后面去了）。
+        self.doc.blocks.insert(pos, nb)
+        for b in blocks:
+            self.doc.blocks.remove(b)
+        self.stats.tabled += 1
+        log.info("  ▦ %s → 表格块 %s（%d×%d，吃掉 %s，%s）", first.id, nb.id, n_rows, n_cols,
+                 ",".join(ids), a.get("reason") or "")
+        return ToolOut(f"已重建表格：{len(ids)} 块 → 一个表格块 **{nb.id}**（{n_rows} 行 × {n_cols} 列）。"
+                       f"⚠️ 这一页的块号已变化，后面引用请用新块号。中文译文由后续翻译步骤补上"
+                       f"（不必你译）；原块 {ids} 已删除。")
 
     def _t_delete_block(self, a: dict) -> ToolOut:
         b = self._find(str(a.get("id") or ""))
@@ -924,7 +1115,7 @@ class Proofreader:
             "already_reviewed_pages": sorted(skip) or None,
             "title": (doc.meta.get("title") or doc.meta.get("title_en") or "")[:200] or None,
             # 只给**页级计数**（全篇明细放 seed 会每轮重发，见 `_suspect_pages` 的说明）
-            "suspect_pages": _suspect_pages(doc) or None,
+            "suspect_pages": _suspect_pages(doc, self.tools.table_hint_ids) or None,
         }
         task = (f"这是《{seed['title'] or '未命名论文'}》的抽取结果概览：\n"
                 + json.dumps(seed, ensure_ascii=False)
@@ -934,10 +1125,13 @@ class Proofreader:
                      f"（但如果它们的顺序/结构影响了本页的判断，你仍然可以 read_page 复查）。")
         task += (" `suspect_pages` 是程序量出的**页级可疑计数**（键是页号，值是可疑块数）："
                  "具体是哪些块、可疑在哪，`read_blocks` 的每块 `flags` 字段里就有（`check_artifacts` "
-                 "给整页明细）。⚠️ 计数里**混着两类**：字符串规则的（断词/引用空格）与"
-                 "**几何的**「续段」—— 后者是被栏间切开的续段（一句话分成两块），"
-                 "`flags` 里显示为 `续段`、整块说明在 `read_blocks` 的 `seam` 字段；"
-                 "看到它必须**对照页图核对分块**。按「每页两轮」做：一轮看图看块，"
+                 "给整页明细，`overview` 里每页还有 `tables` = 疑似表区数）。"
+                 "⚠️ 计数里**混着三类**：字符串规则的（断词/引用空格）、"
+                 "**几何的**「续段」（被栏间切开的续段，一句话分成两块，"
+                 "`flags` 里显示为 `续段`、说明在 `read_blocks` 的 `seam` 字段）、"
+                 "以及**几何的**「表格?」（落在横线表区里的块 —— 抽取器不会识别表格，"
+                 "这些行多半是「同一行相邻栏被粘成一句话」，要用 `set_table` 重建）。"
+                 "这两类几何戳都必须**对照页图**才能下结论。按「每页两轮」做：一轮看图看块，"
                  "一轮把全部改动 + mark_page_done 提交。")
         return [
             {"role": "system", "content": SYSTEM_PROMPT},
@@ -1117,6 +1311,219 @@ def _prune_images(messages: list[dict]) -> None:
             head = next((p.get("text", "") for p in kept if isinstance(p, dict)), "")
             m["content"] = (f"{head} ⚠️ 渲染图已从上下文移除（控制请求体大小）；"
                             f"需要再看就重新调用 read_page（命中渲染缓存）。")
+
+
+# ── 表格重建的护栏（决策㊴）───────────────────────────────────────────────
+# 字符**只能来自文本层**：agent 的图只用来判结构（哪几行是一张表、列边界、合并格），
+# 格子里的字必须是它已经在块里读到的那些字。这三条护栏把"看图认字"这条错路堵死：
+#   ① 逐字来源：每个格子的文字必须能在被消费的源块文本里找到（找不到 = 它在凭记忆默写）；
+#   ② 形状：等宽二维表、至少 2 行 2 列（一行一列的东西不是表，是段落）；
+#   ③ 不吃正文：源块里不许有"没被装进格子"的成句文字（表注除外，它是 `caption`）。
+_TABLE_MAX_ROWS = 80              # 一张表最多这么多行（超了多半是把正文当表了）
+_TABLE_MIN_RESIDUE_WORDS = 4      # 源块里剩这么多实词 = 有字没进格子 → 拒收
+
+
+def _flat(text: str) -> str:
+    """匹配用的归一化：空白压平 + **去掉行末断词的连字符**。
+
+    两处都要，否则会把**正确**的重建判成编造：PDF 里 "Convolutional Neural" 与
+    "Networks" 分属两行（组段时是 `\\n`），而格子里是连起来的一串；行末断词
+    "Neuro-\\nlinguistic" 在格子里是 "Neurolinguistic"。
+    """
+    t = re.sub(r"\s+", " ", (text or "").replace("\u00ad", ""))
+    return re.sub(r"(?<=[A-Za-z])-\s+(?=[a-z])", "", t).strip()
+
+
+def _table_placeable(src: str, needle: str) -> bool:
+    """`needle`（一格文字）是否**逐字**来自 `src`（两种归一化都试）。"""
+    n = _flat(needle)
+    if not n:
+        return True                                   # 空格子无需校验（允许空尾格）
+    return n in _flat(src) or n in _flat(src).replace("- ", "")
+
+
+def _table_residue(block_text: str, placed: list[str]) -> list[str]:
+    """从源块文本里挖掉"已装进格子的字"后，剩下的**成句**片段。
+
+    判据故意宽松（≥4 个实词才算"一段没被消费的话"）：表头的单位、脚注的星号、
+    表号 "Table 4." 这类残渣本来就该剩下来，为它们拒收会让 agent 无路可走。
+    """
+    t = _flat(block_text)
+    for p in sorted(placed, key=len, reverse=True):
+        p = _flat(p)
+        if len(p) >= 2:
+            t = t.replace(p, " ")
+    words = [w for w in re.findall(r"[A-Za-z][A-Za-z's-]{3,}", t) if w.lower() not in _STOPWORDS]
+    return words if len(words) >= _TABLE_MIN_RESIDUE_WORDS else []
+
+
+_STOPWORDS = {"the", "and", "for", "with", "that", "this", "from", "are", "was", "not",
+              "table", "figure", "note", "total", "other", "than", "more", "less", "see"}
+
+
+# ── 疑似表区（几何，纯本地计算、零 token）─────────────────────────────────
+# 与 ㊲ 的「续段」同一个套路：**程序只负责量出可疑处、把 agent 引到那一块去看**，
+# 判"这是不是表格、该怎么分格"仍在 agent。已实测（㊲ 的对照实验）标记本身买到的
+# 是**召回率与假阴性消除**，不是替代判据 —— 但代价为零，该给。
+#
+# 判据（两条**缺一不可**，都在真数据上调过）：
+#   ① **横线**：这些表有横线、**没有竖线**，所以 `page.find_tables()` 抓不到；
+#   ② **同一行上横着好几段文字**：表格行被 `get_text()` 按阅读顺序拆成了并排的几段
+#      （正是「Naive Bayes (BN) Support vector machine (SVM)」这种粘连的来源）。
+#      只靠①会把**图框边、期刊页眉装饰线**全报成表格（实测 37 页报 20+ 处）；
+#      只靠②会把**双栏正文**报成表格（第 29 页两个正文栏每行都是 2 段）。两条合起来才有
+#      第 3/20/21 页那三张表，且 37 页里零误报。
+#
+# ⚠️ **不要用块的 `payload["bbox"]` 当判据**：`parse.py` 只在 **figure** 块上存 bbox，
+#    正文块（`p`/`h*`）根本没有 —— 旧版就是这么写的，于是"块落在表区里"永远命中 0 个块，
+#    整个提示层**静默全空**（2026-09-16 实测：37 页 regions 恒为 0；而单测里
+#    `_table_doc()` 自己给块塞了 bbox，所以一路是绿的）。块号只能**按文本位置反推**，
+#    且只当**线索**给 agent（见 `_band_block_ids`）。
+_MIN_RULE_LEN = 0.25       # 一条横线至少要有页宽的这个比例才算表格线
+_RULE_TOL = 1.5            # |dy| 小于它就算水平线
+_ROW_GAP = 220.0           # 相邻两条横线的最大间距：表头线 → 底线之间往往隔着一两百像素
+_BAND_PAD = 6.0            # 文本行/块与表区的 y 容差
+_MARGIN_BAND = 0.09        # 页眉/页脚带（期刊装饰线就在这里，不是表格线）
+_MIN_BAND_LINES = 4        # 表带里至少要有这么多行文本
+_MIN_BAND_RATIO = 1.6      # 每「行」平均要摊到这么多段文字（表格一行里横着好几格）
+_MIN_BAND_COLS = 3         # 同一行上的文字至少要起于 3 个不同的 x（双栏正文只有 2 个）
+_MAX_TABLE_REGIONS = 3     # 一页最多报几处（多了就是噪声，agent 反而看不见）
+
+
+def _page_text_lines(page) -> list[tuple[float, float, float, float, str]]:
+    """页面**文本行**（不含图片）：`[(x0, y0, x1, y1, 文本)]`，按 PDF 自己的顺序。"""
+    out: list[tuple[float, float, float, float, str]] = []
+    try:
+        data = page.get_text("dict")
+    except Exception:                                          # noqa: BLE001
+        return out
+    for blk in data.get("blocks") or []:
+        if blk.get("type") != 0:                               # 1 = 图片
+            continue
+        for ln in blk.get("lines") or []:
+            txt = "".join(s.get("text") or "" for s in (ln.get("spans") or []))
+            if not txt.strip():
+                continue
+            x0, y0, x1, y1 = (ln.get("bbox") or (0, 0, 0, 0))[:4]
+            out.append((float(x0), float(y0), float(x1), float(y1), txt))
+    return out
+
+
+def _band_block_ids(lines, blocks: list[Block], y0: float, y1: float) -> list[str]:
+    """表带里的块号 —— **按文本位置反推的线索**，不是事实（`payload["bbox"]` 不可用）。
+
+    做法：表带里的每一行文本，去块里找"最紧的、包含这行字"的块（包含它的最短块 ——
+    短块比长块更可能是它的家）。只有当**这个块被命中的行全部落在表带内**才算数，
+    免得把骑在带子边缘的正文段一起拖进来。只在 `p` 块里找：行的料永远是段落，
+    而**图注、标题的文字会和表带里的行撞车**（实测第 21 页那张表的表注被拆成
+    「inspection, testing, and / validation」两行，正好是 h4「4.1 ML in inspection,
+    testing, and verification」的子串 → 把标题拉进线索里纯属噪声）。
+    """
+    hits: dict[str, list[float]] = {}
+    for _x0, ly0, _x1, ly1, txt in lines:
+        if ly0 < y0 - _BAND_PAD or ly1 > y1 + _BAND_PAD:
+            continue
+        t = _flat(txt)
+        if len(t) < 3:
+            continue
+        cands = [b for b in blocks
+                 if b.type == "p" and t in _flat(b.en)]
+        if not cands:
+            continue
+        owner = min(cands, key=lambda b: len(b.en))
+        hits.setdefault(owner.id, []).extend([ly0, ly1])
+    return [b.id for b in blocks
+            if (v := hits.get(b.id))
+            and min(v) >= y0 - _BAND_PAD and max(v) <= y1 + _BAND_PAD]
+
+
+def _h_rules(page) -> list[tuple[float, float, float]]:
+    """页内所有**水平线**：`[(y, x0, x1)]`（线 + 矩形上下边都算）。"""
+    out: list[tuple[float, float, float]] = []
+    try:
+        drawings = page.get_drawings()
+    except Exception:                                          # noqa: BLE001 — 老版本没有该 API
+        return out
+    width = float(page.rect.width)
+    for d in drawings:
+        for item in d.get("items") or []:
+            if not item:
+                continue
+            kind = item[0]
+            segs = []
+            if kind == "l":                                    # ('l', Point, Point)
+                p1, p2 = item[1], item[2]
+                segs.append((p1.x, p1.y, p2.x, p2.y))
+            elif kind == "re":                                 # ('re', Rect)
+                r = item[1]
+                segs += [(r.x0, r.y0, r.x1, r.y0), (r.x0, r.y1, r.x1, r.y1)]
+            for x1, y1, x2, y2 in segs:
+                if abs(y2 - y1) > _RULE_TOL:
+                    continue
+                x0, x1b = min(x1, x2), max(x1, x2)
+                if x1b - x0 >= _MIN_RULE_LEN * width:
+                    out.append((round((y1 + y2) / 2, 2), x0, x1b))
+    return sorted(out)
+
+
+def _table_regions(page, blocks: list[Block]) -> list[dict]:
+    """量出这一页的**疑似表区**：`[{y0, y1, x0, x1, ids, region}]`。
+
+    `region` 是**页内比例**（0–1），可直接喂给 `read_page(page, region=…)` 放大看 ——
+    这是这条提示真正的作用：让 agent 把注意力放在那一条带上，而不是"整页扫一眼"。
+    `ids` 只是线索（见 `_band_block_ids` 的免责说明）。
+
+    判据见文件上方「疑似表区」那一段：**横线 + 同一行上横着好几段文字**，缺一不可。
+    """
+    rect = page.rect
+    height = float(rect.height)
+    # 0) 去掉页眉/页脚带里的线：期刊在每个内容页顶部都印一对装饰横线，
+    #    不滤掉的话每页都"疑似有表"（实测 37 页里 30 页中招）。
+    rules = [r for r in _h_rules(page)
+             if height * _MARGIN_BAND < r[0] < height * (1 - _MARGIN_BAND)]
+    if len(rules) < 2:
+        return []
+    # 1) 按 y 聚簇：相邻横线间距不超过 `_ROW_GAP` 且 x 区间有重叠
+    groups: list[list[tuple[float, float, float]]] = []
+    for r in rules:
+        if groups:
+            last = groups[-1][-1]
+            overlap = min(last[2], r[2]) - max(last[1], r[1])
+            if r[0] - last[0] <= _ROW_GAP and overlap > 0:
+                groups[-1].append(r)
+                continue
+        groups.append([r])
+    # 2) 每组配「带子里的文本」验一遍：横线只说明"这里画了线"，有没有**表格状的文字**
+    #    才是判据（图框边、通栏分隔线过不了这一关）。
+    lines = _page_text_lines(page)
+    out: list[dict] = []
+    for g in groups:
+        if len(g) < 2:
+            continue
+        y0, y1 = g[0][0], g[-1][0]                          # 首尾两条横线 = 表区的上下界
+        if y1 - y0 < 8:
+            continue
+        band = [l for l in lines if l[1] >= y0 - _BAND_PAD and l[3] <= y1 + _BAND_PAD]
+        if len(band) < _MIN_BAND_LINES:
+            continue
+        rows = {round(l[1] / 4) for l in band}
+        cols = {round(l[0] / 4) for l in band}
+        if not rows or len(band) / len(rows) < _MIN_BAND_RATIO or len(cols) < _MIN_BAND_COLS:
+            continue
+        x0 = min(r[1] for r in g)
+        x1 = max(r[2] for r in g)
+        out.append({
+            "y0": round(y0, 1), "y1": round(y1, 1),
+            "x0": round(x0, 1), "x1": round(x1, 1),
+            "ids": _band_block_ids(band, blocks, y0, y1),
+            "region": [max(0.0, round(x0 / rect.width - 0.02, 3)),
+                       max(0.0, round(y0 / rect.height - 0.02, 3)),
+                       min(1.0, round(x1 / rect.width + 0.02, 3)),
+                       min(1.0, round(y1 / rect.height + 0.02, 3))],
+        })
+        if len(out) >= _MAX_TABLE_REGIONS:
+            break
+    return out
 
 
 def _load_args(raw: str) -> dict:

@@ -555,6 +555,15 @@ select.input { width: auto; }
 .booktbl th { border-top: 1.3px solid var(--fg); border-bottom: 0.7px solid var(--fg); padding: 7px 9px;
   text-align: left; vertical-align: bottom; font-family: var(--font-body); font-weight: 600; }
 .booktbl td { padding: 6px 9px; vertical-align: top; font-family: var(--font-mono); font-variant-numeric: tabular-nums; }
+/* 一格里的中英（决策㊴）：**上下两行**而不是 inline 拼在一起 ——
+   格子通常很短（"Supervised" / "监督"），inline 会看不出边界，块级还能保住列对齐。
+   另一半由 `.lang-zh .b-en` / `.lang-en .b-zh` 收掉（三模式同一套规则，与正文一致）。
+   对照模式下英文那行淡一点，让中文站住（与 `.lang-dual .blk-p .t-en` 同一取向）。 */
+.booktbl .b-en, .booktbl .b-zh { display: block; }
+.lang-dual .booktbl .b-en { color: color-mix(in oklch, var(--fg) 74%, var(--muted)); }
+/* 中英**同形**的格子（数字、缩写、专有名词）只渲一栏 `.b-any`（原型 `cellHTML` 同一支）：
+   它不带语种类，三种模式都可见 —— 数字不该跟着阅读模式消失，也不该在对照模式显示两遍。 */
+.booktbl .b-any { display: block; }
 .booktbl th:first-child, .booktbl td:first-child { padding-left: 2px; }
 .booktbl th:last-child, .booktbl td:last-child { padding-right: 2px; }
 

@@ -681,3 +681,261 @@ def test_interruption_keeps_what_was_already_done(tmp_path):
     assert st.tokens >= 0
     assert ProofreadTools(doc, pdf).done_pages == set()    # 只是确认工具层可再建（无副作用）
 
+
+
+# ── 表格重建（决策㊴，宿主 2026-09-16：「表格和原 pdf 差异较大」）──────────
+# 抽取器**不识别表格**：它按阅读顺序吐行，同一行里相邻栏的格子被粘成一句话。
+# `set_table` 让 agent 把这几个块重建成一张真表格，三条护栏各自对应一种坏结果：
+# ① 格子文字必须逐字来自源块（不许看图默写）；② 等宽二维表、≥2 行 2 列；③ 不许吃掉正文。
+
+def _table_doc(*, page: int = 1) -> Doc:
+    """一张「3 列表」被抽成 2 个粘连块的典型现场（生产 paper1 第 3 页的形状）。"""
+    doc = Doc()
+    doc.blocks.append(Block(id="b-0001", type="p", en="ML category ML model",
+                            payload={"page": page, "bbox": [0, 100, 500, 112]}))
+    doc.blocks.append(Block(id="b-0002", type="p", en="Supervised Naive Bayes (BN)",
+                            payload={"page": page, "bbox": [0, 113, 500, 125]}))
+    doc.blocks.append(Block(id="b-0003", type="p", en="Unsupervised K-means",
+                            payload={"page": page, "bbox": [0, 126, 500, 138]}))
+    return doc
+
+
+def _table_tools(tmp_path, doc, *, pages: int = 1) -> ProofreadTools:
+    pdf = tmp_path / "t.pdf"
+    _tiny_pdf(pdf, pages=pages)
+    return ProofreadTools(doc, pdf)
+
+
+def test_set_table_rebuilds_a_real_table(tmp_path):
+    doc = _table_doc()
+    t = _table_tools(tmp_path, doc)
+    out = t.call("set_table", {
+        "ids": ["b-0001", "b-0002", "b-0003"],
+        "rows": [["ML category", "ML model"],
+                 ["Supervised", "Naive Bayes (BN)"],
+                 ["Unsupervised", "K-means"]],
+        "reason": "第 3 页 Table 1，两列",
+    })
+    assert not out.error, out.text
+    assert len(doc.blocks) == 1                       # 三块 → 一块
+    nb = doc.blocks[0]
+    assert nb.type == "table" and nb.id not in ("b-0001", "b-0002", "b-0003")
+    assert nb.payload["rows"][0] == ["ML category", "ML model"]
+    assert nb.payload["src_ids"] == ["b-0001", "b-0002", "b-0003"]
+    assert nb.payload["page"] == 1
+    assert t.stats.tabled == 1
+    # 裸文本面（校验/切片/read_blocks 都只看它）—— 必须真的带上内容
+    assert nb.en == "ML category | ML model\nSupervised | Naive Bayes (BN)\nUnsupervised | K-means"
+
+
+def test_set_table_rejects_fabricated_cell_text(tmp_path):
+    """护栏①：格子里出现源块里**没有**的字 = 在看图默写（这正是不能用 VLM 认字的原因）。"""
+    doc = _table_doc()
+    t = _table_tools(tmp_path, doc)
+    out = t.call("set_table", {
+        "ids": ["b-0001", "b-0002", "b-0003"],
+        "rows": [["ML category", "ML model"],
+                 ["Supervised", "Naïve Bayes classifer"],     # 编造 + 少了一个字母
+                 ["Unsupervised", "K-means"]],
+    })
+    assert out.error and "找不到" in out.text
+    assert t.stats.rejected == 1 and t.stats.tabled == 0
+    assert len(doc.blocks) == 3                        # 原样不动
+
+
+def test_set_table_rejects_ragged_grid_and_tiny_grid(tmp_path):
+    """护栏②：等宽（允许空尾格）+ 至少 2 行 2 列。"""
+    doc = _table_doc()
+    t = _table_tools(tmp_path, doc)
+    ragged = t.call("set_table", {"ids": ["b-0001", "b-0002"],
+                                  "rows": [["ML category", "ML model"], ["Supervised"]]})
+    assert ragged.error and "等宽" in ragged.text
+    one_row = t.call("set_table", {"ids": ["b-0001", "b-0002"],
+                                   "rows": [["ML category", "ML model"]]})
+    assert one_row.error and "2 行 2 列" in one_row.text
+    assert t.stats.rejected == 2 and len(doc.blocks) == 3
+
+
+def test_set_table_rejects_swallowing_prose(tmp_path):
+    """护栏③：源块里还剩成句的文字没进格子 —— 那是把正文当成了表格行。"""
+    doc = _table_doc()
+    doc.blocks[1].en = ("Supervised Naive Bayes (BN) Consider the general problem of "
+                        "classifying documents into categories.")
+    t = _table_tools(tmp_path, doc)
+    out = t.call("set_table", {
+        "ids": ["b-0001", "b-0002", "b-0003"],
+        "rows": [["ML category", "ML model"],
+                 ["Supervised", "Naive Bayes (BN)"],
+                 ["Unsupervised", "K-means"]],
+    })
+    assert out.error and "没进格子" in out.text and "b-0002" in out.text
+    assert t.stats.rejected == 1 and len(doc.blocks) == 3
+
+
+def test_set_table_rejects_cross_page_and_consumes_caption(tmp_path):
+    """同一页是硬要求（跨页拼接交给两页各建一张）；表注用 caption 传，别塞进格子。"""
+    doc = _table_doc(page=1)
+    doc.blocks.append(Block(id="b-0004", type="p", en="Table 1. A comparison of classifiers.",
+                            payload={"page": 1, "bbox": [0, 90, 500, 99]}))
+    doc.blocks.append(Block(id="b-0005", type="p", en="Accuracy on the test set",
+                            payload={"page": 2, "bbox": [0, 90, 500, 99]}))
+    t = _table_tools(tmp_path, doc, pages=2)
+    cross = t.call("set_table", {"ids": ["b-0003", "b-0005"],
+                                 "rows": [["a", "b"], ["c", "d"]]})
+    assert cross.error and "跨了" in cross.text
+    # 表注归 caption：它**不算**没进格子的正文（否则 agent 无处安放表注）
+    out = t.call("set_table", {
+        "ids": ["b-0004", "b-0001", "b-0002", "b-0003"],
+        "rows": [["ML category", "ML model"],
+                 ["Supervised", "Naive Bayes (BN)"],
+                 ["Unsupervised", "K-means"]],
+        "caption": "Table 1. A comparison of classifiers.",
+    })
+    assert not out.error, out.text
+    tb = doc.blocks[0]
+    assert tb.payload["caption"] == "Table 1. A comparison of classifiers."
+    assert tb.en.splitlines()[0] == "Table 1. A comparison of classifiers."
+    # ⚠️ 位置必须**保持在原处**（表格块占据第一个被消费块的位置）——先删后插会让它跑到页尾，
+    # 阅读顺序当场错乱（实测踩过，表格还在、只是跑到别的段落后面去了）。
+    assert doc.blocks[0].type == "table"
+    assert doc.blocks[1].id == "b-0005"
+
+
+def _band_pdf(path, *, cols=3, rows=4, band=(300, 372), head_rules=True):
+    """造一页"表格状"的 PDF：横线 + **同一行上并排的几段文字**。
+
+    ⚠️ 刻意与生产一致：正文块**不带 `bbox`**（`parse.py` 只给 figure 存 bbox）。旧版
+    表区提示就是靠 `payload["bbox"]` 判"块在不在带子里"，而单测里的假块自己塞了 bbox
+    → 37 页真数据上提示**静默全空**、测试却一路绿（2026-09-16 实测）。
+    """
+    fitz = pytest.importorskip("fitz")
+    src = fitz.open()
+    pg = src.new_page(width=595, height=792)
+    if head_rules:                                     # 期刊页眉装饰线（落在页边带里）
+        pg.draw_line(fitz.Point(51, 45), fitz.Point(544, 45))
+        pg.draw_line(fitz.Point(51, 58), fitz.Point(544, 58))
+    y0, y1 = band
+    pg.draw_line(fitz.Point(60, y0 - 8), fitz.Point(520, y0 - 8))
+    pg.draw_line(fitz.Point(60, y1 + 8), fitz.Point(520, y1 + 8))
+    step = (y1 - y0) / max(rows - 1, 1)
+    for r in range(rows):
+        for c in range(cols):
+            pg.insert_text((72 + c * 150, y0 + r * step), f"cell{r}{c}")
+    src.save(str(path))
+    src.close()
+
+
+def _band_doc(*, cols=3, rows=4, page=1) -> Doc:
+    """按行糊出来的块（抽取器的产物形状）：**一行里的几格被粘成一个块、无 bbox**。"""
+    doc = Doc()
+    for r in range(rows):
+        doc.blocks.append(Block(id=make_block_id(r + 1), type="p",
+                                en=" ".join(f"cell{r}{c}" for c in range(cols)),
+                                payload={"page": page}))
+    return doc
+
+
+def test_table_blocks_are_hinted_by_page_geometry(tmp_path):
+    """表区提示层（几何现算，不花 token）：横线 + 同行并排文字 → `表格?` 标记 + 块号线索。
+
+    这是给 agent 的**召回**手段 —— 它自己扫不出 37 页里那 4 张表（宿主报缺陷时，
+    它早就把那一页"核对完成"过了）。判据仍在 agent：标记只说明"这一段像表格"。
+    """
+    doc = _band_doc()
+    pdf = tmp_path / "rules.pdf"
+    _band_pdf(pdf)
+    t = ProofreadTools(doc, pdf)
+    try:
+        regions = t.table_regions(1)
+        assert len(regions) == 1
+        # 块号是**按文字位置推的线索**，这里要推全（含表头那一行）
+        assert regions[0]["ids"] == [f"b-000{i}" for i in range(1, 5)]
+        assert regions[0]["region"][1] < regions[0]["region"][3]
+        assert t.table_hint_ids == {f"b-000{i}" for i in range(1, 5)}
+        # 标记要真的走 `read_blocks` / `check_artifacts` 两条读路（单一来源 `_block_tags`）
+        out = t.call("read_blocks", {"page": 1})
+        assert "表格?" in out.text
+        art = t.call("check_artifacts", {"page": 1})
+        assert "tables" in art.text and "zoom" in art.text
+        # 页级计数（seed 里那一份）也必须带上，否则 agent 看不到"这页有表"
+        from papershelf.pipeline.proofread import _suspect_pages
+        assert _suspect_pages(doc, t.table_hint_ids)
+    finally:
+        t.close()
+
+
+def test_page_header_rules_alone_are_not_a_table_band(tmp_path):
+    """页眉带里的装饰横线**不算**表格线。
+
+    这条要能真的转红（否则滤除就是没人看管的代码）：页眉那一对线若留着，会与下方
+    另一条线（相距 < `_ROW_GAP`）聚成一簇、把页眉与正文之间的那条带子当成"表区" ——
+    真数据上第 30 页就是这么误报的（`margin=0` 时 37 页报 4 处，滤掉后 3 处、零误报）。
+    """
+    fitz = pytest.importorskip("fitz")
+    doc = _band_doc(cols=3, rows=2)                    # 页眉下面"看着像表"的并排文字
+    pdf = tmp_path / "head.pdf"
+    src = fitz.open()
+    pg = src.new_page(width=595, height=792)
+    pg.draw_line(fitz.Point(51, 45), fitz.Point(544, 45))     # 期刊页眉：一对通栏细线
+    pg.draw_line(fitz.Point(51, 58), fitz.Point(544, 58))
+    pg.draw_line(fitz.Point(51, 150), fitz.Point(544, 150))   # 页眉下方还有一条通栏线
+    for c in range(3):
+        pg.insert_text((72 + c * 150, 100), f"head{c}")
+        pg.insert_text((72 + c * 150, 130), f"head{c}b")
+    src.save(str(pdf))
+    src.close()
+    t = ProofreadTools(doc, pdf)
+    try:
+        assert t.table_regions(1) == []
+    finally:
+        t.close()
+
+
+def test_two_column_body_and_figure_boxes_are_not_table_bands(tmp_path):
+    """两条独立的反例 —— 少任何一条判据都会被它们骗到：
+
+    ① **双栏正文**：每行也横着 2 段文字，但只有 2 个列起点（真表 ≥3）；
+    ② **图框边**：两条通栏横线夹着一张图，带子里没有"同行并排"的文字。
+    """
+    # ① 双栏正文
+    doc2 = _band_doc(cols=2, rows=4)
+    pdf2 = tmp_path / "twocol.pdf"
+    _band_pdf(pdf2, cols=2, rows=4)
+    t2 = ProofreadTools(doc2, pdf2)
+    # ② 图框：两条全宽横线（相距 80），带子里没有文字行
+    doc3 = _band_doc(cols=1, rows=1)
+    pdf3 = tmp_path / "figbox.pdf"
+    fitz = pytest.importorskip("fitz")
+    src = fitz.open()
+    pg = src.new_page(width=595, height=792)
+    pg.draw_line(fitz.Point(51, 200), fitz.Point(544, 200))
+    pg.draw_line(fitz.Point(51, 280), fitz.Point(544, 280))
+    pg.insert_text((72, 500), "body text far below the figure box")
+    src.save(str(pdf3))
+    src.close()
+    t3 = ProofreadTools(doc3, pdf3)
+    try:
+        assert t2.table_regions(1) == []
+        assert t3.table_regions(1) == []
+    finally:
+        t2.close(); t3.close()
+
+
+def test_set_table_then_mark_page_done_then_finish(tmp_path):
+    """端到端（agent 脚本）：建表 → 收尾，页级记账不受影响。"""
+    doc = _table_doc()
+    pdf = tmp_path / "t.pdf"
+    _tiny_pdf(pdf, pages=1)
+    pf = Proofreader(CFG)
+    pf._chat = _ScriptedLLM([
+        {"calls": [("set_table", {
+            "ids": ["b-0001", "b-0002", "b-0003"],
+            "rows": [["ML category", "ML model"],
+                     ["Supervised", "Naive Bayes (BN)"],
+                     ["Unsupervised", "K-means"]]})]},
+        {"calls": [("mark_page_done", {"page": 1})]},
+        {"calls": [("finish", {"summary": "第 3 页 Table 1 已重建"})]},
+    ])
+    st = pf.proofread_doc(doc, pdf)
+    assert st.tabled == 1 and st.pages == 1 and not st.stopped
+    assert len(doc.blocks) == 1 and doc.blocks[0].type == "table"

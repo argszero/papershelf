@@ -18,7 +18,7 @@ import html as _html
 import re
 
 from .mathml import mathml_css, render_math, render_math_block
-from .model import Block, Doc
+from .model import Block, Doc, table_cells
 from .validate import NO_ZH_TYPES
 
 CSS = """
@@ -294,13 +294,19 @@ def render_block(b: Block, *, lang: str, marker: bool = True, typeset: bool = Fa
         cap_html = f"<figcaption>{_mathy(cap, typeset=typeset)}</figcaption>" if cap else ""
         return f"<figure{attr}>{img}{cap_html}</figure>"
     if t == "table":
-        cap = b.payload.get("caption", "")
-        cap_html = f"<caption>{_esc(cap)}</caption>" if cap else ""
-        rows = b.payload.get("rows") or []
+        rows = table_cells(b, lang)
+        if not rows:
+            # 网格缺失（历史数据 / 别的生产者只填了 `en`）→ 按段落渲染，
+            # 绝不吐一张空表壳（空表在页面上是"什么都没有"，比看到原文更糟）。
+            return f"<p{attr}>{prose(text)}</p>"
+        cap = (b.payload.get("caption") or "") if lang == "en" \
+            else (b.payload.get("caption_zh") or b.payload.get("caption") or "")
+        cap_html = f"<caption>{_mathy(str(cap), typeset=typeset)}</caption>" if str(cap).strip() else ""
         body = []
         for i, row in enumerate(rows):
             cell = "th" if i == 0 else "td"
-            body.append("<tr>" + "".join(f"<{cell}>{_esc(c)}</{cell}>" for c in row) + "</tr>")
+            body.append("<tr>" + "".join(
+                f"<{cell}>{_mathy(str(c), typeset=typeset)}</{cell}>" for c in row) + "</tr>")
         return f'<table class="datatable"{attr}>{cap_html}{"".join(body)}</table>'
     if t == "refs":
         # 同标题：参考文献条目也是可选中的文字（宿主常在上面标"这篇要读"），

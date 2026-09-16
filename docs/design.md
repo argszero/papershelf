@@ -199,7 +199,7 @@ shares(
 | `p` | — | 段落 |
 | `abstract` | — | 摘要框 |
 | `figure` | `{src, caption, wide}` | `<figure><img><figcaption>` |
-| `table` | `{caption, rows, header}` | `<table class="datatable">` |
+| `table` | `{caption, caption_zh, rows, rows_zh}` | 阅读器 `.booktbl`（逐格双语）、**导出/分享** `<table class="datatable">`（服务端 `markup` 渲染）；`rows`/`rows_zh` 是**等宽二维数组**（第一行表头），前端按三模式**逐格**选英/中（中英同形的格子只渲一支，㊴） |
 | `eq` | `{latex, number}` | `<div class="eq">\[…\tag{N}\]</div>` |
 | `meta` | `{authors, affil, journal, doi}` | 页眉信息块 |
 
@@ -303,7 +303,10 @@ PATCH  /api/admin/users/{id}                 # 禁用/启用、重置密码
 ```
 ① 接入        上传 PDF  ┃  arXiv ID（⑱）
                           └→ 优先抓 arxiv.org/html/<ID>v<N>；无 HTML 版回落下载 PDF
-② 解析        fitz：文本块 + 图片块 + 坐标 + 表格线索
+② 解析        fitz：文本块 + 图片块 + 坐标（表格**不在这里做**，见 ①c）
+①c 原文校对   LLM agent（㉝）：给**原 PDF 页图**（可 region 放大）+ 抽取结果 + 工具，
+              逐页校对分块与结构 —— 拆/合/删/改块、改标题层级（㉝ 补记二）、
+              **栏间续段标记**（㊲）、**表格重建**（㊴ `set_table`）。页级续跑（`ok_pages`）
 ③ 英文 HTML   生成带块标记的英文 HTML   <p data-b="b-0042">…</p>
 ③b 公式 LaTeX 化  含数学的英文块过一遍「只排版不改写」的 LLM 通道（决策㉓）
               —— **必须在 ④ 之前**：译文由构造继承同一份 LaTeX，中英公式天然一致
@@ -329,7 +332,7 @@ papershelf export out/doc.json -o out/dual.html --mode dual
 | 文本 | `page.get_text("dict")` 取 blocks/lines/spans |
 | 图片 | **image blocks（type==1）的 bbox**，配 (y,x) 排序；**不用 `get_image_rects()`**（双栏时 bbox 全从 y=58 起，不可靠） |
 | 图注配对 | 图注 block 与图片 block 按 (y,x) 联合排序；左栏 x≈54 / 右栏 x≈309 |
-| 表格 | **line 级 `x0` 判列归属**（`get_text()` 会打乱行内单元格顺序）→ 重建 `<table class="datatable">`，caption 置顶 |
+| **表格**（㊴，2026-09-16） | **解析阶段不识别表格，交给 ①c 校对 agent**（`set_table` 工具）。原因：`page.find_tables()` 三种策略都抓不到这类「有横线、没竖线」的表，`strategy="text"` 还会把双栏正文判成 62×7 大表；而 agent 本来就在逐页看页图。⚠️ **字符不许靠视觉模型认字**：它用 `read_blocks`/`read_block` 拿到抽取到的**逐字原文**，视觉只判**结构**（哪几行一张表、列边界、合并格、跨页、表注归位），再把已有文本装进格子。三条护栏：①每个格子文字必须能在被消费的源块文本里**逐字找到**（找不到整份拒收，防凭图默写）；②行/列数必须一致（允许空尾格，`rows_zh` 与 `rows` 形状不符则回落英文网格）；③源块里不许有成句文字没被消费（`_table_residue`，防把正文段吃进表）。**提示**（`_table_regions`）：横线 + **同一行上横着好几段文字**两条同时成立才报"疑似表区"，实测 37 页报 3 处（真表 3 张）、零误报；只靠横线会报 20+ 处（图框边、页眉装饰线），只靠文字会把双栏正文报成表 —— 提示只买**召回**，判定仍在 agent。单元格**双语**（`rows` + `rows_zh`，跟随阅读器三模式）；**不动 `parse.py`、不涨 `PARSE_VERSION`** |
 | 页眉 logo | 按尺寸启发式（如 325×89）识别并剔除 |
 | arXiv HTML | `<math alttext>` 取**未损坏 LaTeX**；图取 `figures/<file>` 原始文件；参考文献取 `<li id="bib.bibNN">` 并清理 `Cited by: §II` 残渣 |
 | 下载校验 | `content-length` 比对 + PIL 检测底部 25% 纯黑占比 >50% 判截断；`curl -sL -C -` 多轮续传 |

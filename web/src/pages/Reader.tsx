@@ -158,15 +158,45 @@ export function DocBlock({ b, mode, assets, selected, flash, onPick }: {
 
   if (b.type === 'table') {
     const rows = (b.payload?.rows as string[][] | undefined) || []
+    const rowsZh = (b.payload?.rows_zh as string[][] | undefined) || []
+    // 中文网格的形状必须与英文**逐行同宽**，否则整份不用（宁可显示原文表，
+    // 也不显示一张错行的表 —— 错行比没译更难发现，见 model.table_cells 的同一判据）。
+    const zhOk = rowsZh.length === rows.length
+      && rowsZh.every((r, i) => r.length === rows[i].length)
+    const cap = String(b.payload?.caption || '')
+    const capZh = String(b.payload?.caption_zh || '')
+    /** 一格：两栏各自一个 span，由 `.lang-zh / .lang-en` 的 CSS 决定显不显示
+     *  （对照模式两个都在，与原型 `cellHTML` 同构）。中文缺失时在中文栏里**回落原文**。
+     *  ⚠️ 中英**同形**的格子（数字、缩写、专有名词，如 `CNN` / `99.2%`）只渲一栏：
+     *  两栏内容一模一样时，对照模式会把同一串字显示两遍（实测 `CNN / CNN`）——
+     *  原型 `cellHTML` 用 `.b-any` 专门挡这个，漏了它就成了"表格看着有重影"。
+     *  `.b-any` 不带语种类，所以三种模式都可见（数字不该跟着模式消失）。 */
+    const cell = (i: number, j: number) => {
+      const en = rows[i][j]
+      const zh = zhOk ? rowsZh[i][j] : ''
+      if (zh === en) return <span className="b-any">{en}</span>
+      return (
+        <>
+          <span className="b-en">{en}</span>
+          <span className="b-zh">{zh || en}</span>
+        </>
+      )
+    }
     return (
       <div className="blk tbl" data-b={b.id}>
+        {cap && (
+          <div className="cap">
+            <span className="b-en">{cap}</span>
+            <span className="b-zh">{capZh || cap}</span>
+          </div>
+        )}
         <div className="tbl-wrap">
           {rows.length > 0 ? (
             <table className="booktbl">
               <tbody>
                 {rows.map((r, i) => (
-                  <tr key={i}>{r.map((c, j) => (i === 0
-                    ? <th key={j}>{c}</th> : <td key={j}>{c}</td>))}</tr>
+                  <tr key={i}>{r.map((_, j) => (i === 0
+                    ? <th key={j}>{cell(i, j)}</th> : <td key={j}>{cell(i, j)}</td>))}</tr>
                 ))}
               </tbody>
             </table>

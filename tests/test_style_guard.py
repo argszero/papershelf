@@ -444,3 +444,29 @@ def test_headings_keep_the_mark_coordinate_container() -> None:
     markup = (ROOT / "src" / "papershelf" / "pipeline" / "markup.py").read_text(encoding="utf-8")
     assert '"h1", "h2", "h3", "h4"' in markup and "prose(text)" in markup, (
         "服务端标题不再走 prose() —— 没有锚点/没有 <mark>，只改前端是修不好的")
+
+
+def test_identical_table_cells_render_only_once() -> None:
+    """中英**同形**的表格格子只渲一栏（`.b-any`）—— 否则对照模式里会出现重影。
+
+    2026-09-16（决策㊴ 表格重建）实测：`rows_zh` 与 `rows` 逐格相同时
+    （`CNN`、`MNIST, CIFAR-10`、`99.2%`、`[12]` 这类数字/缩写/专有名词），
+    `Reader.tsx` 无条件渲 `.b-en` + `.b-zh` 两栏，而 `.booktbl .b-*` 是 `display:block`
+    → 对照模式下同一串字**上下显示两遍**（DOM 量出的可见文本是 `CNN / CNN`）。
+    原型 `cellHTML` 早就有这一支（`c.en === c.zh` → 单个 `.b-any`），是我们漏了。
+
+    `.b-any` 不带语种类 ⇒ 三种模式都可见（数字不该跟着阅读模式消失）；
+    这条护栏同时钉住 JSX 这一支与 CSS 里它必须可见。
+    """
+    tsx = (WEB / "pages" / "Reader.tsx").read_text(encoding="utf-8")
+    css = CSS.read_text(encoding="utf-8")
+
+    tbl = tsx[tsx.index("b.type === 'table'"):]
+    tbl = tbl[:tbl.index("b.type === 'refs'") if "b.type === 'refs'" in tbl else 4000]
+    assert "className=\"b-any\"" in tbl, (
+        "表格格子丢掉了「中英同形只渲一栏」这一支 —— 对照模式会重复显示数字与缩写")
+    assert "zh === en" in tbl, "同形判定不见了，请复核本护栏"
+
+    naked = re.sub(r"/\*.*?\*/", "", css, flags=re.S)
+    assert ".booktbl .b-any { display: block; }" in naked, (
+        "`.b-any` 在表格里的显示规则变了（它必须三模式都可见，且与另两栏一样成行）")

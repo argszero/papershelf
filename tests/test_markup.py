@@ -234,3 +234,47 @@ def test_typeset_false_keeps_latex_source():
     """校验/prompt 走 `typeset=False`：公式必须留**源码**，否则比对与翻译都拿不到原式。"""
     b = Block(id="b-0013", type="p", en=r"See \(x^2\).", zh="", zh_source="none")
     assert r"\(x^2\)" in render_block(b, lang="en", marker=False, typeset=False)
+
+
+# ── 表格（决策㊴）────────────────────────────────────────────────────────
+def _table_block(**payload) -> Block:
+    rows = payload.pop("rows", [["Layer Type", "Complexity"], ["Self-Attention", "O(n²·d)"]])
+    return Block(id="b-0007", type="table", en="x",
+                 payload={"rows": rows, **payload})
+
+
+def test_table_renders_the_grid_per_language():
+    """表格块的两栏来自**两份网格**：`payload.rows`（英）/ `rows_zh`（中）。
+
+    `zh` 缺失时回落英文（与正文块「没有译文就回落原文」同一条规则）——
+    宁可让读者看到原文表格，也绝不吐一张空表。
+    """
+    b = _table_block(rows_zh=[["层类型", "每层复杂度"], ["自注意力", "O(n²·d)"]],
+                     caption="Table 1. Path lengths.", caption_zh="表1. 路径长度。")
+    en = render_block(b, lang="en", typeset=True)
+    zh = render_block(b, lang="zh", typeset=True)
+    assert "<th>Layer Type</th>" in en and "<td>O(n²·d)</td>" in en
+    assert "Table 1. Path lengths." in en
+    assert "<th>层类型</th>" in zh and "<td>自注意力</td>" in zh
+    assert "表1. 路径长度。" in zh and "Layer Type" not in zh
+
+
+def test_table_falls_back_to_english_when_the_zh_grid_shape_differs():
+    """形状不符就**整份回落**（绝不渲半张错行的表）—— 与 `model.table_cells` 同一判据。"""
+    b = _table_block(rows_zh=[["层类型"]])              # 行数/列数都对不上
+    zh = render_block(b, lang="zh", typeset=True)
+    assert "Layer Type" in zh and "层类型" not in zh
+
+
+def test_table_without_a_grid_renders_as_a_paragraph():
+    """历史/异常数据（只有 `en`、没有网格）走段落分支 —— 不吐空表壳。"""
+    b = Block(id="b-0008", type="table", en="orphan table text")
+    assert render_block(b, lang="en", typeset=True) == '<p data-b="b-0008">orphan table text</p>'
+
+
+def test_table_text_is_the_text_face_used_by_the_machines():
+    """`en`/`zh` 是网格的**裸文本串**：校验器、切片、`read_blocks` 只认它。"""
+    from papershelf.pipeline.model import table_text
+    rows = [["a", "b"], ["c", ""]]
+    assert table_text(rows) == "a | b\nc | "
+    assert table_text(rows, "Table 1. x") == "Table 1. x\na | b\nc | "

@@ -10,6 +10,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import re
@@ -19,7 +20,7 @@ from dataclasses import dataclass
 import httpx
 
 from .markup import render_block
-from .model import Block
+from .model import Block, grid_shape, table_text
 from .validate import expects_chinese, extract_blocks, validate
 
 # 管线模块自己持 logger（不继承调用方）：`server/logging_setup.py` 给 root 挂 handler，
@@ -78,15 +79,80 @@ class LLMConfig:
 _FENCE_RE = re.compile(r"^\s*```(?:html)?\s*|\s*```\s*$")
 
 
+# ── 表格的翻译通路（决策㊴，2026-09-16）─────────────────────────────────────
+# 表格**不能**走正文那条"渲染成 HTML → 让模型翻译 HTML → 解回块文本"的通路：
+# `extract_blocks` 是按 `data-b` 取块内**全部文本**的，`<td>` 之间的边界在解回来时
+# 已经没了 —— 网格结构会当场塌成一堆字（这正是这轮要修的缺陷的另一种形态）。
+# 所以表格单开一条通道：**送网格、要网格**，形状由程序判定（见 `_table_ok`）。
+TABLE_SYSTEM = SYSTEM_PROMPT + """
+关于**表格**（本轮的输入就是一张表，不是普通段落）：
+- 输入是一张表的抽取结果：`caption` 是表注（可空），`rows` 是网格（第一行是表头）。
+- 输出必须是**一个 JSON 对象**，且**只有 JSON**（不要 markdown 围栏、不要解释文字）：
+  {"caption_zh": "表注的中文", "rows_zh": [["第一行第一格", "第一行第二格"], ["…"]]}
+- `rows_zh` 的行数与列数**必须与输入完全一致**，一个格子都不能合并、拆分或删除。
+- 纯数字、单位、符号、公式（如 `O(n²·d)`、`12.4`、`%`）的格子**原样保留**；
+  单元格内不要添加句号，不要补全缩写。
+- 表注（caption）要译；表注里的编号如 `Table 1.` 译成 `表1.`（编号数字不变）。
+"""
+
+_JSON_FENCE_RE = re.compile(r"^\s*```(?:json)?\s*|\s*```\s*$", re.M)
+
+
+def _json_object(text: str) -> dict | None:
+    """容错取第一个 JSON 对象（去围栏 → 直接解析 → 抠第一个平衡的 `{...}`）。"""
+    cleaned = _JSON_FENCE_RE.sub("", (text or "").strip()).strip()
+    start = cleaned.find("{")
+    cands = [cleaned]
+    if start >= 0:                       # 抠第一个平衡花括号块（模型常夹带解释文字）
+        depth = 0
+        for i in range(start, len(cleaned)):
+            if cleaned[i] == "{":
+                depth += 1
+            elif cleaned[i] == "}":
+                depth -= 1
+                if depth == 0:
+                    cands.append(cleaned[start:i + 1])
+                    break
+    for c in cands:
+        try:
+            data = json.loads(c)
+        except (ValueError, TypeError):
+            continue
+        if isinstance(data, dict):
+            return data
+    return None
+
+
 def _clean(text: str) -> str:
     return _FENCE_RE.sub("", text.strip()).strip()
 
 
+def _fit_grid(got: object, want: tuple[int, int]) -> list[list[str]] | None:
+    """把模型回的 `rows_zh` 修成与英文网格**同形**；修不动就返回 `None`。
+
+    只做**一种**修正（不加宽、不造格）：行数一致、每行不超列数时，把短行补空串到
+    列数 —— 实测模型常把**空尾格**整行省掉（源表右侧本来就有空格），那是排版习惯
+    而不是理解错误，为此整份作废太贵。除此之外一律 `None`（形状不符 → 由调用方
+    重试或放弃）。
+    """
+    if not isinstance(got, list) or len(got) != want[0]:
+        return None
+    rows, width = [], want[1]
+    for row in got:
+        if not isinstance(row, list) or not row or len(row) > width:
+            return None
+        cells = [str(c) if c is not None else "" for c in row]
+        rows.append(cells + [""] * (width - len(cells)))
+    return rows
+
+
 class Translator:
-    def __init__(self, cfg: LLMConfig, glossary: list[dict] | None = None) -> None:
+    def __init__(self, cfg: LLMConfig, glossary: list[dict] | None = None,
+                 *, table_retry: int = 1) -> None:
         self.cfg = cfg
         self.glossary = glossary or []
         self.system = SYSTEM_PROMPT          # 子类（Latexizer）可换一套 system prompt
+        self._table_retry = max(0, int(table_retry))
         self.tokens_used = 0
         self.needs_review: list[str] = []   # 重试后仍不合格的块 → 交阅读器按需修订（决策⑯）
 
@@ -122,13 +188,13 @@ class Translator:
         return "".join(parts)
 
     # ── 调用 ──────────────────────────────────────────────────────────────
-    def _chat(self, user: str) -> str:
+    def _chat(self, user: str, system: str | None = None) -> str:
         payload = {
             "model": self.cfg.model,
             "temperature": self.cfg.temperature,
             "max_tokens": self.cfg.max_tokens,
             "messages": [
-                {"role": "system", "content": self.system},
+                {"role": "system", "content": system or self.system},
                 {"role": "user", "content": user},
             ],
         }
@@ -193,12 +259,22 @@ class Translator:
                 and (only is None or b.id in only)]
         # 注意：上下文仍取自**完整** ordered，只有待翻集合被收窄（断点续跑不影响上下文质量）
 
+        # 表格与正文走**两条通道**（见模块里 `TABLE_SYSTEM` 的说明）：表格送网格、要网格，
+        # 正文送带标记的 HTML。混在一起送会让模型把 `<td>` 的边界当成排版噪声。
+        tables = [b for b in todo if b.type == "table"]
+        todo = [b for b in todo if b.type != "table"]
+        for b in tables:
+            zh = self._translate_table(b, log=log)
+            if zh:
+                all_texts[b.id] = zh
+
         index = {b.id: i for i, b in enumerate(ordered)}
         chunks = self.chunk(todo, max_blocks, max_chars)
         # 「进度」必须能回答"还剩多少"：只打「切片 3」看不出是 3/45 还是 3/4
         # （生产汇报「一直显示转换中」时，日志里连总数都没有，无从判断是否在进行）。
         log(
-            f"  · 翻译开始：{len(todo)}/{len(ordered)} 块需翻译，共 {len(chunks)} 个切片"
+            f"  · 翻译开始：{len(todo) + len(tables)}/{len(ordered)} 块需翻译"
+            f"（含表格 {len(tables)} 张），共 {len(chunks)} 个切片"
             f"（{sum(len(b.en) for b in todo)} 字符）"
         )
         for ci, chunk in enumerate(chunks, start=1):
@@ -240,9 +316,11 @@ class Translator:
                     log(f"    ! 重译 {bid} 失败：{exc}")
 
         # ── 收敛保证：重试额度用尽后不再纠缠，留痕交给阅读器的块级修订（决策⑯）──
-        self.needs_review = self._check(todo, all_texts)
+        # 表格的"合格"判据是**形状 + 有没有中文**（`_table_bad`），与正文的文本判据不同，
+        # 所以并进来一起收尾 —— 两处各留一份 needs_review 会导致界面上"待校对"数目对不上。
+        self.needs_review = self._check(todo, all_texts) + [b.id for b in tables if self._table_bad(b)]
         for bid in self.needs_review:
-            b = next((x for x in todo if x.id == bid), None)
+            b = next((x for x in ordered if x.id == bid), None)
             if b is not None:
                 b.payload["needs_review"] = True
         if self.needs_review:
@@ -258,6 +336,67 @@ class Translator:
             else:
                 out.append(b.en)                      # 免中文块：回落英文原文
         return out
+
+    # ── 表格（决策㊴）：送网格、要网格 ─────────────────────────────────────
+    def _table_prompt(self, b: Block) -> str:
+        payload = {
+            "caption": str(b.payload.get("caption") or ""),
+            "rows": b.payload.get("rows") or [],
+        }
+        return (self._glossary_text()
+                + "【需要翻译的表格】\n"
+                + json.dumps(payload, ensure_ascii=False)
+                + "\n\n请按格式要求输出**一个 JSON 对象**（caption_zh + rows_zh），"
+                  "行数列数必须与输入一致。")
+
+    def _translate_table(self, b: Block, log=print) -> str:
+        """翻译一张表 → 回填 `payload["rows_zh"]` / `["caption_zh"]`，返回中文裸文本。
+
+        ## 护栏（每条都对应一种**可判定**的坏结果）
+        - 形状必须**完全一致**：`rows_zh` 的行数/列数与 `rows` 不同时整份作废
+          （错行的表比不译更难发现 —— 读者会当成原文就长这样）；
+        - 空白格子按原文补空串（模型常把空尾格整个省掉，那算形状不符，不该作废）；
+        - 追加重试 `max_retry` 次，仍不合格就**不写**（`en` 原样回落），
+          由 `needs_review` 交给阅读器的块级重译 —— 与正文同一套收敛保证。
+        """
+        rows = b.payload.get("rows") or []
+        want = grid_shape(rows)
+        if not want:
+            return ""
+        for attempt in range(self._table_retry + 1):
+            try:
+                data = _json_object(self._chat(self._table_prompt(b), system=TABLE_SYSTEM))
+            except Exception as exc:                       # noqa: BLE001 — 网络/接口异常不该炸整篇
+                log(f"    ! 表格 {b.id} 翻译调用失败：{exc}")
+                data = None
+            got = (data or {}).get("rows_zh")
+            got = _fit_grid(got, want)
+            if got is not None:
+                b.payload["rows_zh"] = got
+                cap_zh = str((data or {}).get("caption_zh") or "").strip()
+                if cap_zh:
+                    b.payload["caption_zh"] = cap_zh
+                zh = table_text(got, cap_zh or str(b.payload.get("caption") or ""))
+                b.zh = zh
+                log(f"    · 表格 {b.id} 已译（{want[0]}×{want[1]} 格）")
+                return zh
+            if attempt < self._table_retry:
+                log(f"    ! 表格 {b.id} 形状不符（要 {want[0]}×{want[1]}），重试 {attempt + 1}")
+        log(f"    ⚠️ 表格 {b.id} 重试后仍不合格 → 保持英文，标「待校对」")
+        return ""
+
+    @staticmethod
+    def _table_bad(b: Block) -> bool:
+        """表格译文是否合格（与正文 `_check` 同一套取向：能重试修好的才判不合格）。"""
+        want = grid_shape(b.payload.get("rows") or [])
+        got = grid_shape(b.payload.get("rows_zh") or [])
+        if not want or got != want:
+            return True
+        if not expects_chinese(b.en, block_type="table"):
+            return False                    # 纯数字/符号表：本就不要求中文
+        return not re.search(r"[\u4e00-\u9fff]", b.zh or "")
+
+    # ── 分块 / 判定 ───────────────────────────────────────────────────────
 
     @staticmethod
     def ordered(blocks: list[Block]) -> list[Block]:
