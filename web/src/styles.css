@@ -516,7 +516,8 @@ select.input { width: auto; }
 /* 点笔记跳转时的"闪一下"：让人一眼看到落点在哪几个字（原型 snFlash） */
 @keyframes hlFlash { 0% { background: color-mix(in oklch, var(--accent) 42%, transparent); }
   100% { background: transparent; } }
-.hl.is-flash, .blk-p.is-flash { animation: hlFlash 1.3s ease; }
+/* `.blk` 而不是 `.blk-p`：表格块也会被"点笔记跳转"闪一下（㊵ 起表格块也有块级选中态）。 */
+.hl.is-flash, .blk.is-flash { animation: hlFlash 1.3s ease; }
 
 /* 色板圆点：浮条（选中文字 / 点已有划痕）里的选笔。工具栏上不再常驻一排笔
    （2026-09-14 宿主：保持工具栏简洁，选笔在浮条里就够了）。 */
@@ -548,24 +549,32 @@ select.input { width: auto; }
   text-transform: uppercase; color: var(--muted); margin-right: 7px; }
 .cap .b-en, .cap .b-zh { display: block; }
 .cap .b-zh { margin-top: 2px; }
-.tbl { margin: 16px 0; }
-.tbl .cap { margin: 0 0 10px; }
+.tbl { margin: 16px 0; border-radius: 6px; }
+/* 块级选中态（点一下表格 → 下面出现"编辑译文 / 重译此块 / 加笔记"，与正文段同一套） */
+.tbl.is-sel { background: color-mix(in oklch, var(--accent) 7%, transparent); }
 .tbl-wrap { overflow-x: auto; }
-.booktbl { width: 100%; border-collapse: collapse; font-size: calc(var(--doc-fs) - 1.5px); }
-.booktbl th { border-top: 1.3px solid var(--fg); border-bottom: 0.7px solid var(--fg); padding: 7px 9px;
+/* 表格 HTML 由**服务端**渲染（`markup.render_block` 的 table 分支，class="datatable"）——
+   阅读器只负责样式与并排，不自己拼 `<table>`（否则划痕的锚点/`<mark>` 就会分叉，㊵）。
+   版式与从前 `.booktbl` 一致：表头上下双线、数据格等宽数字、首列文字体。 */
+.tbl .datatable { width: 100%; border-collapse: collapse; font-size: calc(var(--doc-fs) - 1.5px); }
+.tbl .datatable th { border-top: 1.3px solid var(--fg); border-bottom: 0.7px solid var(--fg); padding: 7px 9px;
   text-align: left; vertical-align: bottom; font-family: var(--font-body); font-weight: 600; }
-.booktbl td { padding: 6px 9px; vertical-align: top; font-family: var(--font-mono); font-variant-numeric: tabular-nums; }
-/* 一格里的中英（决策㊴）：**上下两行**而不是 inline 拼在一起 ——
-   格子通常很短（"Supervised" / "监督"），inline 会看不出边界，块级还能保住列对齐。
-   另一半由 `.lang-zh .b-en` / `.lang-en .b-zh` 收掉（三模式同一套规则，与正文一致）。
-   对照模式下英文那行淡一点，让中文站住（与 `.lang-dual .blk-p .t-en` 同一取向）。 */
-.booktbl .b-en, .booktbl .b-zh { display: block; }
-.lang-dual .booktbl .b-en { color: color-mix(in oklch, var(--fg) 74%, var(--muted)); }
-/* 中英**同形**的格子（数字、缩写、专有名词）只渲一栏 `.b-any`（原型 `cellHTML` 同一支）：
-   它不带语种类，三种模式都可见 —— 数字不该跟着阅读模式消失，也不该在对照模式显示两遍。 */
-.booktbl .b-any { display: block; }
-.booktbl th:first-child, .booktbl td:first-child { padding-left: 2px; }
-.booktbl th:last-child, .booktbl td:last-child { padding-right: 2px; }
+.tbl .datatable td { padding: 6px 9px; vertical-align: top; font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums; }
+.tbl .datatable caption { caption-side: top; text-align: left; margin: 0 0 10px;
+  font-size: calc(var(--doc-fs) - 1.5px); line-height: 1.62;
+  color: color-mix(in oklch, var(--fg) 80%, var(--muted)); }
+.tbl .datatable th:first-child, .tbl .datatable td:first-child { padding-left: 2px; }
+.tbl .datatable th:last-child, .tbl .datatable td:last-child { padding-right: 2px; }
+/* 对照模式：**左英文表、右中文表**并排（2026-09-16 宿主：「而不是在一个单元格里，既有中文，
+   又有英文」）。两张表各自带自己的 `<caption>`（表注跟着自己那张表 → 天然与两栏对齐），
+   版式与**导出/分享的双语 HTML** 同款（`synth._dual_rows` 一直是两张表并排）。
+   英文那栏淡一点，让中文站住（与 `.lang-dual .blk-p .t-en` 同一取向）。
+   ⚠️ 只有服务端说"中文网格真的可用"（`table_zh`）时才挂 `.dual`——否则右边会是一张
+   与左边一模一样的表（见 `Reader.tsx` 的 `pair`）。 */
+.tbl.dual .tbl-pair { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  column-gap: 36px; align-items: start; }
+.tbl.dual .tbl-col.en { color: color-mix(in oklch, var(--fg) 74%, var(--muted)); }
 
 /* 公式：服务端已渲染为 MathML（遗留项 8，零 JS 零字体） */
 .math-display { display: block; text-align: center; margin: 14px 0; overflow-x: auto; overflow-y: hidden; }
@@ -869,6 +878,9 @@ math { font-size: 1.02em; max-width: 100%; }
     margin-top: 7px; padding-left: 11px;
     border-left: 2px solid color-mix(in oklch, var(--muted) 42%, var(--border));
   }
+  /* 窄屏：两张表**上下**排（并排会把每张表挤成一条窄缝，横向滚动反而更难看） */
+  .tbl.dual .tbl-pair { grid-template-columns: 1fr; row-gap: 10px; }
+  .tbl.dual .tbl-col.zh .datatable caption { margin-top: 14px; }
   .doc-title { font-size: 22px; }
 
   /* 文献表在窄屏**横向滚动**，不硬挤成窄条（截图踩过：标题每行两个字） */

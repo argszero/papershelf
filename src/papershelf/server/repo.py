@@ -11,7 +11,7 @@ import sqlite3
 from typing import Any
 
 from ..pipeline.markup import render_block
-from ..pipeline.model import Block, Doc
+from ..pipeline.model import Block, Doc, table_zh_usable
 from .db import dump_json, load_json, rows_to_list, tx, utcnow
 
 # 免中文块（无译文的块）在阅读器里走「单栏横跨」渲染
@@ -150,7 +150,7 @@ def public_block(b: Block, *, asset_prefix: str = "",
     # 再套一层服务端的 `<h2 class="sec">` 就会得到 `<h2><h2>`（浏览器会把内层甩到外面）。
     # 见 `markup.render_block` 的 `wrap` 参数与 `web/src/pages/Reader.tsx` 的标题分支。
     wrap = not b.type.startswith("h")
-    return {
+    item = {
         "id": b.id, "type": b.type, "level": b.level, "section": b.section,
         "en": b.en, "zh": b.zh, "zh_source": b.zh_source,
         "payload": b.payload,
@@ -161,6 +161,13 @@ def public_block(b: Block, *, asset_prefix: str = "",
         "zh_html": render_block(b, lang="zh", marker=False, typeset=True, marks=marks,
                                 anchors=True, wrap=wrap),
     }
+    if b.type == "table":
+        # 对照模式渲不渲**第二张表**（左英右中）由服务端说了算（决策㊵）：
+        # 判据是"中文网格是否真的可用"（形状一致 + 不是逐格照抄英文，见 `model.table_zh_usable`）。
+        # 前端自己再判一遍 = 第二份判据，迟早与渲染漂开（漂开的表现是右边多出一张
+        # 与左边一模一样的表，或该有的中文表不出现）。
+        item["table_zh"] = table_zh_usable(b)
+    return item
 
 
 def get_block(conn: sqlite3.Connection, paper_id: int, block_id: str) -> Block | None:

@@ -147,14 +147,16 @@ agent 看页图后 `merge_block`；端到端实测合并真的落进产物、译
 另：**后台标签页里真实鼠标事件要么不生效要么被丢** → 判据 = `Emulation.setFocusEmulationEnabled(enabled=True)`
 （`visibilityState=visible / hasFocus()=true` 之后拖选立刻正常）—— 这是「后台标签页不算数」那条教训的**解药**。
 
-**㊴ 表格重建 ✅（代码 + 端到端已通，本地实测完，待上生产）**（2026-09-16 晚）：宿主截图「表格和原 pdf
+**㊴ 表格重建 ✅（已上生产 `bff21da`，2026-09-16 21:1x）**：宿主截图「表格和原 pdf
 差异较大」→ 选 **C**（交 ①c agent，新增 `set_table`）+ **A**（单元格双语 `rows` + `rows_zh`）。
 解析端**从来没做过**表格识别（`table` 一词零出现，粘连行还要白送翻译）；程序侧三条路都不通
 （无竖线／`find_tables()` 三策略全抓不到／`strategy="text"` 把双栏正文判成 62×7）⇒ agent 干，
 **视觉只判结构、认字必须回文本层** + 护栏三连（逐字来源／形状一致／不吃正文）+ `_table_regions`
 几何提示（两条判据缺一不可，37 页真表 3 处零误报）。**不动 `parse.py`、不涨 `PARSE_VERSION`** ⇒
-存量要吃修复必须「重新提取」（≈200 万 tokens，**未动，等宿主**）。离线回归 **347 passed**；
-端到端真产品路径 + 真浏览器三模式已验。
+存量要吃修复必须「重新提取」（≈200 万 tokens）—— **宿主 2026-09-16 定「不用，我来操作」**，
+故生产上暂时**看不到变化**是预期的。CI 六 job 绿；生产 `revision=bff21da…` / healthy /
+bundle `index-BuC2xeWi.js`（与本地同指纹）/ 日志零 error。离线回归 **348 passed**；
+端到端真产品路径 + 真浏览器三模式已验。⚠️ 这次 pull 又撞慢层（42.37MB 重试 ≈30 分钟）。
 
 ### 遗留待定项已结（M3 后全部结清或明确推后）
 1 会话机制 ✅ · 2 前端框架 ✅（React+TS+Vite）· 3 任务队列 ✅（**v1 常驻队列 + 启动恢复**，㉗）·
@@ -534,6 +536,19 @@ _Last updated: 2026-09-16T19:55:00+08:00_
   **空尾格**表达）；**独立视觉通道逐字复核一致**（含易错格「Bayesian networks … Naive Bayes (BN)」
   与自成一行「Q-learning」）。真浏览器三模式实测（⚠️ **改完前端必须 `npm run build`** ——
   旧 bundle 里表格没有 `.b-en/.b-zh`，看起来像"双语没生效"）：空单元格 0、console 零 error。
+
+### 同一轮：**已上生产**（2026-09-16 21:1x，宿主「要」）
+
+`bff21da` → CI `35096774881` 六 job 全绿 → 生产 `docker compose pull app` + `up -d app`：
+`revision=bff21da932cef…` / **healthy** / 公网 health 200 / bundle **`index-BuC2xeWi.js`**
+（与本地同指纹，含 `.b-any`）/ 日志零 error（「转换队列已启动」）。
+DB 与 `.env` 部署前已备份（`papershelf.db.bak.20260916-204237`、`.env.bak.20260916-204237`）。
+⚠️ 这次 pull 又撞慢层：42.37MB 那层反复 `Retrying`，20:42 起 → 21:12 `app Pulled`，**≈30 分钟**
+（`nohup … &` + 轮询照旧是唯一可行解）。
+
+**⚠️ 生产上「看不到变化」是预期**：表格重建在 ①c 阶段发生，存量块里根本没有 `table` 块。
+宿主 20:48 明确：**「不用（重新提取），我来操作」** —— 由宿主自己在文献库点「重新提取」，
+助手**不代签**这个操作（代价 ≈200 万 tokens + 译文重译 + 批注重划）。
 
 
 **To read a memory**: use the `read` tool with the full path.

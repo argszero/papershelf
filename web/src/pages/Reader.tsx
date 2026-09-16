@@ -157,50 +157,41 @@ export function DocBlock({ b, mode, assets, selected, flash, onPick }: {
   }
 
   if (b.type === 'table') {
-    const rows = (b.payload?.rows as string[][] | undefined) || []
-    const rowsZh = (b.payload?.rows_zh as string[][] | undefined) || []
-    // 中文网格的形状必须与英文**逐行同宽**，否则整份不用（宁可显示原文表，
-    // 也不显示一张错行的表 —— 错行比没译更难发现，见 model.table_cells 的同一判据）。
-    const zhOk = rowsZh.length === rows.length
-      && rowsZh.every((r, i) => r.length === rows[i].length)
-    const cap = String(b.payload?.caption || '')
-    const capZh = String(b.payload?.caption_zh || '')
-    /** 一格：两栏各自一个 span，由 `.lang-zh / .lang-en` 的 CSS 决定显不显示
-     *  （对照模式两个都在，与原型 `cellHTML` 同构）。中文缺失时在中文栏里**回落原文**。
-     *  ⚠️ 中英**同形**的格子（数字、缩写、专有名词，如 `CNN` / `99.2%`）只渲一栏：
-     *  两栏内容一模一样时，对照模式会把同一串字显示两遍（实测 `CNN / CNN`）——
-     *  原型 `cellHTML` 用 `.b-any` 专门挡这个，漏了它就成了"表格看着有重影"。
-     *  `.b-any` 不带语种类，所以三种模式都可见（数字不该跟着模式消失）。 */
-    const cell = (i: number, j: number) => {
-      const en = rows[i][j]
-      const zh = zhOk ? rowsZh[i][j] : ''
-      if (zh === en) return <span className="b-any">{en}</span>
-      return (
-        <>
-          <span className="b-en">{en}</span>
-          <span className="b-zh">{zh || en}</span>
-        </>
-      )
-    }
+    /* 表格块（决策㊴ 重建 / ㊵ 并排 + 可划）。
+     *
+     * ⚠️ 表格的 HTML **一律来自服务端**（`en_html`/`zh_html`），前端不再自己拼 `<table>`。
+     * 三条理由，每条都对应一次踩过的坑：
+     * 1. **划痕的尺子只有服务端有** —— 选中格子里几个字要变成 `(start,end)` 坐标，
+     *    靠的是 `<span class="o" data-o="N">` 零宽锚点（`markup.prose_html`，见 `marks.ts`）。
+     *    前端自己排版就没有这把尺子 → **选中后浮条根本不出现**（同 ㊳「标题不可划」）。
+     * 2. **`<mark>` 也必须由服务端吐** —— 自己包一层 = 第二份排版实现，早晚与锚点分叉（㉛）。
+     * 3. 列对齐/表头双线/等宽数字这套版式，导出与分享页看到的是同一份 HTML。
+     *
+     * 对照模式（2026-09-16 宿主：「应该是左侧英文表格，右侧中文表格。而不是在一个单元格里，
+     * 既有中文，又有英文」）：两张表**并排**，左边英文表、右边中文表，各带自己的表注
+     * （表注就在 `<caption>` 里，跟着自己那张表 → 天然与两栏对齐）。
+     * 这也正是**导出/分享的双语 HTML 一直是的样子**（`synth._dual_rows`），此处只是让阅读器对齐它。
+     *
+     * `table_zh` 由服务端给（`model.table_zh_usable`）：中文网格形状不符、或逐格照抄英文时
+     * **不配第二张表** —— 否则右边会是一张与左边一模一样的表，比"一格中英两行"更糟。
+     */
+    const pair = mode === 'dual' && b.table_zh === true
     return (
-      <div className="blk tbl" data-b={b.id}>
-        {cap && (
-          <div className="cap">
-            <span className="b-en">{cap}</span>
-            <span className="b-zh">{capZh || cap}</span>
-          </div>
-        )}
-        <div className="tbl-wrap">
-          {rows.length > 0 ? (
-            <table className="booktbl">
-              <tbody>
-                {rows.map((r, i) => (
-                  <tr key={i}>{r.map((_, j) => (i === 0
-                    ? <th key={j}>{cell(i, j)}</th> : <td key={j}>{cell(i, j)}</td>))}</tr>
-                ))}
-              </tbody>
-            </table>
-          ) : <BlockBody block={b} lang={mode === 'en' ? 'en' : 'zh'} />}
+      <div className={`blk tbl${pair ? ' dual' : ''}${selected ? ' is-sel' : ''}${flash ? ' is-flash' : ''}`}
+           data-b={b.id}
+           tabIndex={0} role="button" aria-label="选中此块"
+           onKeyDown={(e) => {
+             if (e.key !== 'Enter' && e.key !== ' ') return
+             e.preventDefault()
+             onPick?.(b.id)
+           }}>
+        <div className="tbl-pair">
+          {mode !== 'zh' && (
+            <div className="tbl-col en"><div className="tbl-wrap"><BlockBody block={b} lang="en" /></div></div>
+          )}
+          {(mode === 'zh' || pair) && (
+            <div className="tbl-col zh"><div className="tbl-wrap"><BlockBody block={b} lang="zh" /></div></div>
+          )}
         </div>
       </div>
     )

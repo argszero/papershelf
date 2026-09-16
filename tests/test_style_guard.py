@@ -348,7 +348,7 @@ def test_mark_styles_exist(css: str) -> None:
     只是"点了没反应"——正好落在这个仓库最痛的那一类"本地全绿、只有人看得见"的缺陷上。
     """
     naked = re.sub(r"/\*.*?\*/", "", css, flags=re.S)
-    for selector in (".hl", ".hl.is-flash", ".blk-p.is-flash",
+    for selector in (".hl", ".hl.is-flash", ".blk.is-flash",
                      ".hl-amber", ".hl-green", ".hl-blue", ".hl-pink",
                      ".pen", ".pen.is-on", ".pen-amber", ".pen-green", ".pen-blue", ".pen-pink",
                      ".mark-bar", ".mark-bar .mb-btn", ".mark-bar .mb-del"):
@@ -446,27 +446,49 @@ def test_headings_keep_the_mark_coordinate_container() -> None:
         "服务端标题不再走 prose() —— 没有锚点/没有 <mark>，只改前端是修不好的")
 
 
-def test_identical_table_cells_render_only_once() -> None:
-    """中英**同形**的表格格子只渲一栏（`.b-any`）—— 否则对照模式里会出现重影。
+def test_table_renders_from_the_server_and_pairs_one_grid_per_language() -> None:
+    """表格的版式有三条硬约束（决策㊴ 重建 → ㊵ 并排 + 可划），三条都曾踩过坑。
 
-    2026-09-16（决策㊴ 表格重建）实测：`rows_zh` 与 `rows` 逐格相同时
-    （`CNN`、`MNIST, CIFAR-10`、`99.2%`、`[12]` 这类数字/缩写/专有名词），
-    `Reader.tsx` 无条件渲 `.b-en` + `.b-zh` 两栏，而 `.booktbl .b-*` 是 `display:block`
-    → 对照模式下同一串字**上下显示两遍**（DOM 量出的可见文本是 `CNN / CNN`）。
-    原型 `cellHTML` 早就有这一支（`c.en === c.zh` → 单个 `.b-any`），是我们漏了。
+    ⚠️ **这条护栏取代了旧的 `test_identical_table_cells_render_only_once`**：
+    旧实现是"一个格子里上下两行中英"（`.b-en`/`.b-zh`/`.b-any` 三支 span 由 CSS 挑一支显），
+    宿主 2026-09-16 明确否掉了它 ——
+    「表格中英对照，应该是左侧英文表格，右侧中文表格。而不是在一个单元格里，既有中文，又有英文」。
+    于是"同形格子只渲一栏"这一支**整个消失了**（不再有同一个格子里并排两支的可能），
+    旧断言钉的正是那个实现，属于"旧断言写的就是被推翻的设计"。
 
-    `.b-any` 不带语种类 ⇒ 三种模式都可见（数字不该跟着阅读模式消失）；
-    这条护栏同时钉住 JSX 这一支与 CSS 里它必须可见。
+    现在钉的是：
+
+    1. **前端不再自己拼 `<table>`** —— 表格 HTML 一律取服务端的 `en_html`/`zh_html`
+       （`BlockBody` → `.b-inline[data-lang]`）。理由不是"少写代码"：划痕的尺子
+       （零宽锚点 `<span class="o" data-o="N">`）与 `<mark>` 只有服务端吐得出来，
+       前端自排 = 第二份排版实现，选中后**浮条根本不出现**（㊳ 标题那把尺子是同一个坑）。
+    2. **对照模式左右各一张表**（`.tbl.dual .tbl-pair` 两列网格），
+       且**只有服务端说中文网格可用时**才配对（`b.table_zh`，
+       判据见 `model.table_zh_usable` —— 照抄英文的网格绝不能渲成第二张表）。
+    3. `.b-any` / `.booktbl` 这套旧类名不得复活（复活 = 又回到"一格两行"）。
     """
-    tsx = (WEB / "pages" / "Reader.tsx").read_text(encoding="utf-8")
-    css = CSS.read_text(encoding="utf-8")
+    tsx_raw = (WEB / "pages" / "Reader.tsx").read_text(encoding="utf-8")
+    # 去注释再断言：注释里会提到 `<table>` / `rows_zh` 这些字样（讲"为什么不能用"），
+    # 拿注释判会假红。真正要看的是**代码**。
+    tsx = re.sub(r"/\*.*?\*/", "", tsx_raw, flags=re.S)
+    naked = re.sub(r"/\*.*?\*/", "", CSS.read_text(encoding="utf-8"), flags=re.S)
 
     tbl = tsx[tsx.index("b.type === 'table'"):]
     tbl = tbl[:tbl.index("b.type === 'refs'") if "b.type === 'refs'" in tbl else 4000]
-    assert "className=\"b-any\"" in tbl, (
-        "表格格子丢掉了「中英同形只渲一栏」这一支 —— 对照模式会重复显示数字与缩写")
-    assert "zh === en" in tbl, "同形判定不见了，请复核本护栏"
+    assert "<table" not in tbl and "rows_zh" not in tbl, (
+        "表格又在**前端**自己拼 <table> 了 —— 划痕的锚点/<mark> 只有服务端有，"
+        "自排会让「选中格子后出浮条」静默失效（㊳/㊵ 同一个坑）")
+    assert "BlockBody block={b} lang=\"en\"" in tbl and "BlockBody block={b} lang=\"zh\"" in tbl, (
+        "表格两栏必须各走一次 BlockBody（服务端 HTML + `.b-inline[data-lang]` 坐标系）")
+    assert "b.table_zh === true" in tbl, (
+        "配对判据丢了：中文网格不可用时（形状不符/逐格照抄英文）会渲出一张与左边一模一样的表")
+    assert "tbl-pair" in tbl and "tbl-col" in tbl, "并排容器不见了（对照模式要左右两张表）"
 
-    naked = re.sub(r"/\*.*?\*/", "", css, flags=re.S)
-    assert ".booktbl .b-any { display: block; }" in naked, (
-        "`.b-any` 在表格里的显示规则变了（它必须三模式都可见，且与另两栏一样成行）")
+    assert ".tbl.dual .tbl-pair" in naked, (
+        "并排容器 `.tbl.dual .tbl-pair` 的样式没了 —— 两张表会上下叠起来")
+    assert "grid-template-columns: minmax(0, 1fr) minmax(0, 1fr)" in naked, (
+        "左右两栏的网格不见了（对照模式要一左一右，不是上下）")
+    assert ".tbl .datatable" in naked, (
+        "表格样式没有对准服务端吐的 `table.datatable` —— 表格会变成浏览器默认样式")
+    assert ".booktbl" not in naked and ".b-any" not in naked, (
+        "旧的「一格两行」样式（`.booktbl` / `.b-any`）复活了 —— 那是被宿主否掉的版式")

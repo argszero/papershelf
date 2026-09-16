@@ -10,7 +10,7 @@ import dataclasses
 
 from .mathml import mathml_css
 from .markup import CSS, _esc, render_block
-from .model import Block
+from .model import Block, table_zh_usable
 from .validate import NO_ZH_TYPES
 
 DUAL_CSS = """
@@ -122,8 +122,11 @@ def _dual_rows(blocks: list[Block], typeset: bool) -> list[str]:
     rows = []
     for b in blocks:
         en = render_block(b, lang="en", marker=False, typeset=typeset)
-        # 纯公式 / 参考文献 / 尚无译文 → 单栏横跨（渲染英文一次即可）
-        wide = b.type in NO_ZH_TYPES or not (b.zh or "").strip()
+        # 纯公式 / 参考文献 / 尚无译文 → 单栏横跨（渲染英文一次即可）。
+        # ⚠️ 表格另有一条判据：中文网格"形状不符 / 逐格照抄英文"时也别配一对
+        # （否则右栏是一张与左栏一模一样的表，见 `model.table_zh_usable`）。
+        wide = (b.type in NO_ZH_TYPES or not (b.zh or "").strip()
+                or (b.type == "table" and not table_zh_usable(b)))
         if wide:
             rows.append(f'<div class="row wide" data-b="{b.id}"><div class="col">{en}</div></div>')
             continue

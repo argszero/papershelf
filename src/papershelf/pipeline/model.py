@@ -58,17 +58,72 @@ def grid_shape(rows: Any) -> tuple[int, int] | None:
     return (len(rows), width)
 
 
+def table_layout(rows: list[list[str]] | None,
+                 caption: str = "") -> tuple[str, list[list[tuple[int, int]]]]:
+    """网格 → `(裸文本, 每格的字符区间)`。
+
+    **这是表格文本契约的唯一来源**：`table_text` 只是它的第一项。
+    为什么非要一起算（2026-09-16 决策㊵）：阅读器要把**每一格的文字**接进划痕的
+    坐标系（`<span class="o" data-o="N">` 零宽锚点，见 `markup.prose_html`），
+    而那个坐标系是**整块裸文本**的偏移 —— 于是必须知道"第 i 行第 j 格从第几个字开始"。
+    自己再拼一次文本、自己再数一遍分隔符，迟早与 `table_text` 漂开（漂开的表现是
+    划痕整体位移几个字符，很隐蔽），所以两件事共用一份拼接代码。
+
+    表注（caption）单独占第一行，它的区间是 `[0, len(caption))`。
+    """
+    text_cap = str(caption).strip() if (caption or "").strip() else ""
+    lines: list[str] = [text_cap] if text_cap else []
+    cells: list[list[tuple[int, int]]] = []
+    # 光标：第 0 行是表注（如果有），其后每行一格一格地推
+    pos = len(text_cap) + (len(ROW_SEP) if text_cap else 0)
+    for row in rows or []:
+        row_cells: list[tuple[int, int]] = []
+        for i, c in enumerate(row):
+            cell = "" if c is None else str(c)
+            row_cells.append((pos, pos + len(cell)))
+            pos += len(cell) + (len(CELL_SEP) if i < len(row) - 1 else 0)
+        cells.append(row_cells)
+        lines.append(CELL_SEP.join("" if c is None else str(c) for c in row))
+        pos += len(ROW_SEP)
+    return ROW_SEP.join(lines), cells
+
+
 def table_text(rows: list[list[str]] | None, caption: str = "") -> str:
     """网格 → 裸文本（`en`/`zh` 字段的那一份）。
 
     表注单独占第一行（校验器只看这一串文本，表注也是要判漏译的正文）。
     """
-    lines: list[str] = []
-    if (caption or "").strip():
-        lines.append(str(caption).strip())
-    for row in rows or []:
-        lines.append(CELL_SEP.join("" if c is None else str(c) for c in row))
-    return ROW_SEP.join(lines)
+    return table_layout(rows, caption)[0]
+
+
+def table_caption(b: "Block", lang: str) -> str:
+    """某语言的表注：中文缺失时回落英文表注（与网格的回落同一取向，绝不吐空白）。"""
+    en = str(b.payload.get("caption") or "")
+    if lang == "en":
+        return en
+    return str(b.payload.get("caption_zh") or "") or en
+
+
+def table_zh_usable(b: "Block") -> bool:
+    """该表格块**真的有中文网格**吗 —— 决定对照模式渲不渲第二张表。
+
+    三条判据（缺一不可，全部对应一种"看起来对、其实错"的结果）：
+    1. `rows_zh` 存在且形状与 `rows` **逐行同宽**（错行的表比不译更难发现）；
+    2. 中文裸文本非空（没译的块 `zh` 是空串）；
+    3. **不是逐格照抄英文** —— 模型有时把输入原样回一遍（`_table_bad` 会把它标
+       `needs_review`，但 `zh` 已经被写进去了）。照抄的网格若并排渲出来，
+       就是**两张一模一样的表**挨在一起，比"一格中英两行"更糟。
+    """
+    rows = b.payload.get("rows") or []
+    zh = b.payload.get("rows_zh") or []
+    if not grid_shape(rows) or grid_shape(zh) != grid_shape(rows):
+        return False
+    if not (b.zh or "").strip():
+        return False
+    return any(
+        str(zh[i][j]) != str(rows[i][j])
+        for i in range(len(rows)) for j in range(len(rows[i]))
+    )
 
 
 def table_cells(b: "Block", lang: str = "en") -> list[list[str]]:

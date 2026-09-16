@@ -18,7 +18,7 @@ import html as _html
 import re
 
 from .mathml import mathml_css, render_math, render_math_block
-from .model import Block, Doc, table_cells
+from .model import Block, Doc, table_caption, table_cells, table_layout
 from .validate import NO_ZH_TYPES
 
 CSS = """
@@ -103,7 +103,7 @@ def _clip(marks: list[dict], start: int, end: int) -> list[tuple[int, int, dict]
 
 
 def prose_html(text: str, *, typeset: bool, marks: list[dict] | None = None,
-               anchors: bool = False) -> str:
+               anchors: bool = False, base: int = 0) -> str:
     """正文段的内部 HTML：可带**划痕**（任意字符区间）与**偏移锚点**。
 
     ⚠️ `anchors` 默认 **False**，只有要交给用户去划线的视图（阅读器/分享页）才开。
@@ -111,6 +111,11 @@ def prose_html(text: str, *, typeset: bool, marks: list[dict] | None = None,
     校验产物（`synth.py`）、导出文件都吃这份 HTML，多一层空 span 只会让
     产物更难 diff、让 prompt 更贵。这里与 `typeset` 同一取向 ——
     **不发锚点最多是"划不了新的一道"，发了错地方则是往 LLM 输入里掺垃圾**。
+
+    `base` 是这段文字在**整块裸文本**里的起点偏移（默认 0 = 自成一体）。
+    只有表格用它（决策㊵）：一张表的裸文本是"表注一行 + 每行 ` | ` 相连"（`model.table_text`），
+    单元格是这张表里的若干片段 —— 锚点必须吐**全局**偏移，尺子才连得上；
+    划痕也按全局坐标进来、在这里裁到本格。`base=0` 时行为与从前逐字节相同。
 
     ## 锚点是干什么的（改动前务必理解）
 
@@ -131,6 +136,10 @@ def prose_html(text: str, *, typeset: bool, marks: list[dict] | None = None,
       正常路径下不会产生"半个公式"的划痕。
     """
     text = text or ""
+    # `base`：划痕按**整块**坐标进来，这里换算成本片段的局部坐标（裁切照旧只认局部）
+    if base:
+        marks = [{**m, "start": int(m["start"]) - base, "end": int(m["end"]) - base}
+                 for m in (marks or [])]
     marks = sorted([m for m in (marks or []) if int(m["end"]) > int(m["start"])],
                    key=lambda m: int(m["start"]))
     if not marks and not anchors:
@@ -154,7 +163,7 @@ def prose_html(text: str, *, typeset: bool, marks: list[dict] | None = None,
         if not anchors:
             return
         if pos != last:
-            out.append(f'<span class="o" data-o="{pos}"></span>')
+            out.append(f'<span class="o" data-o="{base + pos}"></span>')
             last = pos
 
     for a, b, kind in units:
@@ -299,14 +308,28 @@ def render_block(b: Block, *, lang: str, marker: bool = True, typeset: bool = Fa
             # 网格缺失（历史数据 / 别的生产者只填了 `en`）→ 按段落渲染，
             # 绝不吐一张空表壳（空表在页面上是"什么都没有"，比看到原文更糟）。
             return f"<p{attr}>{prose(text)}</p>"
-        cap = (b.payload.get("caption") or "") if lang == "en" \
-            else (b.payload.get("caption_zh") or b.payload.get("caption") or "")
-        cap_html = f"<caption>{_mathy(str(cap), typeset=typeset)}</caption>" if str(cap).strip() else ""
+        cap = table_caption(b, lang)
+        # ⚠️ **表格的每一格也要在划痕的坐标系里**（2026-09-16 决策㊵ —— 宿主：
+        # 「表格也需要支持选中后出mark-bar」）。表格的裸文本是"表注一行 + 每行以
+        # ` | ` 相连"（`model.table_text`），格子只是这块裸文本里的若干片段，
+        # 所以每格的锚点必须吐**整块**偏移（`prose_html(base=…)`），划痕也按整块坐标进来。
+        # 少了这一步，选中格子里的字时前端量不出坐标 → **浮条根本不出现**
+        # （与 ㊳「选中标题没有 mark-bar」是同一个坑：渲染器少给了一把尺子）。
+        # 起点由 `model.table_layout` 与裸文本**同一份拼接代码**算出，不另数一遍分隔符。
+        _, offsets = table_layout(rows, cap)
+        cap_html = ""
+        if str(cap).strip():
+            cap_html = ("<caption>"
+                        + prose_html(str(cap), typeset=typeset, marks=mine, anchors=anchors)
+                        + "</caption>")
         body = []
         for i, row in enumerate(rows):
             cell = "th" if i == 0 else "td"
-            body.append("<tr>" + "".join(
-                f"<{cell}>{_mathy(str(c), typeset=typeset)}</{cell}>" for c in row) + "</tr>")
+            inner = "".join(
+                f"<{cell}>{prose_html(str(c), typeset=typeset, marks=mine, anchors=anchors, base=offsets[i][j][0])}</{cell}>"
+                for j, c in enumerate(row)
+            )
+            body.append(f"<tr>{inner}</tr>")
         return f'<table class="datatable"{attr}>{cap_html}{"".join(body)}</table>'
     if t == "refs":
         # 同标题：参考文献条目也是可选中的文字（宿主常在上面标"这篇要读"），

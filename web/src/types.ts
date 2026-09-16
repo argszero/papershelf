@@ -25,6 +25,10 @@ export interface Block {
   needs_review: boolean
   /** 免中文块（refs / 纯公式）→ 单栏横跨，不参与左右配对 */
   no_zh: boolean
+  /** **只有表格块**有：中文网格是否真的可用（形状一致 + 不是逐格照抄英文）。
+   *  对照模式据此决定渲不渲右边那张中文表 —— 判据在服务端（`model.table_zh_usable`），
+   *  前端不再自己判一遍（否则是第二份判据，会与渲染漂开）。 */
+  table_zh?: boolean
   /** 服务端渲染好的块 HTML（公式已是 MathML、图片 src 已改写）。
    *  只有 `?html=1`（默认）的响应才有这两个字段——前端不自己排版公式。 */
   en_html?: string

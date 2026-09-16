@@ -198,6 +198,17 @@ def test_every_selectable_block_gets_anchors():
                payload={"latex": "x^2", "number": "3"})
     assert "data-o" not in render_block(eq, lang="en", typeset=True, anchors=True)
 
+    # 表格：**每一格**的字都在坐标系里（决策㊵ —— 宿主：「表格也需要支持选中后出mark-bar」）。
+    # 表格的裸文本是"表注一行 + 每行以 ` | ` 相连"，格子是其中的片段，
+    # 所以锚点吐的是整块偏移（细节与起点算法见 `tests/test_table.py`）。
+    tbl = Block(id="b-0012", type="table", en="Table 2. Results.\nModel | Acc\nCNN | 99.2%",
+                payload={"rows": [["Model", "Acc"], ["CNN", "99.2%"]], "caption": "Table 2. Results."})
+    html = render_block(tbl, lang="en", typeset=True, anchors=True)
+    # 表注两端各一个 + 每格**两端**各一个（格间有 ` | `，所以两个锚点不重合，不去重）
+    assert html.count('data-o="') == 2 + 2 * 4
+    assert 'data-o="18"' in html                # 第一格的起点 = 表注长度 + 换行（" | " 不算字）
+    assert 'data-o="41"' in html                # 最后一个锚点 = 整块裸文本长度
+
 
 def test_heading_mark_offsets_follow_the_bare_text():
     """标题的锚点必须**就是**裸文本的偏移 —— 前端靠它把 DOM 选区换算回坐标。
