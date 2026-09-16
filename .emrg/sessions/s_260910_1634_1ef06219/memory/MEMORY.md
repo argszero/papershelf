@@ -255,4 +255,34 @@ DB 与 `.env` 部署前已备份。生产实测（宿主数据 paper 2）：`pro
 生产验收改用「取 `papershelf_session` cookie → curl PATCH → 查库 + 硬刷 UI」，
 **诚实边界**：那验的是服务端逻辑 + 前端渲染，真实滚轮那一段只在本地验过。
 
-_Last updated: 2026-09-15T23:10:00+08:00_
+_Last updated: 2026-09-16T19:45:00+08:00_
+
+### 最近一轮（2026-09-16 晚）㊳ 标题行也能划重点 / 加笔记（宿主 19:14 截图报告）
+
+宿主：「标题行，选中后没有笔记工具的弹出 mark-bar」。
+- **病灶（两侧各缺一半）**：① 服务端 `pipeline/markup.render_block` 里只有正文段/摘要走
+  `prose()`（吐零宽锚点尺子 `<span class="o" data-o="N">` + `<mark>`），**标题（`h1..h4`）与
+  `refs` 走 `_esc(text)`** 裸文本 → 没有锚点、量不出字符坐标；② 前端 `Reader.tsx` 标题分支
+  直接吐 `<span className="b-en">{b.en}</span>`，**没有 `.b-inline[data-lang]` 那一层** ——
+  而 `marks.ts::selectionSegments` 是从选区文本节点**往上找**那一层拿坐标系与块 id 的。
+  两条叠加 ⇒ `segs` 为空 ⇒ **浮条根本不渲染**（连"划了但没上色"都做不到）。
+- **修法**：标题/`refs` 分支改走 `prose()`；`render_block` 新增 **`wrap`** 参数
+  （`repo.public_block` 对标题传 `wrap=False` —— **`<h1..h4>` 外壳由前端出**，
+  服务端再套一层会得到 `<h2><h2>`，浏览器把内层甩到标题外，中途真踩过）；
+  `BlockBody` 加 `as='div'|'span'`，标题里**只能用 `span`**（`<h2>` 只允许短语内容，`div`/`p` 会被甩出去）。
+- ✅ **`typeset=False` 时 `prose()` 逐字等于 `_esc()`** ⇒ 导出/校验/prompt 三条路径产物**一个字节没变**
+  （有测试钉住）—— 这是敢动标题渲染的底气。
+- **诚实的边界**：公式（MathML 树）与图片仍不可划（本来就没有"裸文本"）；
+  页面**顶部 `doc-head` 那行大字标题**仍不可划（来自元数据、不是正文块，无块坐标）；
+  正文里同一个标题字符串（块 `b-0003`）现在可以划。
+- **验收**：真浏览器**真实鼠标拖选**标题「A review o」→ `mark-bar` 出现（4 支笔 + 加笔记）→
+  写笔记 → 列表出现该条 + DB 里 `highlight(b-0003,en,0-10,green)` / `note(…,hl_id)`；
+  离线回归 **328 passed**；新增护栏 5 条（`test_markup.py` ×2 / `test_highlights.py` ×2 / `test_style_guard.py` ×1）。
+  ⚠️ **两条旧断言写的就是缺陷本身**，按新语义翻转（`test_only_prose_blocks_get_anchors`、
+  `test_offset_anchors_are_in_every_prose_block` —— 后者原文是 `assert "data-o=" not in head["en_html"]`）。
+- **教训**：**"没反应"先问"是不是没给坐标"，别先怀疑交互层** —— 同型第二次
+  （㊱「仅中文正文全空白」也是渲染少给一栏）。判据可以是一条 DOM 量测：
+  逐块数 `inl`/`o` 为 0 的块数 —— 本次在**生产页面**量出**17 个标题全是 `inl=0 o=0`**
+  （说明生产还是旧 bundle `index-BdNiDVTl.js`，本地已 `index-B8ZJwYtc.js`），一眼定位。
+- **本地验收残留已清干净**（`/tmp/pslocal/data/papershelf.db`：删掉本轮 note 4 + highlights 4/5/6，
+  回到原装 **3 笔记 / 3 划痕**；备份 `papershelf.db.bak.20260916-1924`）。

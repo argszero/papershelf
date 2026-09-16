@@ -15,6 +15,8 @@
 
 from __future__ import annotations
 
+import re
+
 from papershelf.pipeline.markup import (
     math_units,
     prose_html,
@@ -161,19 +163,54 @@ def test_text_mark_stops_at_the_formula_boundary():
 
 
 # ── 块级渲染：哪些块可划、哪些不可 ──────────────────────────────────────
-def test_only_prose_blocks_get_anchors():
-    """可划区域只有正文段（含摘要）。标题/参考文献不吐锚点 —— 它们不是可划区域，
-    前端也就不会在里面生成划痕坐标（`refs` 尤其：一条文献切句/划半句都没有意义）。"""
+def test_every_selectable_block_gets_anchors():
+    """**凡是能选中的文字都要有尺子**（2026-09-16 宿主：「标题行，选中后没有笔记工具的弹出 mark-bar」）。
+
+    原先这里钉的是"只有正文段可划"：标题与参考文献条目走 `_esc()`，既没有零宽锚点、
+    也没有 `<mark>`，于是选中标题时 `marks.ts::selectionSegments` 拿不到坐标系，
+    **浮条根本不出现**（用户看到的正是这个）。现在它们与正文段一样走 `prose()`。
+
+    真正"不可划"的只剩**没有可选文字**的块：公式（MathML 排版产物）、图片。
+    """
     head = Block(id="b-0001", type="h2", en="I. Introduction", zh="I. 引言", zh_source="mt")
-    assert "data-o" not in render_block(head, lang="en", typeset=True, anchors=True)
+    en = render_block(head, lang="en", marker=False, typeset=True, anchors=True)
+    assert 'class="o"' in en and 'data-o="0"' in en and en.startswith('<h2 class="sec">')
+    assert 'class="o"' in render_block(head, lang="zh", marker=False, typeset=True, anchors=True)
+
     refs = Block(id="b-0009", type="refs", en="[1] X. Yu, IEEE TAC, 2007.", zh="",
                  zh_source="none")
-    assert "data-o" not in render_block(refs, lang="en", typeset=True, anchors=True)
+    assert "data-o" in render_block(refs, lang="en", marker=False, typeset=True, anchors=True)
 
-    abstract = Block(id="b-0002", type="abstract", en="Abstract body here.", zh="摘要正文。",
-                     zh_source="mt")
-    assert 'class="abstract"' in render_block(abstract, lang="zh", typeset=True, anchors=True)
-    assert "data-o" in render_block(abstract, lang="zh", typeset=True, anchors=True)
+    # 标题上的划痕也要真的渲染出来（否则"能划但看不见"，比不能划更糟）
+    marked = render_block(head, lang="en", marker=False, typeset=True, anchors=True,
+                          marks=[{"id": 4, "lang": "en", "start": 3, "end": 15, "color": "amber"}])
+    assert 'data-h="4"' in marked and "<mark" in marked
+
+    # ⚠️ 导出 / 校验 / prompt 路径（`anchors` 默认 False）**逐字不变**：
+    # 标题仍是 `<h2 class="sec">…</h2>`，一个多余 span 都没有。
+    assert render_block(head, lang="en", marker=False,
+                        typeset=False) == '<h2 class="sec">I. Introduction</h2>'
+    assert render_block(refs, lang="en", marker=False,
+                        typeset=False) == '<p class="ref-item">[1] X. Yu, IEEE TAC, 2007.</p>'
+
+    # 公式块没有可选文字 → 不进这套坐标系（它本来就没有"裸文本"可划）
+    eq = Block(id="b-0011", type="eq", en="", zh="", zh_source="none",
+               payload={"latex": "x^2", "number": "3"})
+    assert "data-o" not in render_block(eq, lang="en", typeset=True, anchors=True)
+
+
+def test_heading_mark_offsets_follow_the_bare_text():
+    """标题的锚点必须**就是**裸文本的偏移 —— 前端靠它把 DOM 选区换算回坐标。
+
+    这条容易在"标题有前导编号/空白"时错位：`prose_html` 是按裸文本切的，
+    所以断言"每个锚点值都落在裸文本上、且最后一个等于长度"。
+    """
+    text = "3.1 Column spilling in two-column layouts"
+    head = Block(id="b-0002", type="h3", en=text, zh="", zh_source="none")
+    html = render_block(head, lang="en", marker=False, typeset=True, anchors=True)
+    positions = [int(m) for m in re.findall(r'data-o="(\d+)"', html)]
+    assert positions[0] == 0 and positions[-1] == len(text)
+    assert all(0 <= p <= len(text) for p in positions)
 
 
 def test_marks_are_filtered_by_language():

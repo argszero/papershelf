@@ -2,7 +2,7 @@
 id: "decisions-master"
 event_at: "2026-09-10T17:52:00+08:00"
 created_at: "2026-09-10T17:52:00+08:00"
-updated_at: "2026-09-10T17:52:00+08:00"
+updated_at: "2026-09-16T19:40:00+08:00"
 type: decision
 scope: project
 status: active
@@ -13,9 +13,9 @@ status: active
 产生方式：宿主与助手**一次一问**逐题澄清（见 `collab-one-question-at-a-time.md`）。
 本文件是**所有设计决策的唯一事实来源**（原先的 11 个单决策碎片文件已 `status: merged` 并入此处）。
 
-> 进度：①–㉚ 全部 ✅（需求澄清完成 + 已落地）→ ㉒ 定的推进方式：**设计文档写到管线即开干**
-> 最近三条：㉘ 元数据抽取/占位标题落列 · ㉙ 删除文献（前端入口 + 磁盘产物）· **㉚ 精读交互**
-> （侧栏去阅读器 + 句子高亮 + 句锚笔记 + 点笔记跳回原句，2026-09-13）
+> 进度：①–㊳ 全部 ✅（需求澄清完成 + 已落地）→ ㉒ 定的推进方式：**设计文档写到管线即开干**
+> 最近三条：㊱ 「待读→在读」自动翻转 + `last_read_at` · ㊲ ①c 分块校对（栏间续段标记）·
+> **㊳ 凡是有可选文字的块都可划**（标题/参考文献补坐标系 —— 选中标题不弹浮条，2026-09-16）
 
 ---
 
@@ -1571,6 +1571,70 @@ DB 与 `.env` 部署前均已备份（`papershelf.db.bak.20260915-220958`、`.en
 
 ---
 
+## ㊳ 凡是有可选文字的块都可划：标题与参考文献条目补上坐标系（2026-09-16 宿主指示）  `e6b1c7a2`
+
+宿主原话（带截图）：**「标题行，选中后没有笔记工具的弹出 mark-bar」**。
+
+### 病灶：渲染器少给了一把尺子，看起来却像前端坏了
+
+划痕的坐标是 `(block_id, lang, start, end)`，靠**服务端吐的零宽锚点**
+`<span class="o" data-o="N">` 当尺子（㉛）。而 `markup.render_block` 里**只有正文段/摘要**走
+`prose()`（吐锚点 + `<mark>`）；标题（`h1..h4`）与 `refs` 条目走的是 `_esc(text)` —— 裸文本。
+
+于是选中标题时：
+
+1. 前端 `marks.ts::selectionSegments` 从选区文本节点**往上找** `.b-inline[data-lang]`
+   拿坐标系与块 id —— 标题在 `Reader.tsx` 里直接吐 `<span className="b-en">{b.en}</span>`，**没有那一层**；
+2. 即便有，块里也**一个 `data-o` 锚点都没有**，量不出字符偏移。
+
+两条叠加 → `segs` 为空 → **浮条根本不渲染**（连"划了但没上色"都做不到）。
+⇒ 这是**两侧各缺一半**的缺陷，只改前端或只改服务端都修不好。
+
+### 修法（两侧缺一不可）
+
+| 侧 | 文件 | 改动 |
+|---|---|---|
+| 服务端 | `pipeline/markup.py::render_block` | 标题分支与 `refs` 分支改走 `prose(text)`（原 `_esc(text)`）；新增 `wrap` 参数，`wrap=False` 只回**内部** HTML |
+| 服务端 | `server/repo.py::public_block` | 标题传 `wrap=not b.type.startswith("h")` —— 外壳由前端出 |
+| 前端 | `web/src/pages/Reader.tsx` | `BlockBody` 加 `as='div'\|'span'`；标题分支改 `<span className="b-en"><BlockBody … as="span"/></span>` |
+
+### 三条硬的实现约束（都是被浏览器/规范逼出来的，不是风格选择）
+
+1. **标题的 `<h1..h4>` 外壳只能有一层**：阅读器自己渲 `<h2 class="doc-h lvlN" data-b=…>`
+   （挂块 id 与字号层级）。服务端若再套 `<h2 class="sec">` 就得到 `<h2><h2>` ——
+   **浏览器会把内层甩到标题外面**（中途真的踩过这一版）。
+2. **标题里一律用 `span`，绝不能用 `div`/`p`**：`<h2>` 只允许**短语内容**，
+   塞块级元素会被浏览器甩出去（`<p>` 同理 —— 没有 HTML 时的纯文本回落也走 fragment 不走 `<p>`）。
+3. **`prose()` 在 `typeset=False` 时逐字等于 `_esc()`**：所以导出 / 校验 / prompt 三条路径
+   （`anchors` 默认 False）的产物**一个字节都没变** —— 这点有测试钉住，是本改动敢动的底气。
+
+### 边界（诚实划清）
+
+- 真正"不可划"的只剩**没有可选文字**的块：公式（渲染成 MathML 树）、图片。它们本来就没有"裸文本"。
+- 页面**顶部那行大字标题**（`doc-head` 里的 `h1.doc-title`）**仍然划不了** —— 它来自元数据、不是正文块、
+  没有块坐标。正文里同一个标题字符串（块 `b-0003`）现在可以划。
+
+### 验收（本地，真浏览器真实鼠标事件）
+
+`index-B8ZJwYtc.js`；reader/2 标题块 `b-0003` 上真实拖选「A review o」→ **`mark-bar` 出现**
+（4 支笔 + 「加笔记」）；点「加笔记」→ 表单写「块 b-0003（原文）· 第 2–8 字」；
+保存后笔记列表出现同一条 + DB 里 `highlight(b-0003,en,0-10,green)` / `note(b-0003,en,1-8,hl_id)`（痕迹已清）。
+离线回归 **328 passed**；新增护栏：`tests/test_markup.py::test_every_selectable_block_gets_anchors`
++ `test_heading_mark_offsets_follow_the_bare_text`、
+`tests/test_highlights.py::test_a_heading_can_carry_a_mark` + `test_heading_html_from_the_api_has_no_outer_tag`、
+`tests/test_style_guard.py::test_headings_keep_the_mark_coordinate_container`。
+⚠️ **两条旧断言按新语义翻转**：`test_markup.py::test_only_prose_blocks_get_anchors`（原断言"标题没有 `data-o`"）
+与 `test_highlights.py::test_offset_anchors_are_in_every_prose_block`（原断言 `"data-o=" not in head["en_html"]`）
+—— **旧断言写的就是缺陷本身**，这轮把它翻正了。
+
+### 教训
+
+**"没反应"要先问"是不是没给坐标"，别先怀疑交互层**：这是第二次同型缺陷
+（㊱ 的「仅中文正文全空白」也是渲染少给一栏）。判据可以是**一条 DOM 量测**：
+逐块数 `querySelectorAll('.b-inline[data-lang]').length` 与 `span.o[data-o]` 的数量 ——
+本次在生产页面上量出**17 个标题全是 `inl=0 o=0`**（生产还是旧 bundle），一眼定位。
+
+---
 
 | # | 项 | 说明 |
 |---|---|---|
@@ -1622,6 +1686,7 @@ DB 与 `.env` 部署前均已备份（`papershelf.db.bak.20260915-220958`、`.en
 | ㉜ | `pipeline/parse.py`（`_reading_order` 分区 + `_gutter` 覆盖度剖面；`PARSE_VERSION` → **5**）、`tests/test_parse_order.py` | 混合版式（通栏页眉 + 双栏正文）不再被一刀切成单栏 → 两栏逐行交错的"读得通但读不通"消失 |
 | ㉝ | `pipeline/proofread.py`（agent + 工具层 + 护栏）、`server/converter.py`（①c 接线 + `ok_pages` 续跑 + 计数累加）、`server/config.py`（`PAPERSHELF_PROOFREAD*`）、`tests/test_proofread.py` | 原文校对 = LLM agent（读页图 + 读/改抽取结果）；页级续跑；成本由 `PROOFREAD_THINKING` + seed 可疑清单 + 每页两轮护栏三条压住 |
 | ㊲ | `pipeline/parse.py`（`_column_spill_seams` + `_looks_like_continuation` + `_page_gutter` 共用尺子；`PARSE_VERSION` → **7**）、`pipeline/proofread.py`（`_block_tags` 单一来源 / `read_blocks.seam` / `check_artifacts.seams` / `_suspect_pages` 含续段 / 提示词「块结构」/ `merge_block` 软提醒）、`tests/test_block_seams.py`（22 项） | **分块也要校对**（宿主：「尽量不要把一句话拆分到两个段里」）：栏间续段只**标记**、由 agent 看页图判定后 `merge_block`（方案 B）；判据 = 几何 + 文字两条同时成立 |
+| ㊳ | `pipeline/markup.py`（标题 + `refs` 分支改走 `prose()`；新增 `wrap` 参数）、`server/repo.py::public_block`（标题 `wrap=False`，外壳由前端出）、`web/src/pages/Reader.tsx`（`BlockBody` 加 `as='span'`，标题带 `.b-inline[data-lang]`）、`tests/test_markup.py` + `tests/test_highlights.py` + `tests/test_style_guard.py` | **凡是有可选文字的块都可划**（宿主：「标题行，选中后没有笔记工具的弹出 mark-bar」）：标题/`refs` 原先走 `_esc()` → 没锚点没 `<mark>` + 前端没 `.b-inline` ⇒ 浮条根本不出现；两侧各修一半。约束：`<h1..h4>` 外壳只一层（`<h2><h2>` 会被浏览器甩出去）、标题内只能用 `span`；`typeset=False` 时产物逐字不变 |
 | ㉞ | `server/routers/papers.py`（`POST /papers/{id}/reextract`，`/convert` 也归零计数）、`server/converter.py`（`claim_paper` 认领即计数、`_set_state` 不再碰 `conv_attempts`）、`web/src/pages/Library.tsx` + `api.ts` + `styles.css`（`.t-re`）、`tests/test_reextract.py`（8 项） | **解析缓存必须有单篇失效出口**（宿主：「没有失效机制是不合理的」）：文献库「删除」旁边加「重新提取」→ 删这一篇的 `doc_cache` 行 + 作废它的笔记/划痕 + `conv_attempts` 归零 + 重新排队；**语义 = 全部作废、从零重跑**（宿主选 A）。顺带修掉**护栏空转**：`conv_attempts` 原本恒为 0 |
 
 ### 本轮实现中新定的小决策（未改 ①–㉓）

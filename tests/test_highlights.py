@@ -88,13 +88,29 @@ def test_marks_render_on_the_right_characters(client, owned):
     assert f'class="o" data-o="{len(EN)}"' in para["en_html"]
 
 
-def test_offset_anchors_are_in_every_prose_block(client, owned):
-    """没有划痕的正文块**也要**有锚点 —— 否则"第一笔划在哪里"这件事无从下手。"""
+def test_offset_anchors_are_in_every_selectable_block(client, owned):
+    """没有划痕的可选中块**也要**有锚点 —— 否则"第一笔划在哪里"这件事无从下手。
+
+    ⚠️ 2026-09-16 起**标题也算可划区域**（宿主：「标题行，选中后没有笔记工具的弹出 mark-bar」）：
+    标题走 `prose()`，于是它和正文段一样有尺子。在此之前这条断言写的是
+    「`data-o` 不在标题里」，那正是缺陷本身。
+    """
     data = client.get(f"/api/papers/{owned['pid']}/doc").json()
     para = next(b for b in data["blocks"] if b["id"] == "b-0002")
     assert 'data-o="0"' in para["en_html"] and "<mark" not in para["en_html"]
     head = next(b for b in data["blocks"] if b["id"] == "b-0001")
-    assert "data-o=" not in head["en_html"]          # 标题不是可划区域
+    assert 'data-o="0"' in head["en_html"] and "<mark" not in head["en_html"]
+    assert head["zh_html"].count('class="o"') >= 2
+
+
+def test_a_heading_can_carry_a_mark(client, owned):
+    """标题上划的一道，必须走完整条链路：建 → 渲染出 `<mark>` → 列表里读得回来。"""
+    pid = owned["pid"]
+    hl = _mk(client, pid, block_id="b-0001", lang="zh", start=0, end=1)   # 「I. 引言」的前 1 字
+    head = next(b for b in client.get(f"/api/papers/{pid}/doc").json()["blocks"]
+                if b["id"] == "b-0001")
+    assert f'data-h="{hl["id"]}"' in head["zh_html"] and "<mark" in head["zh_html"]
+    assert hl["block_id"] == "b-0001" and (hl["start"], hl["end"]) == (0, 1)
 
 
 # （公式原子性 / 颜色回落的**渲染层**测试在 `tests/test_markup.py`，
@@ -393,3 +409,18 @@ def _mk_plan(conn) -> int:
                  " ((SELECT id FROM users LIMIT 1),'p',datetime('now'))")
     conn.commit()
     return conn.execute("SELECT id FROM plans ORDER BY id DESC LIMIT 1").fetchone()["id"]
+
+
+def test_heading_html_from_the_api_has_no_outer_tag(client, owned):
+    """阅读器拿到的标题 HTML **不带 `<h1..h4>` 外壳**（它自己渲 `<h2 class="doc-h">`）。
+
+    否则 `<h2 class="doc-h"><h2 class="sec">…` 会被浏览器把内层甩到外面 ——
+    标题会跑到正文区之外（真浏览器里一眼可见，接口测试里只能钉住这份契约）。
+    正文段的 `<p>` 外壳照旧保留（前端把它塞进 `display:contents` 的壳里，是合法的）。
+    """
+    data = client.get(f"/api/papers/{owned['pid']}/doc").json()
+    head = next(b for b in data["blocks"] if b["id"] == "b-0001")
+    assert head["en_html"].startswith('<span class="o"') and "<h2" not in head["en_html"]
+    assert "Introduction" in head["en_html"]
+    para = next(b for b in data["blocks"] if b["id"] == "b-0002")
+    assert para["en_html"].startswith("<p>")

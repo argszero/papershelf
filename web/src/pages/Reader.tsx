@@ -59,12 +59,18 @@ function readPref<T extends string | number>(key: string, fallback: T): T {
  * `data-lang` 是**划痕的坐标系标识**（㉛）：同一个块的中英两栏各是一份独立的
  * 裸文本偏移空间，`marks.ts` 靠它区分"划的是哪一侧"。
  */
-function BlockBody({ block, lang }: { block: Block; lang: 'en' | 'zh' }) {
+function BlockBody({ block, lang, as = 'div' }: {
+  block: Block; lang: 'en' | 'zh'; as?: 'div' | 'span'
+}) {
   const html = lang === 'en' ? block.en_html : block.zh_html
-  if (!html) return <p>{lang === 'en' ? block.en : (block.zh || block.en)}</p>
-  return (
-    <div className="b-inline" data-lang={lang} dangerouslySetInnerHTML={{ __html: html }} />
-  )
+  const text = lang === 'en' ? block.en : (block.zh || block.en)
+  // 没有服务端 HTML 时退化为纯文本 —— ⚠️ 标题里**绝不能**吐 `<p>`：
+  // `<h2><p>…</p></h2>` 是非法的，浏览器会把 `<p>` 甩到 `<h2>` 之前（整行标题跑到上面去）。
+  if (!html) return (as === 'span' ? <>{text}</> : <p>{text}</p>)
+  if (as === 'span') {
+    return <span className="b-inline" data-lang={lang} dangerouslySetInnerHTML={{ __html: html }} />
+  }
+  return <div className="b-inline" data-lang={lang} dangerouslySetInnerHTML={{ __html: html }} />
 }
 
 /** 正文段的块类型 —— 与**服务端可划区域**必须一致（`markup.render_block`：
@@ -114,10 +120,20 @@ export function DocBlock({ b, mode, assets, selected, flash, onPick }: {
     const lvl = Math.min(3, Math.max(1, b.level || 2))
     return (
       <h2 className={`doc-h lvl${lvl}`} data-b={b.id}>
-        {mode !== 'zh' && <span className="b-en">{b.en}</span>}
+        {/* ⚠️ 标题的每一栏也必须包一层 `.b-inline[data-lang]`（2026-09-16 宿主：
+            「标题行，选中后没有笔记工具的弹出 mark-bar」）。`marks.ts::selectionSegments`
+            是从选区的文本节点往上找 `.b-inline[data-lang]` 拿坐标系与块 id 的 ——
+            标题原先直接吐 `<span className="b-en">{b.en}</span>` 纯文本，于是
+            `containerOf()` 返回 null → `segs` 为空 → 浮条根本不出现（连"划了但没上色"
+            都做不到）。服务端同步改成了 `prose()`，两侧缺一不可：这里给坐标系，
+            服务端给尺子（零宽锚点）与 `<mark>`。
+            用 `span` 而不是 `div`：`<h2>` 里只允许短语内容，塞 `div` 会被浏览器甩出去。 */}
+        {mode !== 'zh' && <span className="b-en"><BlockBody block={b} lang="en" as="span" /></span>}
         {/* 仅中文模式即使标题没译文也要渲染（回落原文）—— 否则整个标题空白。
             对照模式仍然只在有译文时给右栏，免得同一行英文出现两次。 */}
-        {mode !== 'en' && (!wide || mode === 'zh') && <span className="b-zh">{b.zh || b.en}</span>}
+        {mode !== 'en' && (!wide || mode === 'zh') && (
+          <span className="b-zh"><BlockBody block={b} lang="zh" as="span" /></span>
+        )}
       </h2>
     )
   }

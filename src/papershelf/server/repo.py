@@ -146,6 +146,10 @@ def public_block(b: Block, *, asset_prefix: str = "",
         b = dataclasses.replace(
             b, payload={**b.payload, "src": f"{asset_prefix.rstrip('/')}/{str(src).split('/')[-1]}"}
         )
+    # ⚠️ 标题只给**内部** HTML（`wrap=False`）：阅读器自己渲 `<h2 class="doc-h lvlN" data-b=…>`，
+    # 再套一层服务端的 `<h2 class="sec">` 就会得到 `<h2><h2>`（浏览器会把内层甩到外面）。
+    # 见 `markup.render_block` 的 `wrap` 参数与 `web/src/pages/Reader.tsx` 的标题分支。
+    wrap = not b.type.startswith("h")
     return {
         "id": b.id, "type": b.type, "level": b.level, "section": b.section,
         "en": b.en, "zh": b.zh, "zh_source": b.zh_source,
@@ -153,9 +157,9 @@ def public_block(b: Block, *, asset_prefix: str = "",
         "needs_review": bool(b.payload.get("needs_review")),
         "no_zh": b.type in NO_ZH_TYPES,
         "en_html": render_block(b, lang="en", marker=False, typeset=True, marks=marks,
-                                anchors=True),
+                                anchors=True, wrap=wrap),
         "zh_html": render_block(b, lang="zh", marker=False, typeset=True, marks=marks,
-                                anchors=True),
+                                anchors=True, wrap=wrap),
     }
 
 

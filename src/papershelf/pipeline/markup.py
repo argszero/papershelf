@@ -240,8 +240,13 @@ def sentence_offsets(text: str, lang: str) -> list[tuple[int, int]]:
 
 
 def render_block(b: Block, *, lang: str, marker: bool = True, typeset: bool = False,
-                 marks: list[dict] | None = None, anchors: bool = False) -> str:
+                 marks: list[dict] | None = None, anchors: bool = False,
+                 wrap: bool = True) -> str:
     """渲染单个块。lang='en' 用 en 字段，'zh' 用 zh 字段。
+
+    `wrap=False` 只对标题有意义：只回**内部** HTML，不带 `<h1..h4>` 外壳。
+    阅读器要自己渲 `<h2 class="doc-h lvlN" data-b=…>`（挂块 id 与字号层级），
+    若再塞一份服务端的 `<h2>`，CSS 之外还会得到 `<h2><h2>` —— 浏览器会把内层甩出去。
 
     免中文块（参考文献/公式，见 `validate.NO_ZH_TYPES`）在中文视图里**回落英文原文**，
     并标 `data-nt="1"` —— 这样校验器不会把它们误判为「漏译」。
@@ -272,7 +277,13 @@ def render_block(b: Block, *, lang: str, marker: bool = True, typeset: bool = Fa
     if t in ("h1", "h2", "h3", "h4"):
         tag = {"h1": "h1", "h2": "h2", "h3": "h3", "h4": "h4"}[t]
         cls = ' class="sec"' if t == "h2" else (' class="sub"' if t == "h3" else "")
-        return f"<{tag}{cls}{attr}>{_esc(text)}</{tag}>"
+        # ⚠️ 标题也是**可选中的文字**，所以它同样必须走 `prose()`（2026-09-16 宿主：
+        # 「标题行，选中后没有笔记工具的弹出 mark-bar」）。原先这里是 `_esc(text)`，
+        # 于是标题既没有零宽锚点（前端量不出字符坐标）、也没有 `<mark>`（划痕渲染不出来）
+        # —— 表现是"选中标题什么都不会发生"，看起来像前端坏了，其实是**渲染器少给了一把尺子**。
+        # `typeset=False` 时 `prose()` 就是 `_esc()`，导出/校验产物逐字不变。
+        body = prose(text)
+        return f"<{tag}{cls}{attr}>{body}</{tag}>" if wrap else body
     if t == "abstract":
         return f'<div class="abstract"{attr}>{prose(text)}</div>'
     if t == "figure":
@@ -292,7 +303,9 @@ def render_block(b: Block, *, lang: str, marker: bool = True, typeset: bool = Fa
             body.append("<tr>" + "".join(f"<{cell}>{_esc(c)}</{cell}>" for c in row) + "</tr>")
         return f'<table class="datatable"{attr}>{cap_html}{"".join(body)}</table>'
     if t == "refs":
-        return f'<p class="ref-item"{attr}>{_esc(text)}</p>'
+        # 同标题：参考文献条目也是可选中的文字（宿主常在上面标"这篇要读"），
+        # 走 `prose()` 才有锚点与 `<mark>`；`typeset=False` 时输出与 `_esc()` 逐字相同。
+        return f'<p class="ref-item"{attr}>{prose(text)}</p>'
     if t == "eq":
         latex = b.payload.get("latex", "") or text
         # eq 块的 payload 是**裸 LaTeX**（无定界符）→ 必须走 render_math_block

@@ -412,3 +412,35 @@ def test_zh_only_mode_always_renders_the_chinese_column() -> None:
     # 标题同理 —— 两个回落条件都必须保留 `mode === 'zh'` 这条出口。
     assert "!wide || mode === 'zh'" in tsx, "标题在仅中文 + 无译文时会渲染成空白"
     assert "meta.title_zh || mode === 'zh'" in tsx, "文档标题在仅中文 + 无译文时会渲染成空白"
+
+
+def test_headings_keep_the_mark_coordinate_container() -> None:
+    """标题必须**自己**带 `.b-inline[data-lang]`，否则选中标题不弹浮条（2026-09-16 宿主实测）。
+
+    病灶是**两半**，缺任何一半都表现为"选中标题什么都不会发生"：
+
+    - 服务端（`pipeline/markup.py::render_block`）：标题原走 `_esc(text)`，
+      既不吐零宽锚点也没有 `<mark>` → 前端量不出字符坐标；
+    - 前端（`Reader.tsx` 的 `b.type.startsWith('h')` 分支）：原先直接吐
+      `<span className="b-en">{b.en}</span>` 纯文本 —— `selectionSegments()` 是
+      从选区文本节点**往上找** `.b-inline[data-lang]` 才拿到坐标系与块 id 的，
+      找不到就整条 `segs` 为空，浮条不出现。
+
+    这条护栏只钉前端那一半（服务端那一半由 `tests/test_markup.py` 钉）；
+    两处必须同时成立，所以这里也顺带断言标题用的是 `prose()` 而不是 `_esc()`。
+    """
+    tsx = (WEB / "pages" / "Reader.tsx").read_text(encoding="utf-8")
+    assert 'b.type.startsWith(\'h\')' in tsx, "标题分支的判据变了，请复核本护栏"
+    head_branch = tsx[tsx.index("b.type.startsWith('h')"):]
+    head_branch = head_branch[:head_branch.index("b.type === 'figure'")]
+    assert 'as="span"' in head_branch, (
+        "标题又退回渲染纯文本了 —— 它必须包一层 `.b-inline[data-lang]`，"
+        "否则 marks.ts 找不到坐标系，选中标题不弹 mark-bar")
+    assert 'className="b-en"' in head_branch and 'className="b-zh"' in head_branch, (
+        "标题的英文/中文两栏结构不能少（仅中文模式靠 b-zh 兜底）")
+    # `<h2>` 里只允许短语内容：绝不能塞 `<div>`（浏览器会把 div 甩到标题外面）
+    assert '<div' not in head_branch, "标题分支里出现了 div —— `<h2><div>` 会被浏览器拆开"
+
+    markup = (ROOT / "src" / "papershelf" / "pipeline" / "markup.py").read_text(encoding="utf-8")
+    assert '"h1", "h2", "h3", "h4"' in markup and "prose(text)" in markup, (
+        "服务端标题不再走 prose() —— 没有锚点/没有 <mark>，只改前端是修不好的")
