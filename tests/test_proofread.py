@@ -801,6 +801,128 @@ def test_set_table_rejects_cross_page_and_consumes_caption(tmp_path):
     assert doc.blocks[1].id == "b-0005"
 
 
+def test_set_table_accepts_a_cell_whose_text_spans_two_blocks(tmp_path):
+    """一格的文字**横跨两块**是常态（抽取按阅读顺序切块）—— 护栏①③必须看**拼起来的文本**。
+
+    2026-09-16 在生产真跑里复现出来的事故：那次「表格重建 1 张」（37 页 6 张表只落 1 张）
+    就是被这条打掉的 —— `b-0193` 结尾是 "…by integrating meas-"、`b-0194` 开头是
+    "ured and predicted data…"，合起来才是那一格（agent 写的就是合起来的正确文字）。
+    护栏③原先**逐块**挖已装格的字：这串字在任何**单独**一块里都不完整 ⇒ 一个字也挖不掉
+    ⇒ 整块文本被判成"没进格子的正文" ⇒ **正确**的重建被拒收。agent 连试三次、全都撞同一堵墙，
+    最后放弃 —— 而它在页笔记里还写着"已用 set_table 重建"（`表格重建 1 张` 才是真相）。
+    """
+    pdf = tmp_path / "t.pdf"
+    _tiny_pdf(pdf)
+    doc = Doc()
+    doc.blocks.append(Block(id="b-0001", type="p", en="DL Defect type Purpose",
+                            payload={"page": 1}))
+    doc.blocks.append(Block(id="b-0002", type="p",
+                            en="CNN Porosity Predicting porosity by integrating meas-",
+                            payload={"page": 1}))
+    doc.blocks.append(Block(id="b-0003", type="p",
+                            en="ured and predicted data from the melt pool",
+                            payload={"page": 1}))
+    t = ProofreadTools(doc, pdf)
+    out = t.call("set_table", {
+        "ids": ["b-0001", "b-0002", "b-0003"],
+        "rows": [["DL", "Defect type", "Purpose"],
+                 ["CNN", "Porosity",
+                  "Predicting porosity by integrating measured and predicted data "
+                  "from the melt pool"]],
+    })
+    assert not out.error, out.text
+    assert t.stats.tabled == 1 and doc.blocks[0].type == "table"
+
+
+def test_set_table_rejection_points_at_the_block_that_was_left_out(tmp_path):
+    """失手最多的一种是**漏列 ids**（那一格的另一半在别的块里），拒绝信息必须**指得出块号**。
+
+    只说"找不到"，agent 只能瞎猜或整张表放弃；说出块号它一次就能补上
+    （2026-09-16 实测：agent 收到含糊的拒绝后原地打转，一轮就烧掉 39k tokens）。
+    """
+    pdf = tmp_path / "t.pdf"
+    _tiny_pdf(pdf)
+    doc = Doc()
+    doc.blocks.append(Block(id="b-0001", type="p", en="DL Defect type Purpose",
+                            payload={"page": 1}))
+    doc.blocks.append(Block(id="b-0002", type="p",
+                            en="CNN Porosity Predicting porosity by integrating meas-",
+                            payload={"page": 1}))
+    doc.blocks.append(Block(id="b-0003", type="p",
+                            en="ured and predicted data from the melt pool",
+                            payload={"page": 1}))
+    t = ProofreadTools(doc, pdf)
+    out = t.call("set_table", {                       # b-0003 漏了 → 那一格拼不出来
+        "ids": ["b-0001", "b-0002"],
+        "rows": [["DL", "Defect type", "Purpose"],
+                 ["CNN", "Porosity",
+                  "Predicting porosity by integrating measured and predicted data "
+                  "from the melt pool"]],
+    })
+    assert out.error and "找不到" in out.text
+    assert "b-0003" in out.text and "没列进 ids" in out.text   # 指得出是那一块漏了
+    assert t.stats.rejected == 1 and len(doc.blocks) == 3   # 原样不动
+
+
+def test_set_table_matches_through_extraction_whitespace(tmp_path):
+    """`[ 115 ]` / `[115]`、`K -means` / `K-means`、`multi- branch` / `multi-branch` 是**同一串字**。
+
+    抽取给引用编号加空格是常态（生产实测：agent 写对了论文原样的 `[115]`，
+    却被判"找不到" → 它只能去 `edit_block` 改**本来是对的**源块，或干脆放弃整张表）。
+    护栏要防的是**编造内容**（丢字符、换字），不是空白与连字符怎么摆。
+    """
+    pdf = tmp_path / "t.pdf"
+    _tiny_pdf(pdf)
+    doc = Doc()
+    doc.blocks.append(Block(id="b-0001", type="p", en="DL Defect type Ref",
+                            payload={"page": 1}))
+    doc.blocks.append(Block(id="b-0002", type="p", en="CNN Porosity K -means [ 115 ]",
+                            payload={"page": 1}))
+    t = ProofreadTools(doc, pdf)
+    out = t.call("set_table", {
+        "ids": ["b-0001", "b-0002"],
+        "rows": [["DL", "Defect type", "Ref"],
+                 ["CNN", "Porosity", "K-means [115]"]],
+    })
+    assert not out.error, out.text
+    assert t.stats.tabled == 1
+    # 但**换字/丢字**照样拒收（`Naive Bayes (BM)` 不是空白问题）——
+    # 判据是"这串字在源文本里连续出现过"，它只防**编造内容**，不负责"格子填全了没有"
+    # （填全由护栏③「不吃正文」管）。
+    t2 = ProofreadTools(_table_doc(), pdf)
+    bad = t2.call("set_table", {
+        "ids": ["b-0001", "b-0002", "b-0003"],
+        "rows": [["ML category", "ML model"],
+                 ["Supervised", "Naive Bayes (BM)"],     # BN → BM
+                 ["Unsupervised", "K-means"]],
+    })
+    assert bad.error and "找不到" in bad.text
+
+
+def test_table_residue_still_catches_prose_left_out_of_the_cells(tmp_path):
+    """护栏③不能被上面那条修松：**真的**有成句正文没进格子时，照样拒收（且点名块号）。"""
+    pdf = tmp_path / "t.pdf"
+    _tiny_pdf(pdf)
+    doc = Doc()
+    doc.blocks.append(Block(id="b-0001", type="p", en="ML category ML model",
+                            payload={"page": 1}))
+    doc.blocks.append(Block(id="b-0002", type="p", en="Supervised Naive Bayes (BN)",
+                            payload={"page": 1}))
+    doc.blocks.append(Block(id="b-0003", type="p",
+                            en="Unsupervised K-means Consider the general problem of "
+                               "classifying documents into categories.",
+                            payload={"page": 1}))
+    t = ProofreadTools(doc, pdf)
+    out = t.call("set_table", {
+        "ids": ["b-0001", "b-0002", "b-0003"],
+        "rows": [["ML category", "ML model"],
+                 ["Supervised", "Naive Bayes (BN)"],
+                 ["Unsupervised", "K-means"]],
+    })
+    assert out.error and "没进格子" in out.text
+    assert "b-0003" in out.text                       # 哪一块没消化掉，指得出来
+
+
 def _band_pdf(path, *, cols=3, rows=4, band=(300, 372), head_rules=True):
     """造一页"表格状"的 PDF：横线 + **同一行上并排的几段文字**。
 

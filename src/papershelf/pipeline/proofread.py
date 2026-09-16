@@ -281,6 +281,11 @@ SYSTEM_PROMPT = """你是学术论文的**原文抽取校对 agent**。
   - `rows` = 网格，**第一行是表头**，一格一段文字；**格子里的字必须逐字来自这些块**
     （程序逐格核对，找不到就整份拒收 —— 不许你凭图默写、不许翻译、不许补全）；
   - 单元格里被换行切开的两截要接回同一格（`Convolutional Neural` + `Networks` → 一格）；
+  - ⚠️ **一个格子可以横跨好几块**：抽取是按阅读顺序切块的，表格的一行常被切成几段
+    （本块结尾 "…by integrating meas-" + 下一块开头 "ured and predicted data…" 是**同一格**）。
+    程序是按你列进 `ids` 的块**拼起来**的一段文本逐格核对的 —— 跨块拼接没问题，
+    行末断词的连字符也会自动接回，**别因为"这一格在两块里"就放弃这张表**；
+    反过来，若某格的另一半在**没列进 ids** 的块里，工具会直接把块号告诉你，补上即可。
   - 表注（`Table 1. …`）单独放进 `caption` 参数，不要塞进格子当第一行。
   ⚠️ **反面例子（不要动）**：双栏排版的正文**不是**表格 —— 它读起来是通顺的句子、
   没有横线、没有列对齐。把整页正文当成一张 62×7 的大表是最典型的误判
@@ -876,22 +881,41 @@ class ProofreadTools:
 
         src = "\n".join(b.en for b in blocks)
         placed = [c for row in rows for c in row] + ([caption] if caption else [])
-        # ① 逐字来源：每个格子的文字必须能在被消费的源块里找到
+        # ① 逐字来源：每个格子的文字必须能在**被消费的块拼起来**的文本里找到
         missing = [c for c in [x for row in rows for x in row if x.strip()]
                    if not _table_placeable(src, c)]
         if missing:
             self.stats.rejected += 1
+            # ⚠️ 拒绝信息必须**指得出地方**（2026-09-16 实测）：最常见的失手不是"看图默写"，
+            # 而是**漏列了 ids** —— 那一格的另一半在别的块里（`ids` 少了一个 b-0211 之类的）。
+            # 只说"找不到"，agent 就只能瞎猜或放弃；指出块号它一次就能补上。
+            # 判据 = 「把这个块也拼进来，这一格就凑齐了」（**不是**"这个块里有这串字"：
+            # 一格横跨两块时，任何**单块**里都找不到完整的它）。
+            hints = []
+            for m in missing[:3]:
+                fixers = [b.id for b in self._page_blocks(next(iter(pages)))
+                          if b not in blocks and _table_placeable(src + "\n" + b.en, m)]
+                if fixers:
+                    hints.append(f"「{m[:36]}」再补 {'/'.join(fixers[:3])} 就凑齐了")
+            tip = (" —— 这些字**没列进 ids**：" + "；".join(hints) + "。"
+                   "把它们也列进 ids 就行（别照抄，先 read_blocks 对一遍）") if hints else (
+                   "。请逐字复制块里的原文；若缺字，先用 edit_block 把该块改对")
             return ToolOut("建表被拒绝：这些格子的文字在源块里**找不到**"
-                           f"（不能凭记忆/看图默写）：{[m[:40] for m in missing[:5]]}"
-                           f"。请逐字复制块里的原文；若缺字，先用 edit_block 把该块改对。", error=True)
-        # ③ 不吃正文：源块里不许有成句的文字没被装进格子
-        for b in blocks:
-            left = _table_residue(b.en, placed)
-            if left:
-                self.stats.rejected += 1
-                return ToolOut(f"建表被拒绝：{b.id} 里还有没进格子的文字：{left[:8]}。"
-                               f"要么把它们也填进对应格子，要么**别把它列进 ids**"
-                               f"（表注用 caption 传，表外脚注留在原块里别动）。", error=True)
+                           f"（不能凭记忆/看图默写）：{[m[:40] for m in missing[:5]]}{tip}",
+                           error=True)
+        # ③ 不吃正文：拼起来的源文本里不许有成句的文字没被装进格子
+        left = _table_residue(src, placed)
+        if left:
+            self.stats.rejected += 1
+            where = _blocks_holding(blocks, left)
+            return ToolOut(
+                f"建表被拒绝：这些块拼起来还有没进格子的文字：{left[:8]}"
+                + (f"（出现在 {'、'.join(where)}）" if where else "")
+                + "。要么把它们也填进对应格子 —— ⚠️ **一个格子的字可以横跨好几块**"
+                  "（本块末尾 + 下一块开头常常是同一格，行末断词的连字符会自动接回，"
+                  "程序按这些块**拼起来**的文本核对）；"
+                  "要么**别把它们列进 ids**（表注用 caption 传，表外脚注留在原块里别动）。",
+                error=True)
 
         first = blocks[0]
         pos = self.doc.blocks.index(first)
@@ -1195,6 +1219,13 @@ class Proofreader:
                     images.extend(out.images)
                 if name == "mark_page_done" and not out.error:
                     page_done = True
+                # ⚠️ **护栏拒绝要进日志**（`error=True` 走 INFO，附工具参数）：
+                # 只数个数（"护栏拒绝 5"）在事后是**不可诊断**的 —— 生产实测就卡在这里
+                # （2026-09-16：真跑一遍只重建出 1 张表，想知道另外几张为什么没成，
+                # 日志里只有计数、没有原因，只能重跑一遍）。可判定的坏结果必须留下判据。
+                if out.error:
+                    log.info("①c 工具 %s(%s) 被拒绝：%s", name,
+                             json.dumps(args, ensure_ascii=False)[:400], out.text[:300])
                 log.debug("①c 工具 %s(%s) → %s", name, json.dumps(args, ensure_ascii=False)[:120],
                           out.text[:120])
                 messages.append({"role": "tool", "tool_call_id": tc.get("id") or name,
@@ -1334,27 +1365,90 @@ def _flat(text: str) -> str:
     return re.sub(r"(?<=[A-Za-z])-\s+(?=[a-z])", "", t).strip()
 
 
+# 各种连字符（ASCII 之外的破折号常出现在页码区间、型号 "5–8-1" 里）
+_HYPHENS = "\u2010\u2011\u2012\u2013\u2014\u2212"
+
+
+def _drop_char(ch: str) -> bool:
+    """机器核对时**不算内容**的字符：空白与连字符。"""
+    return ch.isspace() or ch == "-" or ch in _HYPHENS
+
+
+def _tight(text: str) -> str:
+    """最松的一层归一化：压掉**全部空白**与**全部连字符**（在 `_flat` 之后再压一遍）。
+
+    为什么不放宽"字"、只放宽这两样（2026-09-16 生产实测补的）：
+    空白与连字符在 PDF 抽取里最不可靠 —— `[ 115 ]` / `[115]`、`K -means` / `K-means`、
+    `multi- branch` / `multi-branch`、`meas- ured` / `measured` 都是**同一串字**。
+    护栏的目的是"不许编造内容"；**丢一个字符**才是编造，那是另一条判据（不放宽）。
+    实测代价：不肯放宽时，agent 写对了 `[115]`（论文原样）却被判"找不到"，
+    它只能去 `edit_block` 改源块 —— 而**源块是对的、论文也这么印**，改它反而错。
+    """
+    return "".join(ch for ch in _flat(text) if not _drop_char(ch))
+
+
+def _tight_index(text: str) -> tuple[str, list[int]]:
+    """`_tight(text)` + 每个字符在 `text` 里的下标（把命中位置映射回原文用）。"""
+    chars, idx = [], []
+    for i, ch in enumerate(text):
+        if not _drop_char(ch):
+            chars.append(ch)
+            idx.append(i)
+    return "".join(chars), idx
+
+
 def _table_placeable(src: str, needle: str) -> bool:
-    """`needle`（一格文字）是否**逐字**来自 `src`（两种归一化都试）。"""
-    n = _flat(needle)
+    """`needle`（一格文字）是否来自 `src` —— 按**空白/连字符不敏感**的方式比。"""
+    n = _tight(needle)
     if not n:
         return True                                   # 空格子无需校验（允许空尾格）
-    return n in _flat(src) or n in _flat(src).replace("- ", "")
+    return n in _tight(src)
 
 
-def _table_residue(block_text: str, placed: list[str]) -> list[str]:
-    """从源块文本里挖掉"已装进格子的字"后，剩下的**成句**片段。
+def _table_residue(src: str, placed: list[str]) -> list[str]:
+    """从**被消费块拼起来的文本**里挖掉"已装进格子的字"后，剩下的**成句**片段。
 
     判据故意宽松（≥4 个实词才算"一段没被消费的话"）：表头的单位、脚注的星号、
     表号 "Table 4." 这类残渣本来就该剩下来，为它们拒收会让 agent 无路可走。
+
+    ⚠️ **必须在"拼起来的文本"上算，不能逐块算**（2026-09-16 实测修正）。
+    一个格子的字**经常横跨好几块** —— 抽取按阅读顺序切块，表格一行会被切成几段：
+    `b-0193` 结尾是 "…by integrating meas-"，`b-0194` 开头是 "ured and predicted data…"，
+    合起来才是那一格的 "…integrating measured and predicted data…"。
+    逐块挖时，这串字在**任何单独一块里都不完整** → 一个也挖不掉 → 整块文本被判成
+    "没进格子的正文" → **正确**的重建被拒收（生产实测：agent 连试 3 次全被拒、
+    最后放弃，见「表格重建 1 张」那次）。拼起来算则与 `_table_placeable` 看的是
+    **同一个文本面**，两条护栏不再各说各话。
+
+    挖除按 `_tight` 的松比对做（空白/连字符不敏感），**但残留检测仍在带空白的 `_flat`
+    文本上做** —— 数实词要靠空白划词界，全压掉就一个词都数不出来了。
+    位置映射由 `_tight_index` 提供：在压缩串上命中的一段，映射回原文把那段抹掉。
     """
-    t = _flat(block_text)
+    t = _flat(src)
+    tight, idx = _tight_index(t)
+    cut = [False] * len(t)
     for p in sorted(placed, key=len, reverse=True):
-        p = _flat(p)
-        if len(p) >= 2:
-            t = t.replace(p, " ")
-    words = [w for w in re.findall(r"[A-Za-z][A-Za-z's-]{3,}", t) if w.lower() not in _STOPWORDS]
+        tp = _tight(p)
+        if len(tp) < 2:
+            continue
+        start = 0
+        while (k := tight.find(tp, start)) >= 0:
+            for j in range(k, k + len(tp)):
+                cut[idx[j]] = True
+            start = k + len(tp)
+    left = "".join(" " if cut[i] else ch for i, ch in enumerate(t))
+    words = [w for w in re.findall(r"[A-Za-z][A-Za-z's-]{3,}", left) if w.lower() not in _STOPWORDS]
     return words if len(words) >= _TABLE_MIN_RESIDUE_WORDS else []
+
+
+def _blocks_holding(blocks: list[Block], words: list[str]) -> list[str]:
+    """哪些块里还能看到这些残留词 —— 只为了让拒绝信息**指得出地方**（不是判据）。"""
+    out = []
+    for b in blocks:
+        t = _flat(b.en).lower()
+        if any(w.lower() in t for w in words[:8]):
+            out.append(b.id)
+    return out
 
 
 _STOPWORDS = {"the", "and", "for", "with", "that", "this", "from", "are", "was", "not",
