@@ -363,3 +363,16 @@ _Last updated: 2026-09-16T19:55:00+08:00_
   **空尾格**表达）；**独立视觉通道逐字复核一致**（含易错格「Bayesian networks … Naive Bayes (BN)」
   与自成一行「Q-learning」）。真浏览器三模式实测（⚠️ **改完前端必须 `npm run build`** ——
   旧 bundle 里表格没有 `.b-en/.b-zh`，看起来像"双语没生效"）：空单元格 0、console 零 error。
+
+### 同一轮：**已上生产**（2026-09-16 21:1x，宿主「要」）
+
+`bff21da` → CI `35096774881` 六 job 全绿 → 生产 `docker compose pull app` + `up -d app`：
+`revision=bff21da932cef…` / **healthy** / 公网 health 200 / bundle **`index-BuC2xeWi.js`**
+（与本地同指纹，含 `.b-any`）/ 日志零 error（「转换队列已启动」）。
+DB 与 `.env` 部署前已备份（`papershelf.db.bak.20260916-204237`、`.env.bak.20260916-204237`）。
+⚠️ 这次 pull 又撞慢层：42.37MB 那层反复 `Retrying`，20:42 起 → 21:12 `app Pulled`，**≈30 分钟**
+（`nohup … &` + 轮询照旧是唯一可行解）。
+
+**⚠️ 生产上「看不到变化」是预期**：表格重建在 ①c 阶段发生，存量块里根本没有 `table` 块。
+宿主 20:48 明确：**「不用（重新提取），我来操作」** —— 由宿主自己在文献库点「重新提取」，
+助手**不代签**这个操作（代价 ≈200 万 tokens + 译文重译 + 批注重划）。
