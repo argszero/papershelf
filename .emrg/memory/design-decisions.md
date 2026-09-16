@@ -1627,6 +1627,17 @@ DB 与 `.env` 部署前均已备份（`papershelf.db.bak.20260915-220958`、`.en
 与 `test_highlights.py::test_offset_anchors_are_in_every_prose_block`（原断言 `"data-o=" not in head["en_html"]`）
 —— **旧断言写的就是缺陷本身**，这轮把它翻正了。
 
+### 上线记录（2026-09-16 19:3x 宿主「提交，push，上生产」）
+
+`a62f8d4` → CI 六 job 全绿 → 生产 `docker compose pull app && up -d app`：
+`revision=a62f8d44a89f…` / **healthy** / 公网 health 200 / bundle **`index-B8ZJwYtc.js`** / 日志零 error。
+这次 pull **零 Retrying**（上次 42MB 层重试了 35–40 分钟），但流程仍照 `nohup … &` 走。
+DB 与 `.env` 部署前已备份（`papershelf.db.bak.20260916-193210`、`.env.bak.20260916-193210`）。
+**生产真浏览器实测**（宿主 paper 1）：35 个标题 → **33 个正文标题 `inl=2 / o=4`**，
+余下 2 个 = 应用自己的「阅读器」`h1` + `doc-head` 元数据标题（有意不可划）；
+标题块 `b-0003` 上**真实拖选** → `mark-bar` 出现（4 支笔 + 加笔记）。**只拖不写**，
+生产库痕迹为零（`notes 8 / highlights 162` 前后一致）。
+
 ### 教训
 
 **"没反应"要先问"是不是没给坐标"，别先怀疑交互层**：这是第二次同型缺陷

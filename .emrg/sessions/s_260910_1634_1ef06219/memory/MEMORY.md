@@ -255,7 +255,7 @@ DB 与 `.env` 部署前已备份。生产实测（宿主数据 paper 2）：`pro
 生产验收改用「取 `papershelf_session` cookie → curl PATCH → 查库 + 硬刷 UI」，
 **诚实边界**：那验的是服务端逻辑 + 前端渲染，真实滚轮那一段只在本地验过。
 
-_Last updated: 2026-09-16T19:45:00+08:00_
+_Last updated: 2026-09-16T19:55:00+08:00_
 
 ### 最近一轮（2026-09-16 晚）㊳ 标题行也能划重点 / 加笔记（宿主 19:14 截图报告）
 
@@ -286,3 +286,27 @@ _Last updated: 2026-09-16T19:45:00+08:00_
   （说明生产还是旧 bundle `index-BdNiDVTl.js`，本地已 `index-B8ZJwYtc.js`），一眼定位。
 - **本地验收残留已清干净**（`/tmp/pslocal/data/papershelf.db`：删掉本轮 note 4 + highlights 4/5/6，
   回到原装 **3 笔记 / 3 划痕**；备份 `papershelf.db.bak.20260916-1924`）。
+
+### 同一轮：**已上生产**（2026-09-16 19:3x，宿主「提交，push，上生产」）
+
+`a62f8d4` → CI 六 job 全绿 → `docker compose pull app && up -d app`：
+`revision=a62f8d4…` / **healthy** / 公网 health 200 / bundle **`index-B8ZJwYtc.js`** / 日志零 error
+（「转换队列已启动（轮询 3.0s，并发 2）」）。DB 与 `.env` 部署前均已备份
+（`papershelf.db.bak.20260916-193210`、`.env.bak.20260916-193210`）。
+这次 pull **零 Retrying**（上次那 42MB 层反复重试 35–40 分钟，这次很快）——
+但流程仍照 `nohup … &` 走（教训不改：SSH 直接等会被 600s 切断、镜像拉不全）。
+
+**生产真浏览器实测**（宿主数据 paper 1）：**35 个标题 → 33 个正文标题 `inl=2 / o=4`**，
+剩下 2 个"不可划"是**有意为之**（应用自己的「阅读器」`h1` + `doc-head` 那行元数据标题，都没有块坐标）；
+在标题块 `b-0003`（「A review of machine learning…」）上**真实鼠标拖选** → **`mark-bar` 出现**（4 支笔 + 加笔记）。
+验收**只拖不写** → 生产库痕迹为零（`notes 8 / highlights 162` 与验收前一致，paper 1/2 状态未变）。
+
+**⚠️ 本轮新踩的三个坑（都写进记忆了）**
+1. **`cdp("Page.reload")` 之后 harness 的"当前标签"会漂回上一个标签** —— 必须**再 `switch_tab` 一次**才
+   接着量 DOM；否则会在**别的标签页**上量（这次连着两次量到宿主的 duckduckgo 搜索结果页，
+   输出"标题 0 个容器"，**差点判成"没修好"**）。判据 = 每次量测前先打一次 `location.href` 自证。
+2. **后台标签页里真实鼠标事件不生效** → 解药是 `Emulation.setFocusEmulationEnabled(enabled=True)`
+   （设完 `visibilityState=visible` + `hasFocus()=true`，拖选立刻正常）—— 这是「后台标签页不算数」那条
+   旧教训的**正面解法**（旧做法是绕开、改用 curl）。
+3. **`git status` 里 static 产物不出现**别慌：`src/papershelf/static/assets/` 与 `index.html` 是
+   **gitignore 的**（镜像里由 CI 的 npm build 生成），所以"改了前端但 git 没动静"是正常的。
