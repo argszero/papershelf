@@ -257,5 +257,20 @@ v10 白做；实测 agent **一个没删**（2 页 / 52k tokens）。`PARSE_VERS
 - **代价/边界**：每条都重发一遍 ~950 tokens 的 system prompt（28 条 ≈2.9 万）—— 改成"一批 10 条"
   可降到约 1/5，本轮**未做**；标题译得好不好仍只能由人看（⑯ 块级修订兜底）。
   ⚠️ **存量没有 `ref` 块** ⇒ 要吃修复**必须宿主自己点「重新提取」**（≈100 万 tokens，不代签）。
+**→ 已上生产并验收（2026-09-17 21:1x，宿主「提交，push，上生产」）**：`4f42ff8`（代码）+
+`b14d813`（记忆）→**两轮 CI 六 job 全绿**（`35224100637` / `35224627827`）→
+`docker compose pull app`（52.85MB 慢层 21:02→21:17 ≈15 分钟、`Retrying` 5 次）+ `up -d app` →
+`revision=4f42ff8`（**代码提交**；记忆提交 `b14d813` 的镜像应用内容相同 —— `.dockerignore` 排除 `.emrg/`）
+/ healthy / 公网 health 200 / bundle `index-8YofT6DN.js`+`index-lPIbuEdh.css`（本轮前端只加注释）/ 日志零 error；
+DB + `.env` 事前备份（`papershelf.db.bak.20260917-210256`）。
+**容器内直调自证**（零 token）：`PARSE_VERSION=13` / `NO_ZH_TYPES=['deco','eq','refs']` /
+`PARTIAL_ZH_TYPES=['ref']`；现造 3 个碎片 → 切出 2 条；四道护栏逐条试（合格那条回
+`…(2024) 金属增材制造（MAM）在车辆零部件生产中的应用——综述. Metals 14(2):195.`，整条都译 → 报
+"混进 DOI"，标题没中文 → 报"没有中文"）；`title_span` 对**模型拼回的词**仍定位到 `(44, 79)`；
+`ref` 块渲染含 `data-pt="1"`/不含 `data-nt`，未译的 `ref` 才挂 `data-nt`；PROMPT 规则 5 已改口径。
+**用生产库里真实的 `refs` 块**（`b-0121`）复验向后兼容：仍挂 `data-nt`、**不带** `data-pt`、
+`expects_chinese(refs)=False` / `expects_chinese(ref)=True`。
+⚠️ **生产"看不到变化"是预期**：生产唯一那篇（paper 1）**有 29 个 `refs`、零个 `ref` 块**
+（v13 之前解析的）⇒ 要看得**宿主自己点「重新提取」**（≈100 万 tokens，不代签）。
 
-_Last updated: 2026-09-17T21:10:00+08:00_
+_Last updated: 2026-09-17T21:30:00+08:00_
