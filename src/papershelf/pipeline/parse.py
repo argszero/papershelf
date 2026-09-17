@@ -49,7 +49,12 @@ from .model import Doc, make_block_id
 #        此前 `Abstract` / `Keywords` 这类具名小标题**根本不存在于产物里**
 #   v7 → 给**栏间被切开的续段**盖 `payload["seam"]` 戳（见 `_column_spill_seams`）：
 #        只是**标记**、不自动合并 —— "该不该并"要看页图（①c 校对 agent 的活）
-PARSE_VERSION = 7
+#   v8 → 行内拆分出的两块**归一 y 到源行**（见 `_sub_block`）：v6 拆 `Keywords`
+#        时两块各自带 span 的 bbox，y0 差 ~1pt → 阅读顺序把关键词列表排到 `Keywords`
+#        标题**之前**（宿主 2026-09-17 实测截图）
+#   v9 → 页眉/页脚带里的**白色（不可见）文字**不入产物（`_drop_invisible_spans`）：
+#        Springer 首页那行纯白 `Vol.:(0123456789)` 曾被当成正文段落渲染、还要白送翻译
+PARSE_VERSION = 9
 
 # 页面上下边缘（比例），落在其中的短文本块视为页眉/页脚候选
 EDGE_TOP, EDGE_BOTTOM = 0.075, 0.925
@@ -684,22 +689,81 @@ def _group_lines(pairs: list[tuple[int, dict[str, Any]]]) -> list[tuple[int, lis
     return out
 
 
+def _union_bbox(boxes: list[list[float]]) -> list[float] | None:
+    if not boxes:
+        return None
+    return [min(b[0] for b in boxes), min(b[1] for b in boxes),
+            max(b[2] for b in boxes), max(b[3] for b in boxes)]
+
+
+# 白色（RGB 1,1,1）。`span["color"]` 是打包成整数的 RGB —— 0xFFFFFF 即白。
+_WHITE = 0xFFFFFF
+
+
+def _drop_invisible_spans(block: dict[str, Any], height: float) -> dict[str, Any] | None:
+    """剔除页边带里的**白色（不可见）文字**；整块都是白字则整块丢掉。
+
+    ## 为什么（2026-09-17 宿主实测截图：「图标+Springer，提取成了 `Vol.:(0123456789)`」）
+
+    Springer 的版式在页面右下角留住一行 `Vol.:(0123456789)` —— 它是**纯白**画的
+    （实测 `color=(1.0, 1.0, 1.0)`，字号 8pt，位于 y≈738–747，页高 791），
+    纸面上**看不见**；那处真正可见的是矢量画的 Springer 图标（我们本来就不渲矢量图）。
+    但 `get_text()` 照抽不误 → 产物多出一个毫无意义的段落、还要白送一次翻译。
+
+    ## 判据为什么这么窄（宁可漏删，不许误删）
+
+    白字**不一定**是不可见内容：深色底上的白字（章节横幅、图内标注）是真内容。
+    所以只动**页眉/页脚带**（`EDGE_TOP` / `EDGE_BOTTOM`，即"页边短文本"的候选区）
+    里的白字 —— 那里不可能是正文。实测 37 页原版全文：**全白块只有这 1 个**，
+    且落在底带（y0/y1 = 738/747，页高 791 ⇒ 93.3%–94.4%），正文区零命中。
+
+    ⚠️ 这里**不能用 `_edge_band`**（`_MARGIN_BAND = 0.05`，比 `EDGE_BOTTOM` 更窄）：
+    实测该块 y1 = 747 而 `0.95 × 791 = 751` → `_edge_band` 判 `None`，
+    「剔除不可见文字」会**静默不生效**（第一版就是这么写的，靠直接调用才量出来）。
+    """
+    y0, y1 = block["bbox"][1], block["bbox"][3]
+    if y0 > height * EDGE_TOP and y1 < height * EDGE_BOTTOM:
+        return block                       # 正文区：不动
+    pairs = [(li, s) for li, ln in enumerate(block.get("lines") or [])
+             for s in (ln.get("spans") or []) if _span_text(s).strip()]
+    if not pairs:
+        return block
+    kept = [(li, s) for li, s in pairs if s.get("color") != _WHITE]
+    if len(kept) == len(pairs):
+        return block                       # 没有白字（绝大多数块走这条）
+    if not kept:
+        return None                        # 整块都是白字 → 整块丢掉
+    return _sub_block(block, _group_lines(kept))
+
+
 def _sub_block(block: dict[str, Any],
                groups: list[tuple[int, list[dict[str, Any]]]]) -> dict[str, Any]:
     """按「(原行号, spans)」分组造一个最小可用的文本块（bbox 由 spans 重算）。
 
     只保留后续流程真正用到的键：`type` / `bbox` / `lines`（其余流程看 `lines` 里的
     `spans`——字体、字号都在里面，标题判定要用）。
+
+    ⚠️ **每行的纵向范围取「源行」的，不取 span 自己的**（2026-09-17 宿主实测修正）。
+    行内拆分（`_split_runin_heads`）会把**同一行**切成两块，而 span 的 bbox 只包住
+    它自己的字形 —— `Keywords`（无下伸部）与紧跟的关键词列表实测 y0 差 **1.4pt**。
+    阅读顺序 `_by_y` 按 `(y0, x0)` 排，于是**列表排到了标题之前**，页面上渲染成
+    「关键词列表 → Keywords 标题」（生产 paper 1 首页 `b-0008`/`b-0009`）。
+    同一行的两块本该**只由 x 区分先后**，所以这里把 y 归到源行上（x 仍是 span 的）。
     """
     lines: list[dict[str, Any]] = []
-    for _, spans in groups:
+    boxes: list[list[float]] = []
+    src_lines = block.get("lines") or []
+    for li, spans in groups:
         box = _spans_bbox(spans)
         if box is None:
             continue
+        row = src_lines[li].get("bbox") if 0 <= li < len(src_lines) else None
+        if row:
+            box = [box[0], min(box[1], row[1]), box[2], max(box[3], row[3])]
         lines.append({"bbox": box, "spans": spans, "wmode": 0, "dir": (1, 0)})
+        boxes.append(box)
     new = {k: v for k, v in block.items() if k in ("number", "size")}
-    new.update({"type": 0, "bbox": _spans_bbox([s for _, sp in groups for s in sp])
-                or block.get("bbox"), "lines": lines})
+    new.update({"type": 0, "bbox": _union_bbox(boxes) or block.get("bbox"), "lines": lines})
     return new
 
 
@@ -988,6 +1052,10 @@ def parse_pdf(
         width = widths[page_no - 1]
         text_blocks = [b for b in blocks if b.get("type") == 0 and _block_text(b)]
         text_blocks = [b for b in text_blocks if _block_text(b) not in headers]
+        # 页边带里的**白色（不可见）文字**不入产物（Springer 的 `Vol.:(0123456789)`
+        # 就是纯白画的；见 `_drop_invisible_spans`）。
+        cleaned = [_drop_invisible_spans(b, heights[page_no - 1]) for b in text_blocks]
+        text_blocks = [b for b in cleaned if b is not None]
         # 「加粗小标题 + 正文」被 PyMuPDF 并成一块的，先按行拆开 —— 不拆则 `Abstract`
         # 这类标题在产物里**根本不存在**（见 `_split_runin_heads`）。
         text_blocks = [x for b in text_blocks for x in _split_runin_heads(b, body_size)]

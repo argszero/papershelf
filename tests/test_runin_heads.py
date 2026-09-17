@@ -94,6 +94,28 @@ def test_abstract_without_bold_is_still_split(tmp_path):
     assert head is not None and head.type == "h2" and head.en.strip() == "Abstract"
 
 
+def test_inline_split_keeps_head_before_body_in_reading_order(tmp_path):
+    """**顺序**回归：同一行拆出来的两块，标题必须排在列表**之前**。
+
+    起因（2026-09-17 宿主实测截图）：「关键词这里顺序不对」—— 页面上渲染成
+    「Additive manufacturing · Machine learning · …」在 **`Keywords` 标题之上**。
+
+    真因**不在拆分本身**（`_split_runin_heads` 返回的就是 `[头, 尾]`），而在
+    **拆分后给两块各算了一个 span 级的 bbox**：`Keywords` 没有下伸部、紧跟的列表有，
+    于是两块的 y0 差 ~1pt，而阅读顺序 `_by_y` 按 `(y0, x0)` 排 → 列表被排到前面。
+    拆错的地方不在"拆"，在"拆出来的两块靠什么定序"。
+    """
+    pdf = tmp_path / "t.pdf"
+    _pdf(pdf, [[(72, 100, "Keywords", "hebo"),
+                (72 + 52, 100, " additive manufacturing, machine learning, deep learning", "helv")]])
+    doc = parse_pdf(pdf, assets_dir=tmp_path / "a")
+    kinds = [(b.type, (b.en or "").strip()) for b in doc.blocks]
+    head_i = next((i for i, (_, t) in enumerate(kinds) if t == "Keywords"), None)
+    list_i = next((i for i, (_, t) in enumerate(kinds) if t.startswith("additive manufacturing")), None)
+    assert head_i is not None and list_i is not None, f"两块都没拆出来：{kinds}"
+    assert head_i < list_i, f"标题排在列表后面了（顺序颠倒）：{kinds}"
+
+
 # ── ② 不许误拆（拆错会把一句话劈成两块、破坏译文对齐）───────────────────────
 
 def test_plain_bold_sentence_is_not_split(tmp_path):
