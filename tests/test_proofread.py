@@ -653,6 +653,46 @@ def test_retries_are_finite_and_hard_errors_are_not_retried(monkeypatch):
     assert handler.calls == 1                              # 不重试（重试只会白花钱）
 
 
+def test_retry_count_defaults_to_20_with_capped_backoff(monkeypatch):
+    """宿主 2026-09-17：「504 重试，放宽到 20 次」。
+
+    ⚠️ 次数与**退避封顶**必须一起成立：`2 ** attempt` 在第 20 次是 1,048,576 秒 ≈ 12 天，
+    而 `time.sleep` 会真睡 —— 放宽次数却不封顶，等于把"上游抖一下"换成"整篇挂死"。
+    """
+    from papershelf.pipeline.proofread import RETRY_BACKOFF_MAX
+
+    sleeps: list[float] = []
+    monkeypatch.setattr("papershelf.pipeline.proofread.time.sleep", sleeps.append)
+    handler = _FlakyPost([504] * 40)
+    _patched_client(monkeypatch, handler)
+    pf = Proofreader(CFG)
+    assert pf.retries == 20                                # 默认值就是宿主定的那个数
+
+    with pytest.raises(httpx.HTTPStatusError):
+        pf._chat([], None)
+
+    assert handler.calls == 21                             # 首次 + 20 次重试
+    assert len(sleeps) == 20
+    assert max(sleeps) == RETRY_BACKOFF_MAX                # 封顶生效（否则是 2^20）
+    assert sleeps == sorted(sleeps)                        # 单调不减：是退避，不是等长重试
+    assert sum(sleeps) < 600                               # 最长总等待 ~8 分钟，不是无界
+
+
+def test_config_knob_reaches_the_proofreader(monkeypatch):
+    """`PAPERSHELF_PROOFREAD_RETRIES` 必须真的传到 `Proofreader`（否则配置项是空话）。"""
+    from papershelf.server.config import get_settings
+
+    monkeypatch.setenv("PAPERSHELF_PROOFREAD_RETRIES", "7")
+    assert get_settings(refresh=True).proofread_retries == 7
+
+    import inspect
+
+    from papershelf.server import converter
+
+    src = inspect.getsource(converter._run)
+    assert "retries=settings.proofread_retries" in src
+
+
 def test_interruption_keeps_what_was_already_done(tmp_path):
     """中断也必须交账：已改的块 + 已核对的页要留下来（否则重跑从第 1 页重买）。"""
     from papershelf.pipeline.proofread import ProofreadTools

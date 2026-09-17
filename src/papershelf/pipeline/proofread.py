@@ -1010,14 +1010,37 @@ class ProofreadTools:
                 if p not in self.done_pages and self._page_blocks(p)]
 
 
+# ── 瞬时故障重试（429/5xx/超时/断连）─────────────────────────────────────────
+# ⚠️ 这四个常量必须**定义在 `Proofreader` 之前**：`DEFAULT_RETRIES` 是 `__init__` 的
+# 默认参数值，而默认参数在 **class 语句执行时**（import 期）就求值 —— 定义在后面会
+# `NameError`，且报在 import 上、看不出跟重试有关。
+RETRY_STATUS = re.compile(r"^(429|5\d\d)$")
+RETRY_BACKOFF = 2.0
+# 退避上限。**这条不是调优，是正确性**：重试次数放宽到 20 之后，天真的 `2**attempt`
+# 在第 20 次失败要等 2^20 秒 ≈ 12 天 —— `time.sleep` 会**真睡**，整篇转换就此挂死。
+# 封顶后总等待 ≈ 2+4+8+16+30×16 ≈ 8 分钟，远小于"整篇校对归零重跑"的代价。
+RETRY_BACKOFF_MAX = 30.0
+# 默认重试次数（宿主 2026-09-17 定：2 → 20）。**为什么放宽**：生产实测（2026-09-17）
+# 上游回了 **504**（`... HTTP 504 → 重试 → HTTP 504 → 放弃 → 保留已完成的 4 页`），
+# 2 次重试瞬间用完 ⇒ 8 页稿剩下 4 页**从未校对**，而文献在界面上看起来和成功一样
+# （宿主正是据此看到"竖向表格提取错乱"——那是解析原样，不是校对结果）。
+# 重试 20 次 + 封顶退避，换来的是"上游抖一下不再毁掉整篇"。
+DEFAULT_RETRIES = 20
+
+
+def _retry_wait(attempt: int) -> float:
+    """第 `attempt` 次失败后的等待秒数：指数退避（`RETRY_BACKOFF ** attempt`），**封顶**。"""
+    return min(RETRY_BACKOFF ** attempt, RETRY_BACKOFF_MAX)
+
+
 # ── 校对 agent 本体 ───────────────────────────────────────────────────────
 
 class Proofreader:
     """驱动一个**校对 agent**：给它工具，让它自己看图、读抽取结果、改抽取结果。"""
 
     def __init__(self, cfg, *, dpi: int = 130, max_tokens: int = 32000,
-                 max_rounds: int = 120, token_budget: int = 600_000, retries: int = 2,
-                 thinking: str = ""):
+                 max_rounds: int = 120, token_budget: int = 600_000,
+                 retries: int = DEFAULT_RETRIES, thinking: str = ""):
         self.cfg = cfg
         self.thinking = thinking
         self.dpi = dpi
@@ -1065,6 +1088,9 @@ class Proofreader:
         长任务里"一次瞬时故障 = 全部重来"是最贵的失败模式，必须在这里挡住。
 
         `429` / `5xx` / 超时 / 连接错误 → 退避重试；`4xx`（除 413）是请求本身的问题，直接抛。
+
+        ⚠️ 重试次数 20（宿主 2026-09-17）、**退避封顶**（`RETRY_BACKOFF_MAX`）。两者必须
+        一起看：次数放宽而退避不封顶，就等于让进程在第 20 次失败时睡 12 天。
         """
         attempt = 0
         while True:
@@ -1093,7 +1119,7 @@ class Proofreader:
                 if attempt > self.retries:
                     log.error("①c 调用失败 %d 次，放弃：%s", attempt - 1, exc)
                     raise
-                wait = RETRY_BACKOFF ** attempt
+                wait = _retry_wait(attempt)
                 log.warning("①c 调用失败（%s）→ %.1fs 后重试（第 %d/%d 次）",
                             exc, wait, attempt, self.retries)
                 time.sleep(wait)
@@ -1101,7 +1127,7 @@ class Proofreader:
                 if attempt > self.retries:
                     log.error("①c 调用失败 %d 次，放弃：%s", attempt - 1, exc)
                     raise
-                wait = RETRY_BACKOFF ** attempt
+                wait = _retry_wait(attempt)
                 log.warning("①c 调用异常（%s）→ %.1fs 后重试（第 %d/%d 次）",
                             exc, wait, attempt, self.retries)
                 time.sleep(wait)
@@ -1303,9 +1329,6 @@ MAX_PAGE_NUDGES = 8
 # 留 14 条 ≈ 7 轮的工具往返。实测参考页（大块拆成一堆小块）就是被这里放大的：
 # 一页 34 块 → 5 次调用 → 5 条几 KB 的结果被反复重发 → 21.7k tokens/轮。
 KEEP_TAIL_MESSAGES = 8
-# 瞬时故障重试：上游网关 429/5xx/超时/断连都重试，退避 2s / 4s / 8s…（共 `retries` 次）
-RETRY_STATUS = re.compile(r"^(429|5\d\d)$")
-RETRY_BACKOFF = 2.0
 
 
 def _nudge(left: list[int]) -> str:
@@ -1486,6 +1509,8 @@ _STOPWORDS = {"the", "and", "for", "with", "that", "this", "from", "are", "was",
 #    且只当**线索**给 agent（见 `_band_block_ids`）。
 _MIN_RULE_LEN = 0.25       # 一条横线至少要有页宽的这个比例才算表格线
 _RULE_TOL = 1.5            # |dy| 小于它就算水平线
+_STITCH_TOL = 1.2          # 「共线」：两条短线段的 y 差上限（pt）
+_STITCH_GAP = 4.0          # 「相接」：两条短线段之间的横向空隙上限（pt）
 _ROW_GAP = 220.0           # 相邻两条横线的最大间距：表头线 → 底线之间往往隔着一两百像素
 _BAND_PAD = 6.0            # 文本行/块与表区的 y 容差
 _MARGIN_BAND = 0.09        # 页眉/页脚带（期刊装饰线就在这里，不是表格线）
@@ -1543,32 +1568,49 @@ def _band_block_ids(lines, blocks: list[Block], y0: float, y1: float) -> list[st
 
 
 def _h_rules(page) -> list[tuple[float, float, float]]:
-    """页内所有**水平线**：`[(y, x0, x1)]`（线 + 矩形上下边都算）。"""
-    out: list[tuple[float, float, float]] = []
+    """页内所有**水平线**：`[(y, x0, x1)]`（线 + 矩形上下边都算）。
+
+    ⚠️ **必须先把共线的短段缝起来**（v12，宿主 2026-09-17 报的"竖向表格"）：
+    期刊那张 6 列表的**每一格边框都是单独画的** —— 表头线被画成 6 段
+    （52 / 151 / 135 / 151 / 150 / 19 pt），全宽 658pt 而**任何单段都不到页宽的 25%**
+    → 长度筛选（`_MIN_RULE_LEN`）把每一条都丢掉 → `_h_rules` 返回 0 条 →
+    `_table_regions` 的"横线"这条判据在这类表上**恒为假**，agent 一点提示都拿不到
+    （实测转正后的第 5 页：`tables: 0`，agent 是**自己看图**才发现的）。
+    缝合按「y 相同（±`_STITCH_TOL`）且横向相接（空隙 ≤ `_STITCH_GAP`）」：
+    上面那 6 段正好首尾相接 → 合成一条 658pt 的通栏线。
+    筛选放在缝合**之后**，于是"这条线够不够长"量的是整条线，不是某一格。
+    """
+    segs: list[tuple[float, float, float]] = []
     try:
         drawings = page.get_drawings()
     except Exception:                                          # noqa: BLE001 — 老版本没有该 API
-        return out
+        return []
     width = float(page.rect.width)
     for d in drawings:
         for item in d.get("items") or []:
             if not item:
                 continue
             kind = item[0]
-            segs = []
+            raw = []
             if kind == "l":                                    # ('l', Point, Point)
                 p1, p2 = item[1], item[2]
-                segs.append((p1.x, p1.y, p2.x, p2.y))
+                raw.append((p1.x, p1.y, p2.x, p2.y))
             elif kind == "re":                                 # ('re', Rect)
                 r = item[1]
-                segs += [(r.x0, r.y0, r.x1, r.y0), (r.x0, r.y1, r.x1, r.y1)]
-            for x1, y1, x2, y2 in segs:
+                raw += [(r.x0, r.y0, r.x1, r.y0), (r.x0, r.y1, r.x1, r.y1)]
+            for x1, y1, x2, y2 in raw:
                 if abs(y2 - y1) > _RULE_TOL:
                     continue
-                x0, x1b = min(x1, x2), max(x1, x2)
-                if x1b - x0 >= _MIN_RULE_LEN * width:
-                    out.append((round((y1 + y2) / 2, 2), x0, x1b))
-    return sorted(out)
+                segs.append((round((y1 + y2) / 2, 2), min(x1, x2), max(x1, x2)))
+    out: list[tuple[float, float, float]] = []
+    for y, x0, x1 in sorted(segs):
+        if out:
+            ly, lx0, lx1 = out[-1]
+            if abs(y - ly) <= _STITCH_TOL and x0 <= lx1 + _STITCH_GAP:
+                out[-1] = (ly, lx0, max(lx1, x1))
+                continue
+        out.append((y, x0, x1))
+    return [r for r in out if r[2] - r[1] >= _MIN_RULE_LEN * width]
 
 
 def _table_regions(page, blocks: list[Block]) -> list[dict]:

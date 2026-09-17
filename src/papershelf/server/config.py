@@ -81,6 +81,12 @@ class Settings:
     proofread_model: str = field(
         default_factory=lambda: os.environ.get("PAPERSHELF_PROOFREAD_MODEL", "")
     )
+    # **单次调用**的瞬时故障重试次数（429/5xx/超时/断连）。宿主 2026-09-17：「504 重试，
+    # 放宽到 20 次」—— 生产实测 2 次重试被一次 504 吃完，8 页稿剩下 4 页**从未校对**而界面
+    # 看起来是成功的。退避有上限（`proofread.RETRY_BACKOFF_MAX`），20 次的上限总等待 ≈ 8 分钟。
+    proofread_retries: int = field(
+        default_factory=lambda: _int("PAPERSHELF_PROOFREAD_RETRIES", 20)
+    )
     # 思考预算：`minimal`（默认）/ `off` / `low` / `auto`。
     # 池子里的视觉模型是**推理模型**，同一请求实测（2026-09-14）：
     #   auto → completion 2001 tokens / 10.0s；`minimal` → 693 / 3.7s；`off` → 80 / 1.1s。

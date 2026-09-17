@@ -282,6 +282,17 @@ def _run(conn: sqlite3.Connection, paper: dict, settings, fingerprint: str | Non
     # 但校对很贵（整页图 + 推理模型，一篇 37 页 ≈ 与整篇翻译同级），不能每次重跑都重买一遍 ——
     # 上次哪些页已校对成功记在 `doc.meta["proofread"]["ok_pages"]`（也随缓存落库）。
     proofread_pdf = None if paper["source"] == "arxiv" else Path(paper["pdf_path"] or "")
+    # ⚠️ 整页旋转的页面（v12）：解析阶段已把 PDF **转正**并落成副本（`doc.meta["normalized_pdf"]`），
+    # ①c 必须读**同一份** —— 它渲染页图、量疑似表区，坐标都得与解析产物对齐，否则
+    # `read_page(region=…)` 会放大到错误的位置（比"看反方向"更糟：看反方向它自己转得过来，
+    # 坐标错位会让它以为提示是假的）。副本不在时退回原件（不崩，只是校对质量下降）。
+    normalized = doc.meta.get("normalized_pdf")
+    if proofread_pdf is not None and normalized:
+        norm = Path(normalized)
+        if norm.exists():
+            proofread_pdf = norm
+        else:
+            log.warning("转正副本不在（%s）→ ①c 将看原方向页图", norm)
     prev_pf = doc.meta.get("proofread") or {}
     done_pages = set(prev_pf.get("ok_pages") or ())
     want_pf = settings.proofread and proofread_pdf is not None and proofread_pdf.exists()
@@ -301,6 +312,7 @@ def _run(conn: sqlite3.Connection, paper: dict, settings, fingerprint: str | Non
                          max_tokens=settings.proofread_max_tokens,
                          max_rounds=settings.proofread_max_rounds,
                          token_budget=settings.proofread_token_budget,
+                         retries=settings.proofread_retries,
                          thinking=settings.proofread_thinking)
         try:
             stats = pf.proofread_doc(doc, proofread_pdf, skip_pages=done_pages)

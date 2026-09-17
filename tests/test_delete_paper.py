@@ -72,10 +72,13 @@ def test_delete_removes_files_on_disk(client, settings, make_user):
     assets = settings.papers_dir / f"p{pid}" / "assets"
     assets.mkdir(parents=True, exist_ok=True)
     (assets / "fig1.png").write_bytes(b"fake")
+    # v12：整页旋转的**转正副本**也落在 `p<id>/` 下（`normalized.pdf`）——
+    # 它正是为此放在这儿：整目录 `rmtree` 一次收干净，不会留孤儿。
+    (settings.papers_dir / f"p{pid}" / "normalized.pdf").write_bytes(b"fake")
 
     assert client.delete(f"/api/papers/{pid}").status_code == 204
     assert not pdf.exists(), "落盘 PDF 未删除"
-    assert not (settings.papers_dir / f"p{pid}").exists(), "图片资产目录未删除"
+    assert not (settings.papers_dir / f"p{pid}").exists(), "图片资产目录（含转正副本）未删除"
 
 
 def test_delete_missing_or_foreign_paper_is_404(client, settings, make_user):

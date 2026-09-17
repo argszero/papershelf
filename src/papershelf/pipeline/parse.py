@@ -9,6 +9,7 @@
 
 from __future__ import annotations
 
+import logging
 import re
 from collections import Counter
 from pathlib import Path
@@ -17,6 +18,8 @@ from typing import Any, NamedTuple
 import fitz  # PyMuPDF
 
 from .model import Doc, make_block_id
+
+log = logging.getLogger("papershelf.pipeline.parse")
 
 # 解析版本号 —— **改动解析产物形状时必须手动 +1**。
 #
@@ -68,7 +71,19 @@ from .model import Doc, make_block_id
 #         ③**无图注的图片不再丢弃**（原先整批删掉"期刊 logo、作者头像"，实测把真图
 #         也误删 —— 图注压在图片边缘上时配不上注，图与图注一起消失）；
 #         ④图注配对允许**小幅纵向重叠**（`_CAP_*`），并改成"全局最近优先、一对一认领"。
-PARSE_VERSION = 11
+#   v12 → ①**整页旋转 90° 的页面转正**（见 `_page_rotation` / `normalize_rotated_pages`）：
+#         这类页面的文字是旋转着画上去的（页面 `/Rotate` 却是 0），而整条链路都假设
+#         "文字是水平的" —— 表格的**列**在页面坐标里是竖排，按 y 排序 / 按 x 找栏间空白
+#         于是把列当成行：同一行里相邻的格子被粘成一句、Ref 列的值跑到表头**之前**
+#         （宿主 2026-09-17 实测截图：一张竖向表格提取后格式全错）。转正是**坐标
+#         变换**，不是识别 —— 转正后它和一张普通横排表格完全一样；
+#         ②这类页面**不参与分栏**（表格格间的大空隙会被 `_gutter` 当成栏间空白，
+#         行序被劈成两半）：见 `_reading_order(columns=False)`；
+#         ③修掉**表注被静默丢弃**（转正后暴露出来的独立缺陷）：图注已由几何配对
+#         认领时，那个老式 `pending_figure` 没被复位，于是**下一页**以 "Table N" 起头
+#         的表注撞进"给上一个图当图注"的分支，而那个图已有图注 → 整行被 `continue` 丢掉
+#         （实测 8 页稿 `Table 2 …` 在任何块里都不存在，①c 只能如实报"表注在抽取中丢失"）。
+PARSE_VERSION = 12
 
 # 页面上下边缘（比例），落在其中的短文本块视为页眉/页脚候选
 EDGE_TOP, EDGE_BOTTOM = 0.075, 0.925
@@ -138,6 +153,15 @@ _CAP_MAX_GAP = 90.0          # 图注离图片多远之内还算它的图注（p
 _CAP_OVERLAP = 24.0          # 允许的纵向重叠上限（pt）—— 版面把图注压在图片边缘上
 _CAP_OVERLAP_RATIO = 0.25    # 或"重叠不超过图高的这个比例"（大图允许压得更多）
 _CAP_SIDE_PENALTY = 30.0     # 与图片**并排**（横向不重叠）的图注：可能是邻栏的话，代价更高
+
+# ── 整页旋转（v12）────────────────────────────────────────────────────────────
+# 有些期刊把**横排的大表格**印在竖版页面上：整页文字（含表格）是**旋转 90° 画上去的**，
+# 而页面 `/Rotate` 仍是 0 —— 所以 PyMuPDF 的 `page.rotation`、`page.rect` 都看不出异常，
+# 只有 span 级的 `line["dir"]` 说真话（`(0,-1)`：文字沿 y 轴自下而上）。
+# 判据只看**字符数加权**的纵向比例，且要求纵向字符数够多（免得一两行竖排标注
+# 把整页判成旋转页 —— 那个代价是把正常页面转 90°）。
+_ROT_VERT_RATIO = 0.6        # 纵向字符占全页字符的比例超过它 ⇒ 判为旋转页
+_ROT_MIN_CHARS = 200         # 纵向字符数下限（噪声门槛）
 
 # 章节编号模式（IEEE/学术常见）：顶层「I. / II.」，次级「A. / B.」，深层「1.1 / 2.3.1」
 _RE_H2 = re.compile(r"^([IVX]{1,6})\.\s+\S")
@@ -455,7 +479,8 @@ def _page_gutter(blocks: list[dict[str, Any]], width: float, height: float) -> f
 
 
 def _reading_order(
-    blocks: list[dict[str, Any]], width: float, height: float
+    blocks: list[dict[str, Any]], width: float, height: float, *,
+    columns: bool = True,
 ) -> list[dict[str, Any]]:
     """按阅读顺序排序：**分区**处理 —— 通栏块自成一段，窄块段内再分栏。
 
@@ -470,6 +495,14 @@ def _reading_order(
     ⚠️ **版面边角块（页眉/页脚/页码/水印）不参与分段**，只按 y 归位到页首或页尾
     （`_marginal`）。它们夹在正文段之间会把整页切成交错的段（实测第 1 页输出
     「左栏首段 → 页脚 → 页眉 → 左栏续段 → 右栏」）。正文两栏因此能连续读到底。
+
+    ## `columns=False`（v12：转正后的旋转页）
+
+    这类页面整页是一张**横排表格**，格与格之间天然有大段空白 —— `_gutter` 会把
+    「Sensor type 列右缘 / ML 列左缘」那条缝当成**栏间空白**，于是阅读顺序变成
+    "每行的左半 → 每行的右半"，**行序被劈成两半**（实测：第 5 页前 8 块全是右半张表
+    的单元格，左半张表排到了后面）。表格只有一种正确的顺序：**行序**。
+    所以这里退化成纯 `_by_y`（边角块归位那条照旧保留）。
     """
     if not blocks:
         return []
@@ -481,7 +514,8 @@ def _reading_order(
     body = [b for b in blocks if not _marginal(b, width, height, gutter)]
     runs: list[tuple[str, list[dict[str, Any]]]] = []
     for b in _by_y(body):
-        cls = "full" if (b["bbox"][2] - b["bbox"][0]) > width * _SPAN_RATIO else "col"
+        full = (not columns) or (b["bbox"][2] - b["bbox"][0]) > width * _SPAN_RATIO
+        cls = "full" if full else "col"
         if runs and runs[-1][0] == cls:
             runs[-1][1].append(b)
         else:
@@ -1316,6 +1350,82 @@ def _pair_captions_by_geometry(
     return result, used
 
 
+def _page_rotation(page: Any) -> int:
+    """这一页的文字是不是**整页旋转 90° 画的**；是则返回把它**转正**的度数（0/90/270）。
+
+    只看 `line["dir"]`（PyMuPDF 除非页面 `/Rotate` 非 0，否则报的就是**内容坐标系**）：
+      * `(0,-1)` ⇒ 字是自下而上排的 ⇒ `show_pdf_page(..., rotate=270)` 转正；
+      * `(0, 1)` ⇒ 自上而下（顺时针转出来的那种）⇒ `rotate=90`。
+    判据用**字符数加权**，且要求纵向字符数够多 —— 竖排的表头标注（一个词）不该
+    把整页判成旋转页：那代价是把一页正常内容转 90°。
+    """
+    up = down = horiz = 0
+    for b in page.get_text("dict")["blocks"]:
+        if b.get("type") != 0:
+            continue
+        for ln in b.get("lines") or ():
+            n = sum(len(s.get("text") or "") for s in (ln.get("spans") or ()))
+            if not n:
+                continue
+            d = ln.get("dir") or (1, 0)
+            if d[1] < -0.5:
+                up += n
+            elif d[1] > 0.5:
+                down += n
+            else:
+                horiz += n
+    vert = up + down
+    if vert < _ROT_MIN_CHARS or vert / max(1, vert + horiz) < _ROT_VERT_RATIO:
+        return 0
+    return 270 if up >= down else 90
+
+
+def normalize_rotated_pages(
+    src: Any, dst: str | Path | None = None,
+) -> tuple[Any | None, dict[int, int], Path | None]:
+    """把「整页旋转 90°」的页面**转正**：返回 `(转正后的 doc | None, {页码: 度数}, 落盘路径 | None)`。
+
+    ## 为什么必须转正，而不是"在别处补偿"
+
+    表格的**行**在页面坐标里是**竖列**：整条链路（`_by_y` 排序、`_gutter` 找栏间空白、
+    ①c 的 `read_page(region=…)`）都假定文字水平。实测（宿主 2026-09-17 报的"竖向表格"，
+    8 页稿第 5 页 = 生产 paper 1 的第 5 页）：同一行里相邻的格子被**粘成一句**
+    （`Single sensor Spectrum sensors SVM, DT, KNN, LDA, K-means, NN Monitoring the porosity…`），
+    而 Ref 列的值（`[ 92 ]`）因为 x 最小，跑到了**表头之前**。
+
+    转正是**纯坐标变换**：`show_pdf_page(rotate=…)` 把这一页原样重画一遍，
+    文字层、矢量层（表格线/标识）与图片层一起跟着转（实测图片字节与尺寸不变），
+    于是它和一张**普通的横排表格**完全一样 —— 不需要给表格识别加任何特例。
+
+    返回的 doc 由调用方负责关闭。`dst` 只在这时写一次（没有旋转页则一个字节都不写）：
+    它是给 **①c** 用的 —— 它渲染页图、量疑似表区，必须与解析产物**同一套坐标**，
+    否则 `read_page(region=…)` 会放大到错误的地方。落盘失败不致命（返回的 doc 照样能用），
+    只记一条 warning：那时 ①c 会退回去看原方向页面（校对质量下降，但不会崩）。
+    """
+    rot = {i: r for i, page in enumerate(src, 1) if (r := _page_rotation(page))}
+    if not rot:
+        return None, {}, None
+    out = fitz.open()
+    for i, page in enumerate(src, 1):
+        r = rot.get(i)
+        if r:
+            # 转正后的页面：宽高互换（竖版 → 横版）
+            fresh = out.new_page(width=page.rect.height, height=page.rect.width)
+            fresh.show_pdf_page(fresh.rect, src, i - 1, rotate=r)
+        else:
+            out.insert_pdf(src, from_page=i - 1, to_page=i - 1)       # 原样复制，零改动
+    saved: Path | None = None
+    if dst is not None:
+        saved = Path(dst)
+        try:
+            saved.parent.mkdir(parents=True, exist_ok=True)
+            out.save(saved)
+        except Exception as exc:                                  # noqa: BLE001 — 不致命
+            log.warning("转正后的页面副本写盘失败（%s）→ ①c 将看原方向页图：%s", saved, exc)
+            saved = None
+    return out, rot, saved
+
+
 def _finalize(doc: Doc) -> Doc:
     """收尾清理：合并标题行、抽出标题到 meta、剔除无图注的 logo/头像、重编块 ID。"""
     blocks = doc.blocks
@@ -1470,6 +1580,26 @@ def parse_pdf(
     out_dir.mkdir(parents=True, exist_ok=True)
 
     src = fitz.open(pdf_path)
+    # ── 整页旋转的页面**先转正**（v12）───────────────────────────────────────────
+    # 转正后本函数后续每一行都不必再想"这页是不是躺着的"：坐标系就是正的。
+    # 副本落在**这篇文献自己的目录**（`papers_dir/p<id>/normalized.pdf` = 图片资产目录的父目录）
+    # —— 它必须给 ①c 用（渲染页图、量疑似表区），与这里**同一套坐标**。
+    # ⚠️ **不能**图省事写成 `pdf_path.parent / "normalized.pdf"`：所有 PDF 都平铺在同一个
+    # `papers_dir` 下，那个名字是**全库共享**的 ⇒ 并发（`MAX_CONCURRENCY=2`）时两篇互相覆盖，
+    # ①c 会**读到别人的 PDF 而不报错**；而且删文献（㉙）只收 `p<id>/` 与 PDF 本身，孤儿副本
+    # 会一直留在库里。放在 `p<id>/` 下顺带解决这两件事（`_remove_paper_files` 已整目录 rmtree）。
+    # 没给 `assets_dir` 的临时脚本：副本名字带上源文件名，保证不共享。
+    if assets_dir:
+        norm_dst = Path(assets_dir).parent / "normalized.pdf"     # papers_dir/p<id>/normalized.pdf
+    else:
+        norm_dst = pdf_path.with_name(f"{pdf_path.stem}.normalized.pdf")
+    norm_src, rotated, norm_path = normalize_rotated_pages(src, norm_dst)
+    if norm_src is not None:
+        src.close()                                   # 内容已在建副本时拷走（show_pdf_page）
+        src = norm_src
+        log.info("解析：%d 页整页旋转 → 已转正（%s）",
+                 len(rotated), "、".join(f"第 {p} 页 {r}°" for p, r in sorted(rotated.items())))
+
     raw_pages: list[list[dict[str, Any]]] = []
     lines_per_page: list[list[_Line]] = []
     draws_per_page: list[list[Any]] = []
@@ -1489,6 +1619,12 @@ def parse_pdf(
         widths.append(rect.width)
 
     doc = Doc(meta={"source": pdf_path.name, "pages": len(raw_pages)})
+    if rotated:
+        # 落进 meta 三用：①c 据此取同一份 PDF；调试时一眼看得出哪几页被转正过；
+        # 也解释了"这一页的分栏判断为什么被跳过"。
+        doc.meta["rotated_pages"] = sorted(rotated)
+        if norm_path is not None:
+            doc.meta["normalized_pdf"] = str(norm_path)
     if title_hint:
         doc.meta["title_en"] = title_hint
 
@@ -1523,11 +1659,18 @@ def parse_pdf(
         #    跨页合并时页码会略有偏差（同一段公式被 PDF 拆到两页的极少数情形）。
         add = _paged_adder(doc, page_no)
 
-        ordered = _reading_order(text_blocks + image_blocks, width, heights[page_no - 1])
-        # 「栏间续段」只在**这一页的阅读顺序**上才看得出来（要左右栏的接缝），
-        # 所以在这里算好、随块一起盖进 payload（见 `_column_spill_seams`）。
-        seams = _column_spill_seams(ordered, width, heights[page_no - 1],
-                                    _page_gutter(ordered, width, heights[page_no - 1]))
+        # 转正后的旋转页（v12）**不分栏**：整页是一张横排表格，格间空白会被
+        # `_gutter` 当成栏间空白，行序被劈成"每行的左半 → 每行的右半"。
+        if page_no in rotated:
+            ordered = _reading_order(text_blocks + image_blocks, width,
+                                     heights[page_no - 1], columns=False)
+            seams: dict[int, str] = {}
+        else:
+            ordered = _reading_order(text_blocks + image_blocks, width, heights[page_no - 1])
+            # 「栏间续段」只在**这一页的阅读顺序**上才看得出来（要左右栏的接缝），
+            # 所以在这里算好、随块一起盖进 payload（见 `_column_spill_seams`）。
+            seams = _column_spill_seams(ordered, width, heights[page_no - 1],
+                                        _page_gutter(ordered, width, heights[page_no - 1]))
         captions, caption_blocks = _pair_captions_by_geometry(image_blocks, text_blocks)
         # 页边横线 → 挂在**它所属的那一行文字**上（`{id(块): "below"|"above"}`）。
         # 必须放在 `_split_runin_heads` **之后**算：拆出来的两块是新字典，按 `id()`
@@ -1615,9 +1758,21 @@ def parse_pdf(
             text = _block_text(b)
 
             # 图注：紧随图片块之后、以 Fig./Table 开头 → 挂到该图
-            if pending_figure is not None and _caption_like(text):
-                if not pending_figure.payload.get("caption"):
-                    pending_figure.payload["caption"] = " ".join(text.split())
+            #
+            # ⚠️ 三条判据缺一不可（v12 修的一处**静默丢内容**）：这里原来只写
+            # `if pending_figure is not None and _caption_like(text)`，而这个
+            # `pending_figure` 是**跨页存活**的，且**几何配对**（`_pair_captions_by_geometry`，
+            # v11）认领过的图注**不会走这个分支** → 变量从没被复位。于是下一页以
+            # "Table N …" 起头的**表注**撞进来，而那个图已经有图注了 → 什么都不写、
+            # 直接 `continue` —— 实测 8 页稿第 5 页的 `Table 2 Research on single and
+            # multi-sensor as ML input data for defect detection` **在任何块里都不存在**
+            # （①c 只能如实报"表注在抽取中丢失，无法凭块补写"，而它是对的：不许凭图默写）。
+            # 判据：**同一页** 且 那个图**还没有**图注，才认。
+            if (pending_figure is not None
+                    and pending_figure.payload.get("page") == page_no
+                    and not pending_figure.payload.get("caption")
+                    and _caption_like(text)):
+                pending_figure.payload["caption"] = " ".join(text.split())
                 pending_figure = None
                 continue
 
