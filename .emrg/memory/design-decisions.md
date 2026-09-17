@@ -2164,6 +2164,32 @@ DB 与 `.env` 部署前已备份（`/tmp/papershelf.db.bak.20260917-154522`、`/
   **8 次变异检验全部转红**（关旋转判据 / 表注退回旧写法 / 关缝合 / 不落副本 / 旋转页仍分栏 /
   完全不转正 / 重试退回 2 / 退避不封顶 / 配置不接线）。
 
+### 四之二、上线记录（2026-09-17 18:4x，宿主「push，上生产」）
+
+`c89a4ad`+`3d7c300` → CI run `35211627575` **六 job 全绿**（test / build amd64 / build arm64 /
+merge / smoke / verify）→ `docker compose pull app`（52.85MB 那层这次**零 Retrying**，约 4 分钟）
++ `up -d app`：`revision=3d7c300…` / **healthy** / 公网 health 200 + `{"ok":true,…}` /
+bundle `index-8YofT6DN.js` + `index-lPIbuEdh.css`（与本地构建产物**逐字节一致**，本轮前端零改动）/
+日志零 error（「转换队列已启动（轮询 3.0s，交付并发 2）」）。DB 与 `.env` 事前已备份
+（`…bak.20260917-183946`）。
+
+**容器内直调自证（部署后唯一能证明"线上跑的就是这份代码"的路径）**：
+`PARSE_VERSION=12` / `DEFAULT_RETRIES=20` / `RETRY_BACKOFF_MAX=30.0` /
+`get_settings().proofread_retries=20` / `converter._run` 源码里 `normalized_pdf` 与
+`retries=settings.proofread_retries` 两处接线都在；**现造一页旋转页喂给线上那份解析器
+→ `rotated_pages=[1]`、副本落在 `p1/`**（正是本轮修的那个"不该落全库共享名"的位置）。
+
+**用宿主自己那篇 PDF 预演（只解析、零 token、不写库）**：
+`docker exec` 里对 `/data/papers/2026-09-17T083840+0000_original2.pdf` 跑 v12 解析 →
+`rotated_pages=[5]`、块 149 起步、**`b-0060 'Table 2 Research on single and multi-sensor …'` 回来了**、
+`[ 92 ]` 跟着它自己那一行（不再跑到表头之前）。
+
+⚠️ **生产上"看不到变化"是预期**：生产**唯一**那篇（paper 1，8 页 149 块）是**今天 16:38 上传、
+v11 解析**的 —— 而它**就是宿主报的那篇**（同 PDF：第 5 页整页旋转表格）。库里实测现状正是病灶：
+`[ 92 ]/[ 100 ]/[ 101 ]` 排在表头**之前**、每行被栏间空白劈成两半、**没有任何块以 "Table 2" 起头**；
+`meta.proofread.pages = 4`（**只校了 4/8 页** —— 就是 504 那次）。⇒ 要吃修复**必须宿主自己点
+「重新提取」**（≈100 万 tokens，含全篇 ①c + 重译；助手**不代签**）。
+
 ### 五、教训（写下来）
 
 1. **"整页旋转"要看 span 的 `dir`，别看 `/Rotate`** —— 页面属性可以为 0 而内容整个躺下。
