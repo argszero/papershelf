@@ -1923,6 +1923,31 @@ DB 与 `.env` 部署前已备份（`papershelf.db.bak.20260917-085812`、`.env.b
 4. **测试要复现生产形状**（同 ㊴）：本轮的合成 PDF 测试直接画真线、写真字号，
    而不是自造 `bbox`（㊴ 那次自造 bbox 让提示层"绿着但生产命中 0"）。
 
+**上线与生产验收（2026-09-17 12:0x）**：`657388f`（代码）+ `f4476c4`（记忆）→ CI 六 job 全绿 →
+生产 `docker compose pull app`（52.85MB 层，中途 Retrying 5 次）+ `up -d app`：
+`revision=f4476c4` / **healthy** / 公网 health 200 / bundle `index-D9a7YvYN.js` / 日志零 error。
+部署前后 `data/papershelf.db` 与 `.env` 均已备份（`…bak.20260917-1150`）。
+生产 CSS 产物里 `.pg-band` / `.pg-rule-below` / `.pg-rule-above` 三条装饰规则**实测在位**。
+
+真浏览器（生产 paper 1）逐列量测三模式：dual `t-en 119/119 + t-zh 87/87` 可见、
+`lang-zh` 下 `t-en 0/119`、`lang-en` 下 `t-zh 0/87`（`t-zh 119` 含免中文块的原文回落 —— ㊱ 的修复）；
+硬刷后控制台**零 error**（只有 Edge 自己那条 lazy-image info）。
+⚠️ 一条环境坑：后台标签页里 `click_at_xy` 点工具栏**不生效**（模式纹丝不动），
+`Emulation.setFocusEmulationEnabled(enabled=True)` 后 `visibilityState` 转 `visible` 立刻正常
+—— 「后台标签页不算数」的正解（见 `ui-interaction-real-events`）。
+
+**⚠️ 验收结论必须两分开说**：
+- **(a) 部署本身 ✅ 已验**：reader 渲染、三模式、控制台、CSS 规则、服务端渲染路径全部通过；
+- **(b) 页面上看到页眉与横线 ✗ 还没有** —— 生产那篇（paper 1，139 块）是 **v10 之前解析的**
+  （有 `payload.page`、**无** `band`/`rule`）⇒ 要吃 v10 必须**宿主自己点「重新提取」**（≈200 万 tokens/篇）。
+
+**新的生产验收手法（可复用、零 token、不动数据）**：不重跑转换，直接
+`docker exec papershelf python` + `base64` 把一段脚本送进容器，调
+`render_block(block, typeset=True)` 断言产物含 `pg-band pg-top pg-rule-below`，
+并断言 `typeset=False` 产物逐字干净（`<p data-b=…>`）—— 这比只看 bundle 指纹更直接地证明
+**线上跑的确实是这份代码**，且不需要制造临时文献、不花 token。
+（同族思路：能"在容器里直接调函数"就别"造数据跑全流程"。）
+
 
 1. 归属链固定 **User → Plan → Paper**，无 Team/Org（①⑦）
 2. LLM key **只在服务端**（⑧）

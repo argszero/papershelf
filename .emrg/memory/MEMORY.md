@@ -130,8 +130,8 @@ agent 看页图后 `merge_block`；端到端实测合并真的落进产物、译
 bundle `index-BuC2xeWi.js`（与本地同指纹）/ 日志零 error。离线回归 **348 passed**；
 端到端真产品路径 + 真浏览器三模式已验。⚠️ 这次 pull 又撞慢层（42.37MB 重试 ≈30 分钟）。
 
-**㊶ 页面家具 = 页眉文字不再丢 + 页边横线补回（解析 v8/v9/v10）✅ 本地已落地**
-（2026-09-17，`657388f`，**尚未上生产**；细节见 `design-decisions.md` ㊶）：宿主一次贴三条截图 ——
+**㊶ 页面家具 = 页眉文字不再丢 + 页边横线补回（解析 v8/v9/v10）✅ 已上生产**
+（2026-09-17，`657388f`/`f4476c4`，生产 `revision=f4476c4`；细节见 `design-decisions.md` ㊶）：宿主一次贴三条截图 ——
 ①关键词顺序不对（行内拆出的两块各带字形 bbox、y0 差 1.4pt → **纵向归一到源行**，v8）
 ②`Vol.:(0123456789)` 抽出来了（那串字是**纯白色**画的、白纸上等于看不见 → **页边带白字不入产物**，v9）
 ③「这里少了一条水平线」（每页页眉下那条**矢量细线**：`get_text()` 从不回线条，**不是新 bug**）→
@@ -148,6 +148,19 @@ v10 白做；实测 agent **一个没删**（2 页 / 52k tokens）。`PARSE_VERS
 ⚠️ **存量要吃修复必须「重新提取」**（`PARSE_VERSION` 变了）—— 由宿主自己操作（≈200 万 tokens/篇）。
 顺带修：`validate.tag_balance` 的正则会被 CSS 注释里的 `<` 干扰（改一句 CSS 文案就能炸掉整篇转换）。
 
+**→ 已上生产并验收（2026-09-17 12:0x）**：CI 六 job 全绿 → `docker compose pull`（52.85MB 层 Retrying 5 次）
++ `up -d app` → `revision=f4476c4` / healthy / 公网 200 / bundle `index-D9a7YvYN.js` / 日志零 error；
+生产 CSS 里 `.pg-band/.pg-rule-below/.pg-rule-above` 三条规则实测在位。
+生产真浏览器（paper 1）三模式逐列量测：dual `t-en 119/119 + t-zh 87/87`、`lang-zh` 下 `t-en 0/119`、
+`lang-en` 下 `t-zh 0/87`；硬刷后控制台**零 error**。**验收必须两分开说**：部署/渲染 ✅ 已验；
+**页面上看到页眉与横线 ✗ 还没有** —— 生产唯一那篇（paper 1，139 块）是 v10 之前解析的
+（有 `payload.page`、无 `band`/`rule`）⇒ 要看得宿主自己点「重新提取」。
+**新手法（可复用、零 token、不动数据）**：`docker exec papershelf python` + `base64` 塞脚本进容器，
+调 `render_block(...)` 断言产物含 `pg-band pg-top pg-rule-below`、且 `typeset=False` 产物逐字干净
+—— 比只看 bundle 指纹更直接地证明「线上跑的就是这份代码」。
+⚠️ **生产数据已变**：现在只有 1 篇（paper 1 = 8 页 139 块《增材制造中的机器学习综述》），
+此前那批（37 页真论文 / 3 页 / 合成 / synth-table）都不在了。
+
 ### 遗留待定项已结（M3 后全部结清或明确推后）
 1 会话机制 ✅ · 2 前端框架 ✅（React+TS+Vite）· 3 任务队列 ✅（**v1 常驻队列 + 启动恢复**，㉗）·
 7 翻译去重 ✅（PDF hash 缓存）· 8 公式渲染 ✅（**服务端 MathML**）· 10 版权警示 ✅ ·
@@ -155,4 +168,4 @@ v10 白做；实测 agent **一个没删**（2 页 / 52k tokens）。`PARSE_VERS
 **明确推后**：4 术语表归属（v1 计划级）· 5 成本护栏数值 · 6 用量面板（已攒 `tokens_used`，v2）·
 9 图表 VLM（v2）· 14 标签词表（v1 自由标签）
 
-_Last updated: 2026-09-17T11:35:00+08:00_
+_Last updated: 2026-09-17T12:10:00+08:00_

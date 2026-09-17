@@ -255,7 +255,7 @@ DB 与 `.env` 部署前已备份。生产实测（宿主数据 paper 2）：`pro
 生产验收改用「取 `papershelf_session` cookie → curl PATCH → 查库 + 硬刷 UI」，
 **诚实边界**：那验的是服务端逻辑 + 前端渲染，真实滚轮那一段只在本地验过。
 
-_Last updated: 2026-09-16T19:55:00+08:00_
+_Last updated: 2026-09-17T12:10:00+08:00_
 
 ### 最近一轮（2026-09-16 晚）㊳ 标题行也能划重点 / 加笔记（宿主 19:14 截图报告）
 
@@ -411,3 +411,27 @@ DB 与 `.env` 已备份（`…20260917-085812`）。
 
 **⚠️ 宿主还要自己「重新提取」**：护栏修复在 ①c 阶段，存量块里没有 `table` 块，不吃修复就还是没表格
 （宿主 20:48 已表态自己操作）。
+
+### 最近一轮（2026-09-17 上午→中午）v10 页面家具上生产 + 生产验收
+
+**本地**（`657388f`）：解析 v10（页眉文字不再有意丢掉 + 补回每页页眉横线，`PARSE_VERSION` → 10）+
+①c 提示词同步加护栏（页眉/页脚不属"重复块"、不许并入正文）+ `validate.tag_balance` 抗 CSS 注释；
+离线回归 **373 passed**（`tests/test_page_furniture.py` 12 项 + 变异检验转红）。
+
+**生产**（`f4476c4`，备份 `…bak.20260917-1150`）：`docker compose pull`（52.85MB 层 Retrying 5 次，
+`nohup` + 轮询照旧）→ `up -d app` → `revision=f4476c4` / healthy / 公网 200 /
+bundle `index-D9a7YvYN.js` / 日志零 error；CSS 三条装饰规则实测在位。
+
+**生产验收（真浏览器 + 容器内直调，零 token 零数据改动）**
+- 生产真浏览器（paper 1）三模式逐列量测：dual `t-en 119/119 + t-zh 87/87`、`lang-zh` 下 `t-en 0/119`、
+  `lang-en` 下 `t-zh 0/87`；硬刷后控制台**零 error**。数据零改动（`status=reading` / `last_read_at` 未变）。
+- **新手法**：`docker exec papershelf python` + `base64` 塞脚本，直调 `render_block(...)`，断言产物含
+  `pg-band pg-top pg-rule-below`、`typeset=False` 产物逐字干净 ⇒ 证明**线上跑的就是这份代码**。
+- **结论两分开说**：部署/渲染 ✅ 已验；**页面上看到页眉与横线 ✗ 还没有** —— 生产唯一那篇
+  （paper 1，139 块）是 v10 之前解析的（有 `payload.page`、无 `band`/`rule`）⇒ 要看得**宿主自己点「重新提取」**。
+- ⚠️ **生产数据已变**：只剩 1 篇（8 页 139 块《增材制造中的机器学习综述》），此前那批都不在了。
+
+**两条环境坑**：① `browser-harness` 的 `js()` **不接受 `await_promise`**（Promise 自动 await）、
+没有 `navigate()`（用 `goto_url()`），JS 里括号写错会被报成 `SyntaxError`（像 harness 坏了）；
+② 后台标签页里 `click_at_xy` **点按钮不生效**（模式纹丝不动）→ `Emulation.setFocusEmulationEnabled(True)`
+后 `visibilityState=visible` 立刻正常 —— 这是「后台标签页不算数」的正解。
