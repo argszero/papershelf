@@ -246,10 +246,13 @@ def _from_html(html: str, arxiv_id: str, version: str, paper: dict, settings) ->
                 section=section, payload={"latex": tex, "number": num, "latexized": True},
             ))
             continue
-        if ref is not None:                                   # 参考文献条目（保持英文）
+        if ref is not None:                                   # 参考文献条目（`<li>` 本就是一条）
             text = _plain(ref)
             if text:
-                doc.blocks.append(Block(id=make_block_id(len(doc.blocks) + 1), type="refs",
+                # ⚠️ `ref`（不是 `refs`）：arXiv 的条目天然**一条一块**，不需要
+                # `parse.merge_ref_entries` 那套碎片合并 —— 它直接就是"完整条目"，
+                # 于是走**只译标题**的通道（决策㊹）。`refs` 留给"切不出条目的碎片"。
+                doc.blocks.append(Block(id=make_block_id(len(doc.blocks) + 1), type="ref",
                                         en=text, section="REFERENCES"))
             continue
         if fig is not None:                                   # 图：取 img + 图注，公式图跳过

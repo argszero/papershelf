@@ -40,7 +40,8 @@ SYSTEM_PROMPT = """你是学术论文翻译专家，服务于中文科研人员�
    公式编号 `(12)`、引用编号 `[13]` 原样保留。
 4c. **章节标题务必译出中文**：不得整条标题保留英文原文
    （❌「I. INTRODUCTION」 → ✅「I. 引言」）。
-5. 参考文献条目（作者名、标题、期刊、年份）**保持英文原文不译**。
+5. 参考文献条目**只译文献标题**：作者名、期刊/会议名、卷期页、年份、DOI/URL
+   一律保留原文（读者要靠它们检索）。中文栏里一条文献看起来仍是原条目，只有标题成了中文。
 6. 专有名词（模型名、方法名、数据集名）按术语表处理；术语表未覆盖且学界惯用英文的可保留英文。
 
 ⚠️ 结构要求（最高优先级，违反即视为失败）：
@@ -146,13 +147,133 @@ def _fit_grid(got: object, want: tuple[int, int]) -> list[list[str]] | None:
     return rows
 
 
+# ── 参考文献条目：**只译标题**（决策㊹，2026-09-17）──────────────────────────
+# 宿主：「参考文献没有翻译」→ 选 **B**：**只译文献标题**，作者名/期刊名/DOI 保留原文。
+#
+# 与表格同型：**送一条、要一条**（JSON），合格与否由**程序**判，不由模型自称。
+# 为什么不能让正文那条 HTML 通道顺便译：它按块送整段文字、要整段译文 ——
+# 送一条文献过去，回来的就是"作者名也译了"的整条（作者名一译，这条文献就检索不到了）。
+REFS_SYSTEM = SYSTEM_PROMPT + """
+关于**参考文献条目**（本轮的输入就是**一条完整的文献条目**，不是普通段落）：
+- **只译文献标题**；其余一律**原样照抄**：作者姓名、期刊/会议名、卷期页码、年份、
+  出版社、DOI/URL —— 读者要靠它们去检索，译成中文就没用了。
+- 输出必须是**一个 JSON 对象**，且**只有 JSON**（不要 markdown 围栏、不要解释文字）：
+  {"title_en": "<条目里的英文标题，逐字照抄>", "title_zh": "<标题的中文译文>"}
+- `title_en` 必须是输入里**确实存在**的一段（PDF 抽出的行末断词连字符可留可去，
+  其余一个字都不能改）：程序要拿它回原文里定位标题的位置。
+- `title_zh` 只写标题本身：不带条目编号、不带书名号、不带「译：」之类前缀、不带末尾句点，
+  也不要把作者名/期刊名/DOI 抄进来。
+- 条目里有 PDF 抽取噪声（DOI 里多出空格、`%nie&ek` 这类错字）：**照抄原文，不许凭猜补字**。
+"""
+
+_RE_CJK = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]")
+_RE_URLISH = re.compile(r"https?://|doi\.org|\bdoi:\s*10\.|arXiv:", re.I)
+_RE_WS = re.compile(r"\s+")
+
+
+def fold_for_match(text: str) -> tuple[str, list[int]]:
+    """归一化用于**定位**：大小写折叠 + 空白压平 + 行末断词的连字符可省。
+
+    返回 `(归一化串, 每个字符在原串里的下标)`。折叠掉的字符（连字符）不在下标表里，
+    所以下标表与原串仍是**一一对应**的 —— 定位结果是原串上的真实区间。
+    ⚠️ 只用来把模型回抄的标题对回原文坐标；**产物里的文字一个字都不改**。
+
+    为什么要"连字符可省"（2026-09-17 真数据实测）：PDF 抽出来的参考文献里行末断词
+    有两种**同时存在**的形状 —— `man-` + `ufacturing`（连字符后**直接**接字母）与
+    `addi-` + ` tive`（连字符后还留着一个空格）。模型回抄标题时一律顺手拼成一个词
+    （`manufacturing` / `additive`），**两侧都折叠才比得上**。
+    ⚠️ 折叠是对**双方**做的，所以连字符全部折叠也不会把匹配放宽到"另一个词"上：
+    `Laser-directed` 两侧同样折成 `laserdirected`，仍只与它自己匹配。
+    """
+    out: list[str] = []
+    idx: list[int] = []
+    i, n = 0, len(text or "")
+    while i < n:
+        c = text[i]
+        if c.isspace():
+            j = i
+            while j < n and text[j].isspace():
+                j += 1
+            out.append(" ")
+            idx.append(i)
+            i = j
+            continue
+        if c == "-" and i and text[i - 1].isalnum():
+            # 行末断词：`-` 后面可能紧跟字母，也可能先隔一个换行留下的空白
+            j = i + 1
+            while j < n and text[j].isspace():
+                j += 1
+            if j < n and text[j].isalnum():
+                i = j                                 # 连字符与它后面的空白一起折叠掉
+                continue
+        out.append(c.lower())
+        idx.append(i)
+        i += 1
+    return "".join(out), idx
+
+
+def title_span(entry: str, title_en: str) -> tuple[int, int] | None:
+    """`title_en` 在 `entry` 里的字符区间 `[start, end)`；定位不到返回 `None`。"""
+    want, _ = fold_for_match(title_en)
+    want = want.strip()
+    if not want:
+        return None
+    got, idx = fold_for_match(entry)
+    k = got.find(want)
+    if k < 0:
+        return None
+    return idx[k], idx[k + len(want) - 1] + 1
+
+
+def ref_zh_text(entry: str, title_en: str, title_zh: str) -> tuple[str, str]:
+    """模型回的标题 → `(中文文本, 不合格原因)`（原因非空即不合格，中文文本为空串）。
+
+    合格 = 原条目里**把标题那一段换成中文**的那一版（作者/期刊/DOI 逐字保留）。
+    护栏四道，每道对应一种**可判定**的坏结果：
+
+    | 判据 | 挡住的坏结果 |
+    |---|---|
+    | `title_zh` 有中文 | 模型空手回来 / 把标题照抄成英文 |
+    | `title_zh` 不含 DOI/URL | 模型把**整条**文献都译了（作者名一译就没法检索） |
+    | `title_en` 能在条目里定位 | 模型改写了标题（定位是硬要求：中文栏靠它替换） |
+    | 标题不占满整条、中文不过长 | 同上（把整条当成"标题"） |
+
+    ⚠️ 最后一条是**长度**判据而不是语义判据：它只挡"整条被当成标题"这一种可测的形状，
+    标题译得好不好，仍然只能由人看（阅读器的块级修订兜底，决策⑯）。
+    """
+    zh = _RE_WS.sub(" ", (title_zh or "").strip())
+    en = (title_en or "").strip()
+    if not zh:
+        return "", "没有 title_zh"
+    if not _RE_CJK.search(zh):
+        return "", "title_zh 里没有中文"
+    if _RE_URLISH.search(zh):
+        return "", "title_zh 里混进了 DOI/URL（像是把整条都译了）"
+    if not en:
+        return "", "没有回抄 title_en（定位不到标题）"
+    span = title_span(entry, en)
+    if span is None:
+        return "", f"title_en 在条目里定位不到：{en[:60]!r}"
+    start, end = span
+    flat = _RE_WS.sub(" ", (entry or "").strip())
+    if end - start >= 0.9 * len(flat):
+        return "", "标题占了整条条目（像是把整条都当成标题译了）"
+    if len(zh) > 2.5 * (end - start) + 60:
+        return "", "中文标题过长（像是把整条条目都译了）"
+    # 标题若把原文的句点一起抄回来了，替换后要把它补回去 —— 否则
+    # `… (2024) 中文标题 Metals 14(2):195.` 少一个分隔符（期刊名会粘上来）。
+    tail = entry[end - 1] if entry[end - 1] in ".。" else ""
+    return _RE_WS.sub(" ", (entry[:start] + zh + tail + entry[end:]).strip()), ""
+
+
 class Translator:
     def __init__(self, cfg: LLMConfig, glossary: list[dict] | None = None,
-                 *, table_retry: int = 1) -> None:
+                 *, table_retry: int = 1, ref_retry: int = 1) -> None:
         self.cfg = cfg
         self.glossary = glossary or []
         self.system = SYSTEM_PROMPT          # 子类（Latexizer）可换一套 system prompt
         self._table_retry = max(0, int(table_retry))
+        self._ref_retry = max(0, int(ref_retry))
         self.tokens_used = 0
         self.needs_review: list[str] = []   # 重试后仍不合格的块 → 交阅读器按需修订（决策⑯）
 
@@ -247,10 +368,12 @@ class Translator:
     ) -> list[str]:
         """翻译并回填 `zh`；对校验不合格的块**只重译该块**（决策④）。
 
-        两道「不烧冤枉钱」的过滤：
-        - **免中文块**（参考文献/公式，决策③ 的 prompt 规则 5）根本不送模型 —— 这篇论文里
-          参考文献占正文 26%，送过去只会被判「漏译」再重译，纯烧钱；
-        - `zh_source == "human"` 的块**不覆盖**（决策⑯：重跑不得冲掉人工修订）。
+        三道「不烧冤枉钱」的过滤：
+        - **免中文块**（参考文献**碎片**/公式/装饰图，决策③ 的 prompt 规则 5）根本不送模型 ——
+          这篇论文里参考文献占正文 26%，送过去只会被判「漏译」再重译，纯烧钱；
+        - `zh_source == "human"` 的块**不覆盖**（决策⑯：重跑不得冲掉人工修订）；
+        - 表格与**完整的参考文献条目**（`ref`）各走自己的通道（见模块里 `TABLE_SYSTEM`
+          与 `REFS_SYSTEM` 的说明）：表格送网格、要网格；文献条目**只译标题**。
         """
         all_texts: dict[str, str] = {}
         ordered = self.ordered(blocks)
@@ -259,12 +382,18 @@ class Translator:
                 and (only is None or b.id in only)]
         # 注意：上下文仍取自**完整** ordered，只有待翻集合被收窄（断点续跑不影响上下文质量）
 
-        # 表格与正文走**两条通道**（见模块里 `TABLE_SYSTEM` 的说明）：表格送网格、要网格，
-        # 正文送带标记的 HTML。混在一起送会让模型把 `<td>` 的边界当成排版噪声。
+        # 表格 / 参考文献条目与正文走**三条通道**（见模块里 `TABLE_SYSTEM`、`REFS_SYSTEM`
+        # 的说明）：混在一起送会让模型把 `<td>` 的边界当成排版噪声、
+        # 把文献条目的作者名也一并译掉。
         tables = [b for b in todo if b.type == "table"]
-        todo = [b for b in todo if b.type != "table"]
+        refs = [b for b in todo if b.type == "ref"]
+        todo = [b for b in todo if b.type not in ("table", "ref")]
         for b in tables:
             zh = self._translate_table(b, log=log)
+            if zh:
+                all_texts[b.id] = zh
+        for b in refs:
+            zh = self._translate_ref(b, log=log)
             if zh:
                 all_texts[b.id] = zh
 
@@ -273,8 +402,8 @@ class Translator:
         # 「进度」必须能回答"还剩多少"：只打「切片 3」看不出是 3/45 还是 3/4
         # （生产汇报「一直显示转换中」时，日志里连总数都没有，无从判断是否在进行）。
         log(
-            f"  · 翻译开始：{len(todo) + len(tables)}/{len(ordered)} 块需翻译"
-            f"（含表格 {len(tables)} 张），共 {len(chunks)} 个切片"
+            f"  · 翻译开始：{len(todo) + len(tables) + len(refs)}/{len(ordered)} 块需翻译"
+            f"（含表格 {len(tables)} 张、参考文献 {len(refs)} 条），共 {len(chunks)} 个切片"
             f"（{sum(len(b.en) for b in todo)} 字符）"
         )
         for ci, chunk in enumerate(chunks, start=1):
@@ -316,9 +445,12 @@ class Translator:
                     log(f"    ! 重译 {bid} 失败：{exc}")
 
         # ── 收敛保证：重试额度用尽后不再纠缠，留痕交给阅读器的块级修订（决策⑯）──
-        # 表格的"合格"判据是**形状 + 有没有中文**（`_table_bad`），与正文的文本判据不同，
-        # 所以并进来一起收尾 —— 两处各留一份 needs_review 会导致界面上"待校对"数目对不上。
-        self.needs_review = self._check(todo, all_texts) + [b.id for b in tables if self._table_bad(b)]
+        # 表格的"合格"判据是**形状 + 有没有中文**（`_table_bad`）、参考文献条目是
+        # **有没有中文标题**（`_ref_bad`），都与正文的文本判据不同，
+        # 所以并进来一起收尾 —— 三处各留一份 needs_review 会导致界面上"待校对"数目对不上。
+        self.needs_review = (self._check(todo, all_texts)
+                             + [b.id for b in tables if self._table_bad(b)]
+                             + [b.id for b in refs if self._ref_bad(b)])
         for bid in self.needs_review:
             b = next((x for x in ordered if x.id == bid), None)
             if b is not None:
@@ -395,6 +527,44 @@ class Translator:
         if not expects_chinese(b.en, block_type="table"):
             return False                    # 纯数字/符号表：本就不要求中文
         return not re.search(r"[\u4e00-\u9fff]", b.zh or "")
+
+    # ── 参考文献条目（决策㊹）：送一条、要一条，**只译标题** ────────────────
+    def _ref_prompt(self, b: Block) -> str:
+        return (self._glossary_text()
+                + "【需要翻译的参考文献条目】\n" + b.en
+                + "\n\n请按格式要求输出**一个 JSON 对象**（title_en + title_zh）。")
+
+    def _translate_ref(self, b: Block, log=print) -> str:
+        """一条参考文献 → 只译标题：写回 `payload["title_zh"]`/`["title_en"]`，返回中文裸文本。
+
+        中文裸文本 = **原条目里把标题那一段换成中文**（作者/期刊/DOI 逐字保留）——
+        这正是中文栏要显示的东西，也是"只译标题"的可视化：两栏的文字只差标题。
+        不合格就**不写**（`en` 原样回落）并标 `needs_review`，与正文/表格同一套收敛保证。
+        """
+        why = "未调用"
+        for attempt in range(self._ref_retry + 1):
+            try:
+                data = _json_object(self._chat(self._ref_prompt(b), system=REFS_SYSTEM))
+            except Exception as exc:                       # noqa: BLE001 — 网络/接口异常不该炸整篇
+                log(f"    ! 参考文献 {b.id} 翻译调用失败：{exc}")
+                data = None
+            title_en = str((data or {}).get("title_en") or "").strip()
+            title_zh = str((data or {}).get("title_zh") or "").strip()
+            zh, why = ref_zh_text(b.en, title_en, title_zh)
+            if zh:
+                b.payload["title_en"], b.payload["title_zh"] = title_en, title_zh
+                b.zh = zh
+                log(f"    · 参考文献 {b.id} 标题已译：{title_zh[:36]}")
+                return zh
+            if attempt < self._ref_retry:
+                log(f"    ! 参考文献 {b.id} 不合格（{why}），重试 {attempt + 1}")
+        log(f"    ⚠️ 参考文献 {b.id} 重试后仍不合格（{why}）→ 保持英文，标「待校对」")
+        return ""
+
+    @staticmethod
+    def _ref_bad(b: Block) -> bool:
+        """文献条目是否没译出标题（与 `_table_bad` 同一取向：收敛后仍不合格才判）。"""
+        return not _RE_CJK.search(b.zh or "")
 
     # ── 分块 / 判定 ───────────────────────────────────────────────────────
 

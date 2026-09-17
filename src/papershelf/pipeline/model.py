@@ -11,8 +11,12 @@ from dataclasses import dataclass, field, asdict
 from typing import Any, Literal
 
 BlockType = Literal[
-    "meta", "abstract", "h1", "h2", "h3", "h4", "p", "figure", "table", "eq", "refs"
+    "meta", "abstract", "h1", "h2", "h3", "h4", "p", "figure", "table", "eq",
+    "refs", "ref", "deco"
 ]
+# `refs` = 文末参考文献区里**尚未切出条目**的碎片块（整块免中文，见 `validate.NO_ZH_TYPES`）；
+# `ref`  = **一条完整的文献条目**（v13，`parse.merge_ref_entries`）—— 它**只译标题**：
+#          作者/期刊/卷期页/DOI 一律保留原文（`zh` = 原条目里把标题换成中文的那一版）。
 
 # 中文译文的来源，用于决策⑯ 的「重跑不覆盖人工修订」
 ZhSource = Literal["none", "mt", "human"]

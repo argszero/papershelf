@@ -41,10 +41,21 @@ _CJK_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]")
 _DIGIT_RE = re.compile(r"\d+(?:\.\d+)?")
 _WORD_RE = re.compile(r"[A-Za-z]{3,}")
 
-# 按 prompt 规则**本就应保持英文**的块类型：参考文献条目、纯公式、
+# 按 prompt 规则**本就应保持英文**的块类型：参考文献碎片、纯公式、
 # 以及页边装饰块（`deco` = 出版社/期刊标识的透明 PNG，见 `parse._add_graphic` ——
 # 它压根没有文字，要求它"有中文"会立刻变成一场永不收敛的重译）
 NO_ZH_TYPES = {"refs", "eq", "deco"}
+# **部分中文**块（v13）：整块的字面文本只有一部分是译文 —— 参考文献条目（`ref`）
+# **只译标题**，作者/期刊/卷期页/DOI 按决策保留原文。于是：
+# - 「疑似漏译」判定照旧适用（中文那栏必须有 CJK，否则就是标题没译出来）；
+# - **数字/编号比对不适用**（中文栏里那串数字是原件照抄的，不是译文改写的），
+#   不排除就会给每一条参考文献刷一条「数字不一致」的警告，把真警告淹掉。
+#
+# ⚠️ 这一类必须**随 HTML 走**（`markup` 给它挂 `data-pt="1"`，与 `data-nt` 同一套路）：
+# `validate` 拿到的是**渲染好的 HTML**，只有元素标签与属性，**没有块类型** ——
+# 这里比对过一次 `en.tags`（元素标签），而 `ref` 渲染出来就是 `<p>`，
+# 于是「数字不比对」这条**永远不会生效**（实测：给每条文献刷一条 digit_mismatch）。
+PARTIAL_ZH_TYPES = {"ref"}
 # LaTeX 化之后，「可译散文」的判据：剥掉数学与 LaTeX 命令后**还剩至少 1 个实词**
 MIN_WORDS_FOR_ZH = 1
 # 数学函数名不算散文（否则 "inf u ∈ R^m …" 会被要求译，模型给不出中文 → 死循环）
@@ -92,11 +103,14 @@ def expects_chinese(en_text: str, *, block_type: str = "") -> bool:
     """该块是否**应该**出现中文译文 —— 决定「漏译」判定是否适用。
 
     豁免两类（它们正是「永不收敛重试」的根源）：
-    1. 参考文献条目 / 纯公式块（prompt 明确要求保持英文原样）；
+    1. 参考文献**碎片块** / 纯公式块（prompt 明确要求保持英文原样）；
     2. 剥掉数学/LaTeX 后**不剩任何散文实词**的块 —— 它们是展示公式与符号，
        如 `\\[ \\dot{x} = f(x) + g(x)u \\tag{1} \\]`，本就没有可译的句子。
        注意 `where \\( ... \\)` 这类公式引导语**要译**（剩 "where" 一个实词）。
        （图注与标题例外：它们再短也是正文内容，必须译。）
+
+    ⚠️ `ref`（完整的参考文献条目，v13）**在这里就是"应该有中文"** —— 它只译标题，
+    标题也是必须译出来的内容（见 `PARTIAL_ZH_TYPES`）。
 
     这里的判定**同时**被 translator 用于决定「哪些块需要送模型翻译」，
     两处必须一致，否则又会出现「不译 → 判漏译 → 重译 → 仍不译」的死循环。
@@ -141,6 +155,7 @@ class _BlockTextExtractor(HTMLParser):
         self.texts: dict[str, str] = {}
         self.tags: dict[str, str] = {}     # 块 ID → 元素标签（判定「图注」需要）
         self.nt: set[str] = set()          # 带 data-nt 的块 = 不要求中文
+        self.partial: set[str] = set()     # 带 data-pt 的块 = **部分中文**（见 PARTIAL_ZH_TYPES）
         self._stack: list[str | None] = []
 
     def handle_starttag(self, tag, attrs):
@@ -154,6 +169,8 @@ class _BlockTextExtractor(HTMLParser):
             self.tags[bid] = tag
             if d.get("data-nt"):
                 self.nt.add(bid)
+            if d.get("data-pt"):
+                self.partial.add(bid)
             self._stack.append(bid)
         else:
             self._stack.append(None)
@@ -380,7 +397,10 @@ def validate(en_html: str, zh_html: str, *, check_digits: bool = True) -> Report
         # 漏译：英文块有实际内容，而中文块毫无 CJK 字符
         if len(en_txt.strip()) > 40 and not _CJK_RE.search(zh_txt):
             r.untranslated.append(b)
-        if check_digits:
+        if check_digits and b not in en.partial:
+            # `PARTIAL_ZH_TYPES`（参考文献条目）里那串数字是**原件照抄**的（作者/卷期页/DOI
+            # 本来就保留原文），与"译文改写了数字"是两回事 —— 不排除就会给每一条文献
+            # 刷一条警告，把真警告淹掉。判据取自 HTML 上的 `data-pt`（见 `PARTIAL_ZH_TYPES`）。
             if _TAG_NUM_RE.findall(en_txt) != _TAG_NUM_RE.findall(zh_txt):
                 r.tag_mismatch.append(b)
             elif _DIGIT_RE.findall(en_txt) != _DIGIT_RE.findall(zh_txt):

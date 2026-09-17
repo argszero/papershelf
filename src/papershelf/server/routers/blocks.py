@@ -118,9 +118,14 @@ def retranslate_block(paper_id: int, block_id: str,
     # 阅读器真正渲染的东西（决策㊴）。翻译器把它写在了**内存里的那个 Block 副本**上，
     # 而这里是"取库里的行 → 拼 Block → 翻译 → 单列回写"，副本一丢网格就没了 ——
     # 表现是「重译此块」后中文照旧是英文（重译了、但渲染用的网格没变）。
+    # 参考文献条目（`ref`）同理：`title_zh` 是"这条译了什么"的记录，一起回写。
     patch: dict[str, Any] = {"reconciled": True}
     if target_block.type == "table":
         for k in ("rows_zh", "caption_zh"):
+            if k in target_block.payload:
+                patch[k] = target_block.payload[k]
+    elif target_block.type == "ref":
+        for k in ("title_en", "title_zh"):
             if k in target_block.payload:
                 patch[k] = target_block.payload[k]
     update_block(conn, paper_id, block_id, zh=new_zh, zh_source="mt", payload_patch=patch)

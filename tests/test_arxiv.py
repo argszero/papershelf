@@ -88,9 +88,26 @@ def test_inline_math_uses_native_alttext(doc):
     assert any("Attention" in b.en for b in doc.blocks)     # 正文可用
 
 
-def test_references_are_kept_english(doc):
-    refs = [b for b in doc.blocks if b.type == "refs"]
+def test_references_become_ref_blocks(doc):
+    """arXiv 的 `<li id="bib…">` **天然一条一块** → 直接是 `ref`（完整条目）。
+
+    决策㊹（2026-09-17）：`ref` **参与翻译，但只译标题**；`refs` 只留给
+    「切不出条目的碎片」（PDF 路线才有那种碎片，arXiv 没有）。
+    """
+    refs = [b for b in doc.blocks if b.type == "ref"]
     assert refs and refs[0].en.strip()
+    assert refs[0].en.startswith("[1]") or "Vaswani" in refs[0].en, refs[0].en[:80]
+    assert not [b for b in doc.blocks if b.type == "refs"], "arXiv 条目不该落回 `refs` 碎片类型"
+
+
+def test_references_are_expected_to_have_chinese(doc):
+    """`ref` **不是**免中文块：标题必须译出来（否则就是 ㊹ 要修的那个缺陷本身）。"""
+    from papershelf.pipeline.validate import NO_ZH_TYPES, expects_chinese
+
+    refs = [b for b in doc.blocks if b.type == "ref"]
+    assert refs
+    assert "ref" not in NO_ZH_TYPES
+    assert expects_chinese(refs[0].en, block_type="ref"), "参考文献条目的标题没被要求译出来"
 
 
 def test_blocks_are_sequentially_numbered(doc):

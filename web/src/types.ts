@@ -8,7 +8,14 @@
 
 export type BlockType =
   | 'meta' | 'abstract' | 'h1' | 'h2' | 'h3' | 'h4'
-  | 'p' | 'figure' | 'table' | 'eq' | 'refs'
+  | 'p' | 'figure' | 'table' | 'eq'
+  /** 参考文献区里**尚未切出条目**的碎片块：整块保持原文（服务端 `validate.NO_ZH_TYPES`），
+   *  中文栏回落英文 —— 前端据此「单栏横跨」。 */
+  | 'refs'
+  /** **一条完整的文献条目**（解析 v13，`parse.merge_ref_entries`）：**只译标题**，
+   *  作者/期刊/卷期页/DOI 保留原文，所以中文栏 = "原条目 + 中文标题"（两栏只差标题）。
+   *  ⚠️ 它**不是** `no_zh`：译出来了就有中文栏，没译出来（`zh` 为空）才单栏横跨。 */
+  | 'ref'
   /** 页边装饰图（v11）：出版社/期刊的**矢量标识**栅格化成的透明 PNG
    *  （`parse._margin_graphics`）。没有文字、免中文、不参与校验。 */
   | 'deco'
@@ -26,7 +33,9 @@ export interface Block {
   payload: Record<string, unknown>
   /** 校验/重试后仍存疑 → 显示「待校对」徽标（决策⑯ 的兜底入口） */
   needs_review: boolean
-  /** 免中文块（refs / 纯公式）→ 单栏横跨，不参与左右配对 */
+  /** 免中文块（`refs` 碎片 / 纯公式 / 装饰图）→ 单栏横跨，不参与左右配对。
+   *  ⚠️ `ref`（完整文献条目）**不算**免中文块 —— 它只译标题，没译出来时
+   *  前端按 `zh` 为空自行走单栏横跨（不是靠这个字段）。 */
   no_zh: boolean
   /** **只有表格块**有：中文网格是否真的可用（形状一致 + 不是逐格照抄英文）。
    *  对照模式据此决定渲不渲右边那张中文表 —— 判据在服务端（`model.table_zh_usable`），

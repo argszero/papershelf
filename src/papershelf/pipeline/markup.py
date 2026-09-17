@@ -19,7 +19,7 @@ import re
 
 from .mathml import mathml_css, render_math, render_math_block
 from .model import Block, Doc, table_caption, table_cells, table_layout
-from .validate import NO_ZH_TYPES
+from .validate import NO_ZH_TYPES, PARTIAL_ZH_TYPES
 
 CSS = """
 :root{--ink:#1a1a1a;--accent:#2f5d7a;--rule:#d8d2c4;--bg-abstract:#f3f7fa}
@@ -99,9 +99,9 @@ def _esc(s: str) -> str:
 # 看起来像重复段落。PDF 里它是 8.5pt（正文 10pt）的灰字，所以这里就把它渲成
 # **稍小 + 灰**，并在它那一侧补回那条线（矢量线此前一条都不在产物里）。
 #
-# ⚠️ 页边带的字号/颜色只作用于 `p`/`refs`（`_BAND_TYPES`）：标题有自己的字号层级，
+# ⚠️ 页边带的字号/颜色只作用于 `p`/`refs`/`ref`（`_BAND_TYPES`）：标题有自己的字号层级，
 #    万一有个真标题落在页顶带里，也不该被压成灰字。横线则与块类型无关。
-_BAND_TYPES = ("p", "refs")
+_BAND_TYPES = ("p", "refs", "ref")
 
 #: PDF stroke 颜色（`parse._hex_color` 产出）—— 只有这个形状允许进 HTML 属性
 _RE_HEX_COLOR = re.compile(r"#[0-9a-fA-F]{6}")
@@ -394,8 +394,10 @@ def render_block(b: Block, *, lang: str, marker: bool = True, typeset: bool = Fa
     阅读器要自己渲 `<h2 class="doc-h lvlN" data-b=…>`（挂块 id 与字号层级），
     若再塞一份服务端的 `<h2>`，CSS 之外还会得到 `<h2><h2>` —— 浏览器会把内层甩出去。
 
-    免中文块（参考文献/公式，见 `validate.NO_ZH_TYPES`）在中文视图里**回落英文原文**，
+    免中文块（参考文献碎片/公式，见 `validate.NO_ZH_TYPES`）在中文视图里**回落英文原文**，
     并标 `data-nt="1"` —— 这样校验器不会把它们误判为「漏译」。
+    `ref`（完整文献条目，只译标题）是**另一回事**：译出来了就要求中文那栏真有中文
+    （`data-nt` 只在**没译出来**时挂 —— 否则 "这一条没译" 会被静默豁免）。
 
     `marks` 是**本块本语言**的划痕（`[{id, lang, start, end, color}]`，见 `prose_html`）：
     只有阅读器/分享页会传（它们要可标注），**导出与校验不传**
@@ -406,13 +408,18 @@ def render_block(b: Block, *, lang: str, marker: bool = True, typeset: bool = Fa
     （后者会让翻译/LaTeX 化 prompt 拿到 HTML 标签，既烧钱又必然出错）。
     **给人看的渲染点必须显式传 `typeset=True`。**
     """
-    nt = b.type in NO_ZH_TYPES
+    nt = b.type in NO_ZH_TYPES or (b.type == "ref" and not (b.zh or "").strip())
     # 中文视图：没有译文时**回落英文原文**，绝不渲染空白
     # （否则 dual 视图会出现整块右栏空着的洞、单语导出也会缺内容）
     text = (b.en if lang == "en" else (b.zh or b.en)) or ""
     if not typeset and lang != "en" and not (b.zh or "").strip():
         text = b.en
-    attr = f' data-b="{b.id}"' + (' data-nt="1"' if nt else "") if marker else ""
+    # `data-pt`（**部分中文**块，见 `validate.PARTIAL_ZH_TYPES`）：它跟 `data-nt` 一样
+    # 必须随 HTML 走 —— 校验器拿到的只有 HTML，没有块类型，不挂这个戳
+    # 「中文栏里的数字是原件照抄的」这条豁免就永远不生效（`ref` 渲染出来是 `<p>`）。
+    pt = b.type in PARTIAL_ZH_TYPES
+    attr = (f' data-b="{b.id}"' + (' data-nt="1"' if nt else "")
+            + (' data-pt="1"' if pt else "")) if marker else ""
     t = b.type
     mine = [m for m in (marks or []) if m.get("lang") == lang]
     # 版面装饰类（页边带 + 页边横线 + 装饰图）与线的颜色/粗细；**只给人看的渲染**挂
@@ -508,9 +515,10 @@ def render_block(b: Block, *, lang: str, marker: bool = True, typeset: bool = Fa
             )
             body.append(f"<tr>{inner}</tr>")
         return f"{elem('table', 'datatable')}{cap_html}{''.join(body)}</table>"
-    if t == "refs":
+    if t in ("refs", "ref"):
         # 同标题：参考文献条目也是可选中的文字（宿主常在上面标"这篇要读"），
         # 走 `prose()` 才有锚点与 `<mark>`；`typeset=False` 时输出与 `_esc()` 逐字相同。
+        # `refs` = 尚未切出条目的碎片块，`ref` = 一条完整文献（只译标题，见 `model.BlockType`）。
         return f"{elem('p', 'ref-item')}{prose(text)}</p>"
     if t == "eq":
         latex = b.payload.get("latex", "") or text

@@ -17,7 +17,7 @@ from typing import Any, NamedTuple
 
 import fitz  # PyMuPDF
 
-from .model import Doc, make_block_id
+from .model import Block, Doc, make_block_id
 
 log = logging.getLogger("papershelf.pipeline.parse")
 
@@ -83,7 +83,12 @@ log = logging.getLogger("papershelf.pipeline.parse")
 #         认领时，那个老式 `pending_figure` 没被复位，于是**下一页**以 "Table N" 起头
 #         的表注撞进"给上一个图当图注"的分支，而那个图已有图注 → 整行被 `continue` 丢掉
 #         （实测 8 页稿 `Table 2 …` 在任何块里都不存在，①c 只能如实报"表注在抽取中丢失"）。
-PARSE_VERSION = 12
+#   v13 → **参考文献碎片合并成整条条目**（`merge_ref_entries`，宿主 2026-09-17：
+#         「参考文献没有翻译」→ 决策「只译文献标题」）。原先文末材料只按"从 REFERENCES
+#         起标 `refs`"处理，条目被 PyMuPDF 的块检测切成一堆 ~200 字符的碎片
+#         （切口常落在**词中间**，一块里还常塞着下一条的前半截）：既没法译标题，
+#         读者看到的也不是"一条文献"。现在切出**整条** → 新块类型 `ref`（只译标题）。
+PARSE_VERSION = 13
 
 # 页面上下边缘（比例），落在其中的短文本块视为页眉/页脚候选
 EDGE_TOP, EDGE_BOTTOM = 0.075, 0.925
@@ -207,6 +212,17 @@ _RE_REF_START = re.compile(r"^\s*\[\d{1,3}\]")
 REFS_TAIL_FRACTION = 0.35   # 参考文献只可能出现在文末这段区间之后
 MIN_REFS_RUN = 8            # 文末连续命中该数目的块才算参考文献段
 
+# ── 参考文献条目起点（v13，见 `split_ref_entries`）──────────────────────────
+# 两种主流编号：IEEE 的 `[12]`，以及 Springer/Vancouver 的 `12. `。
+# ⚠️ `12. ` 这条**必须带"后面是大写字母"的判据**：光看 `\d{1,3}\.\s` 会把 DOI 的碎片
+# 全抓进来（实测这篇的 `10. 3390/ met14 020195`、`11. 1117/1. Oe.` 全中）——而
+# DOI 编号后面跟的是数字。`(?<![\w.,])` 则挡住长数字串的**尾巴**
+# （`2053- 1591` 不许从中间切出一个 `1591.`）。
+_RE_REF_BRACKET = re.compile(r"\[(\d{1,3})\]\s+")
+_RE_REF_NUM = re.compile(r"(?<![\w.,])(\d{1,3})\.\s+(?=[A-Z\u00c0-\u024f\"“'‘])")
+# 合并出的单条条目**上限**：超过它说明编号判据中途失效（后面的条目全被吞进最后一条），
+# 宁可放弃合并也不产出一块两千字的"条目"。
+_REF_MAX_ENTRY = 2000
 
 
 def _spans(block: dict[str, Any]) -> list[dict[str, Any]]:
@@ -1010,6 +1026,138 @@ def merge_math_runs(blocks: list[Any]) -> list[Any]:
     return blocks
 
 
+# ── 参考文献条目（v13）──────────────────────────────────────────────────────
+# 宿主 2026-09-17：「参考文献没有翻译」→ 定「**只译文献标题**，作者名/期刊名/DOI 保原文」。
+# 要译标题，先得**有一条完整的条目**：PDF 抽出来的参考文献是一条连续文字流，
+# 被 PyMuPDF 的块检测按**栏 / 行组**切成一堆 ~200 字符的碎片，而且切口经常落在
+# **词中间**（实测：`… Metal additive man-` + `ufacturing (MAM) applications …`，
+# 一块里还常常塞着下一条的**前半截**）。碎片块既没法喂给翻译通道
+# （送"半个条目"过去，模型只能编一个标题出来），读者看到的也不是"一条文献"。
+#
+# 所以这里做**纯结构**的合并：把碎片按阅读顺序接成一条流 → 按条目编号切成整条 →
+# 每块一个 `ref` 块。判定与内容都**只用已经抽出来的文字**，不碰 PDF、不调模型。
+def _join_ref_fragments(parts: list[str]) -> str:
+    """把碎片按阅读顺序接成一整条流 —— **只动空白，一个字符都不增删**。
+
+    接缝规则只有三条，都来自实测形状：
+    - 上一片以 `-` 结尾（行末断词/行末连字符）→ 直接接，**不插空格也不删连字符**：
+      `man-` + `ufacturing` → `man-ufacturing`，`Laser-` + `directed` → `Laser-directed`。
+      ⚠️ 这里**故意不"补回断词"**（不把 `man-ufacturing` 拼成 `manufacturing`）：
+      PDF 里"断词连字符"与"词内连字符"长得**一模一样**（`Laser-directed` 就是反例），
+      猜错就是凭空改字。看图能判的是 ①c 校对 agent（它本来就有 `行末断词` 提示），
+      这里只做"不丢字、不加字"的拼接。
+    - 任一侧已有空白（PDF 换行处通常留着尾随空格）→ 直接接。
+    - 两侧都是非空白字符 → 补**一个**空格（否则两个词会粘成一个）。
+    """
+    out = ""
+    for p in parts:
+        if not out:
+            out = p
+            continue
+        if out.endswith("-") and p[:1].isalpha():
+            out += p
+        elif out[-1:].isspace() or p[:1].isspace():
+            out += p
+        else:
+            out += " " + p
+    return out
+
+
+def _ref_entry_starts(stream: str) -> list[int]:
+    """条目起点在流里的下标（**只认连号**的候选）。
+
+    两层判据，缺一不可：
+    ① 形状：`[N] ` 或 `N. ` + 大写字母起头（两种编号风格分别试，取命中多的那个）；
+    ② **连号**：条目编号在原文本就是 1,2,3… 连续的 —— 把"连号"当判据才能真正挡住
+       正文里那些长得像编号的东西（逗号后的年份、DOI 里的 `10.`）。
+       允许跳一号（原件偶有漏号），跳两号以上即停止认（剩下的全归最后一条）。
+    """
+    best: list[int] = []
+    for pattern in (_RE_REF_BRACKET, _RE_REF_NUM):
+        starts: list[int] = []
+        want = 1
+        for m in pattern.finditer(stream):
+            num = int(m.group(1))
+            if num in (want, want + 1):
+                starts.append(m.start())
+                want = num + 1
+        if len(starts) > len(best):
+            best = starts
+    return best if len(best) >= 2 else []
+
+
+def split_ref_entries(stream: str) -> tuple[str, list[str]] | None:
+    """参考文献文字流 → `(条目 1 之前的前导文字, [整条条目…])`；切不出来则 `None`。
+
+    ⚠️ 只做**切分**：把流按起点下标切开、每段压平空白。各段拼回去必须等于原流
+    （`tests/test_refs.py` 钉住了这条"一个字都不许丢"）。
+    """
+    starts = _ref_entry_starts(stream)
+    if not starts:
+        return None
+    texts = []
+    for i, pos in enumerate(starts):
+        end = starts[i + 1] if i + 1 < len(starts) else len(stream)
+        text = " ".join(stream[pos:end].split())
+        if text:
+            texts.append(text)
+    if not texts or max(len(t) for t in texts) > _REF_MAX_ENTRY:
+        return None                      # 编号判据中途失效 → 放弃合并，保持原样
+    return (" ".join(stream[:starts[0]].split()), texts)
+
+
+def merge_ref_entries(blocks: list[Any], from_index: int) -> list[Any]:
+    """把 `blocks[from_index:]`（文末材料段）里的参考文献碎片合并成 `ref` 块。
+
+    - 只有 `refs` 类型、且**没有页眉/页脚戳**（`payload["band"]`）的块参与合并：
+      页眉恰好落在参考文献那两页时也会被 3c 打成 `refs`，把它接进来会污染条目。
+    - 连续的碎片算一段；段与段之间隔着别的块（图/表）→ 各段独立合并。
+    - 段里切不出条目（没有编号，或编号判据中途失效）→ **原样返回那一段**，
+      不产出一个两千字的"条目"，也不丢字。
+    """
+    head, tail = blocks[:from_index], blocks[from_index:]
+    out: list[Any] = []
+    run: list[Any] = []
+
+    def flush() -> None:
+        if run:
+            out.extend(_merge_ref_run(run))
+            run.clear()
+
+    for b in tail:
+        if b.type == "refs" and not (b.payload or {}).get("band"):
+            run.append(b)
+        else:
+            flush()
+            out.append(b)
+    flush()
+    return head + out
+
+
+def _merge_ref_run(run: list[Any]) -> list[Any]:
+    """合并一段连续的参考文献碎片；切不出条目时**原样**返回。"""
+    first = run[0]
+    stream = _join_ref_fragments([b.en for b in run])
+    split = split_ref_entries(stream)
+    if split is None:
+        log.info("  · 参考文献区 %d 个碎片块切不出条目（无编号/编号不连续）→ 保持原样", len(run))
+        return run
+    leading, texts = split
+    # 条目继承首片的 `page`（分页容器按它归页）与其余版面戳；`seam`（栏间续段戳）
+    # 合并后已无意义 —— 它描述的是"与前一块的关系"，而前一块已经并进来了。
+    payload = {k: v for k, v in (first.payload or {}).items() if k != "seam"}
+    payload["ref_fragments"] = len(run)
+    out: list[Any] = []
+    if leading.strip():                  # 条目 1 之前若还有文字，单独留一块（绝不吞）
+        out.append(Block(id=first.id, type="refs", en=leading, section=first.section,
+                         payload=dict(payload)))
+    for text in texts:
+        out.append(Block(id="", type="ref", en=text, section=first.section,
+                         payload=dict(payload)))
+    log.info("  · 参考文献 %d 个碎片块 → %d 条（%s）", len(run), len(texts), first.id)
+    return out
+
+
 def _desmallcaps(text: str) -> str:
     """修复小型大写字母在文本提取时产生的伪空格（仅用于标题）。
 
@@ -1513,8 +1661,12 @@ def _finalize(doc: Doc) -> Doc:
         for b in kept[ref_start + 1:]:
             if b.type in ("p", "refs"):
                 b.type = "refs"
+        # 3c-2) 把碎片合并成**整条**条目（v13）：`refs` = 尚未切出条目的碎片（免中文），
+        #       `ref` = 一条完整文献（只译标题，见 `merge_ref_entries`）。
+        kept = merge_ref_entries(kept, ref_start + 1)
         doc.meta["refs_start"] = head.id
-        doc.meta["refs_count"] = sum(1 for b in kept[ref_start + 1:] if b.type == "refs")
+        doc.meta["refs_count"] = sum(1 for b in kept[ref_start + 1:]
+                                     if b.type in ("refs", "ref"))
 
     # 3d) 图注并入 en 字段：图注也是正文内容，必须走「标记穿透」翻译通道，
     #     否则中文版会留下英文图注（且会被校验器判成漏译）。图片本体另行由 payload.src 渲染。
