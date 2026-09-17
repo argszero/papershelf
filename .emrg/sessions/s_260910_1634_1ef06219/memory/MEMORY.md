@@ -255,7 +255,7 @@ DB 与 `.env` 部署前已备份。生产实测（宿主数据 paper 2）：`pro
 生产验收改用「取 `papershelf_session` cookie → curl PATCH → 查库 + 硬刷 UI」，
 **诚实边界**：那验的是服务端逻辑 + 前端渲染，真实滚轮那一段只在本地验过。
 
-_Last updated: 2026-09-17T15:45:00+08:00_
+_Last updated: 2026-09-17T16:20:00+08:00_
 
 ### 最近一轮（2026-09-16 晚）㊳ 标题行也能划重点 / 加笔记（宿主 19:14 截图报告）
 
@@ -454,3 +454,23 @@ bundle `index-D9a7YvYN.js` / 日志零 error；CSS 三条装饰规则实测在�
   `Message may have string 'sessionId' property` ⇒ 用 `js("location.reload()")`；
   本地会话过期会跳 `/login?next=…` ⇒ `fill_input("#liEmail"/"#liPass")` + 点 `.btn-primary` 重登。
 - **待宿主**：推 + 上生产（`PARSE_VERSION` → 11 ⇒ 生产存量要吃修复得宿主自己点「重新提取」）。
+
+### 同一轮：**已上生产**（2026-09-17 16:1x，宿主「要」）
+
+`5769900` → CI run `35195781106` 六 job 全绿 → `latest`/`sha-5769900` 双 200 →
+`docker compose pull app`（**又撞慢层**：15:45 起、`Retrying` 重下 21.4MB、16:09 完成 ≈24 分钟；
+`nohup` + 轮询照旧）+ `up -d app`：
+`revision=57699004f96ec2cd9f29d832ac868e71ec9696f9` / healthy / 公网 200 /
+bundle `index-8YofT6DN.js` + `index-lPIbuEdh.css`（与本地构建产物 `cmp` 一致）/ 日志零 error。
+DB 与 `.env` 事前已备份（`/tmp/*.bak.20260917-154522`）。
+
+**验收（两分开说）**：① 部署/代码 ✅ —— 容器内直调 `PARSE_VERSION=11` + 合成块渲染断言
+（`--rule-c/--rule-w`、`deco-bottom deco-left`、`width:61px`、`--shade-c`，`typeset=False` 干净）；
+生产真浏览器量 `styleSheets` 三条规则在位 + 合成 `.deco` 节点 computed `inline-block`/`text-align:left`
+（左右交替在生产上是活的）+ 三模式 + 零 console error；**向后兼容实测**：生产 paper 1 仍是 v10 产物
+（`rule` 是字符串）而 16 处 `pg-rule-*` 照常渲染。
+② **页面上看到标识/灰底 ✗ 还没有** —— paper 1（139 块 / deco 0 / shade 0）是 v11 之前解析的，
+要看得宿主自己点「重新提取」（≈200 万 tokens）。
+
+**顺带发现死配置**：`PAPERSHELF_TOKEN_BUDGET` 只有 `config.py` 读、**无人使用**（真转换烧 107 万 tokens 也不会被拦）
+⇒ 遗留待定项 5 的成本护栏目前是空话；修法有语义选择，等宿主定。

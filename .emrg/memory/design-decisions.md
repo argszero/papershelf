@@ -2047,6 +2047,37 @@ DB 与 `.env` 部署前已备份（`papershelf.db.bak.20260917-085812`、`.env.b
 
 **⚠️ 存量文献要吃 v11 必须「重新提取」**（`PARSE_VERSION` 变了）—— 由宿主自己操作。
 
+### 已上生产（2026-09-17 16:1x，宿主「要」）
+
+`5769900`（`73098be` 代码 + `6beee1b` 记忆 + 会话记录）→ CI run `35195781106` 六 job 全绿
+（test / build×2 / merge / smoke / verify）→ `latest` 与 `sha-5769900` 双 200 →
+生产 `docker compose pull app`（**52.85MB 那层又撞慢层**：15:45 起、中途 `Retrying` 后重下 21.4MB，
+16:09 `app Pulled`，**≈24 分钟**；`nohup` + 轮询照旧是唯一可行解）+ `up -d app`：
+`revision=57699004f96ec2cd9f29d832ac868e71ec9696f9` / **healthy** / 公网 health 200 /
+bundle **`index-8YofT6DN.js` + `index-lPIbuEdh.css`**（与本地构建产物 `cmp` 逐字节一致）/ 日志零 error。
+DB 与 `.env` 部署前已备份（`/tmp/papershelf.db.bak.20260917-154522`、`/tmp/.env.bak.20260917-154522`）。
+
+**生产验收（两分开说）**
+- **部署/代码 ✅ 已验**：① 容器内直调（`docker exec -i papershelf python -`，零 token 零改数据）
+  `PARSE_VERSION=11` / `_margin_graphics`·`_margin_shades`·`_render_graphic` 齐在；
+  合成三块（`rule={side,color,width}` / `deco band+align+w,h` / `shade.color`）过 `render_block`：
+  产物含 `pg-rule-below`、`--rule-c:#000000`、`--rule-w:1.5px`、`class="deco deco-bottom deco-left"`、
+  `width:61px;height:16px`、`--shade-c:#c5c6c6`，且 **`typeset=False` 产物零类名零内联样式**。
+  ② 生产真浏览器（`/reader/1`）：`document.styleSheets` 里 `.deco/.deco.deco-left{text-align:left}`
+  与 `.deco img{display:inline-block}`、`--rule-w/--rule-c`、`--shade-c` 三条规则在位；
+  **合成一个 `.deco` 节点量 computed style**：`img display=inline-block`、块 `text-align:left`
+  （⇒ 左右交替在生产上是活的）；三模式 `dual 119en/86zh`、`仅中文 en 0`、`仅原文 zh 0`；控制台零 error。
+  ③ **向后兼容实测**：生产 paper 1 是 **v10 之前解析的**（`payload.rule` 还是字符串 `"below"`，无 `band` 之外的戳）
+  —— 页面上 16 处 `pg-rule-*` 照常渲染 ⇒ `markup._rule_side` 认两种写法的兜底在生产上真的生效。
+- **页面上看到标识/灰底 ✗ 还没有**：生产唯一那篇（paper 1，139 块 / `deco 0 / shade 0`）是 v11 之前解析的
+  ⇒ 要看得**宿主自己点「重新提取」**（≈200 万 tokens）。
+  顺带记一笔生产数据现状：只有 1 篇（`status=reading` / `convs_state=done` / `tokens_used=210044` /
+  `updated_at 2026-09-17T06:13Z` = 本地 14:13，宿主自己跑过一轮），`notes 0 / highlights 0`。
+
+**⚠️ 本轮顺带发现一个死配置**：`PAPERSHELF_TOKEN_BUDGET`（文档 `docs/install.md` 写「单篇 token 预算」，默认 400k）
+**全仓库只有 `config.py` 读它、没有任何地方用它** —— 真实转换烧 107 万 tokens 也不会被它拦下。
+属遗留待定项 5（成本护栏数值）；修有语义选择（硬停 vs 只警告），**未动，待宿主定**。
+
 ---
 
 
