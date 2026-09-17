@@ -1812,7 +1812,34 @@ set_table 重建」「第 20 页：重建 Table 4」——**页笔记是自由�
 护栏拒绝 0、9 轮 / 117k tokens（真 LLM、本地、同一份生产 PDF）。离线回归 **356 passed**。
 ⚠️ 生产要吃这项修复**还得再跑一次**（宿主操作，≈110 万 tokens）。
 
+### ㊵ 表格改左右并排（左英右中）+ 表格每格可划（2026-09-16 深夜，`e2bdaf1`）
+
+宿主：「表格中英对照，应该是左侧英文表格，右侧中文表格。**而不是在一个单元格里，既有中文，又有英文**。
+并且**表格也需要支持选中后出 mark-bar**」。
+
+- **并排**：服务端渲**两张表**（`.tbl-col.en` / `.tbl-col.zh`，`DUAL_CSS` 的 `.dual .row` 机制），
+  前端只出两个 `BlockBody` 列、**不再自拼 `<table>`**；配对判据 `b.table_zh`（`model.table_zh_usable`：
+  逐行同宽 **且** 非逐格照抄英文）→ 不可用则只渲左表横跨。导出/分享走**同一个** `synth._dual_rows`。
+- **可划**：`model.table_layout` 是**唯一事实来源**（表格裸文本 = 表注一行 + 每行 `" | "` 相连），
+  一并算出**每格的字符区间**；每格两端吐 `<span class="o" data-o="N">`（N = **整块偏移**）→
+  后端 `(block_id, lang, start, end)` 契约**零改动**。跨格选区 → **每格各一段 `<mark>`**（有意）。
+- ✅ `typeset=False` 且无划痕时输出**逐字节不变**（有测试钉住）。
+
+**上线记录（2026-09-17 09:0x 宿主「是的」）**：`51f671b`（含 `e2bdaf1` ㊵ + `e0a149e` 护栏 + 记忆）
+→ CI 六 job 全绿 → 生产 `docker compose pull app`（**本次零 Retrying**，约 4 分钟）+ `up -d app`：
+`revision=51f671b…` / **healthy** / 公网 health 200 / bundle **`index-CZzp5tzn.js`**（与本地同指纹）/ 日志零 error。
+DB 与 `.env` 部署前已备份（`papershelf.db.bak.20260917-085812`、`.env.bak.20260917-085812`）。
+
+**生产真浏览器实测**（宿主数据 paper 3 的 `b-0507`，真实鼠标事件 + `setFocusEmulationEnabled`）：
+左 `.tbl-col.en` x=386 w=521 / 右 `.tbl-col.zh` x=943 w=521，各 **20 格 / 52 锚点**；
+在中文表某一格上真实拖选 → `.mark-bar` **出现**（4 支笔 + 「加笔记」）；
+真实点青绿笔 → DB 落 `(paper 3, b-0507, zh, 53, 55, green)` → reload 后表格里渲染
+`<mark class="hl hl-green" data-h="1">FD</mark>`（`oklch(0.78 0.14 155 / 0.42)`）→
+`DELETE /api/highlights/1` 复原，**记录数回到 highlights 0 / notes 0**（生产零残留）。
+
 ---
+
+| # | 项 | 说明 |
 
 | # | 项 | 说明 |
 |---|---|---|

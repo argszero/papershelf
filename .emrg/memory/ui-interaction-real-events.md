@@ -77,3 +77,26 @@ Reader.tsx:156   {visible && <div className="t-zh">…</div>}        ← 中文�
 - 顺带一个环境陷阱：宿主浏览器里可能留着**很久以前打开的标签页**（旧 JS bundle ＋ 已不存在的旧数据集 ＋ 失效会话），
   它渲染的是**历史 DOM**，拿它当验收对象会得到完全错误的结论 —— 先 `list_tabs()` 看 `script[src]` 的 bundle 指纹
   与当前 `static/` 是否一致，再决定信不信这个标签页。
+
+## 同类病例三：**「用 `remove()` 清浮条」污染了后续所有判据**（2026-09-17 ㊵ 生产验收）
+
+**症状**：生产上真鼠标拖选表格格子 → 浮条**读不到**（`!!document.querySelector('.mark-bar')` 恒 false），
+而同页正文段落**也不出**了 —— 差点判成「表格不可划」并回头去查前端。
+
+**真因**：我在每次测例前用 `document.querySelector('.mark-bar')?.remove()`「清理」浮条。
+`.mark-bar` 是 **React 渲染的节点**，`remove()` 只动了 DOM、**没动 state** ——
+React 认为「浮条还在渲染」，于是**不会重新渲染**被删掉的节点 ⇒ 之后每次查询都是 false。
+（同型：`getSelection().removeAllRanges()` 是安全的，它清的是浏览器状态，不是 React state。）
+
+**正确做法**：`cdp("Page.reload")` 让页面回到初始 state（或走真实路径收浮条：点空白）。
+**通则**：验收脚本里**只读不写**；要"重置"就重置**整页**，别手动删框架渲染出来的节点 ——
+否则你测的是自己刚制造的假象（同族：假 SMTP、只看截图）。
+
+**附一条 DOM 事实**：`[data-h]` 划痕在**表格里也是同一个 `<mark class="hl hl-<色>">`**（㊵ 没另起一套），
+浮条 `.mark-bar` 则渲染在 **`.doc-stage` 之外**（stage 的兄弟）——
+所以挂 `MutationObserver` 到 `.doc-stage` **拍不到它的增删**，只能 `querySelector` 全文档查。
+
+**可复制的生产验收闭环**（不污染宿主数据）：
+真实拖选 → 读浮条 → 真点某支笔 → 查 DB（`(block_id,lang,start,end,color)` 与前端探针算的区间一致）
+→ reload 看渲染（`<mark>` + computed 底色）→ `DELETE /api/highlights/<id>`（同源 fetch 自带 cookie）
+→ 再查 DB **计数回到原值**。⚠️ **重启/刷新要遵守「reload 后必须 `switch_tab`」**（harness 的"当前标签"会漂）。

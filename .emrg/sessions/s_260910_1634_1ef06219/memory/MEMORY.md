@@ -396,3 +396,18 @@ DB 与 `.env` 部署前已备份（`papershelf.db.bak.20260916-204237`、`.env.b
 
 **本轮血泪教训**：①「护栏静默拒绝 = 生产静默全灭」（拒绝对 agent 只是一条消息，它会转做别的）；
 ② 护栏的"文本面"必须与 agent 看到的文本面一致（跨块、插空白）；③ 测试要复现生产形状。
+
+### 同一轮：**已上生产**（2026-09-17 09:0x，宿主「是的」）
+
+`51f671b`（= `e2bdaf1` ㊵ + `e0a149e` 护栏 + 记忆）→ CI 六 job 全绿 →
+`docker compose pull app`（本次**零 Retrying**，约 4 分钟）+ `up -d app`：
+`revision=51f671b…` / **healthy** / 公网 health 200 / bundle **`index-CZzp5tzn.js`**（与本地同指纹）/ 日志零 error。
+DB 与 `.env` 已备份（`…20260917-085812`）。
+
+**生产真浏览器实测**（paper 3 / `b-0507`）：左英表 x=386 w=521、右中表 x=943 w=521，各 20 格 52 锚点；
+格内**真实拖选** → `.mark-bar` 出现（4 笔 + 加笔记）；真点青绿笔 → DB 落
+`(3, b-0507, zh, 53, 55, green)` → reload 渲染 `<mark class="hl hl-green" data-h="1">FD</mark>`
+（`oklch(0.78 0.14 155 / 0.42)`）→ `DELETE /api/highlights/1` 复原（highlights 0 / notes 0，零残留）。
+
+**⚠️ 宿主还要自己「重新提取」**：护栏修复在 ①c 阶段，存量块里没有 `table` 块，不吃修复就还是没表格
+（宿主 20:48 已表态自己操作）。
