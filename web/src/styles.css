@@ -454,12 +454,33 @@ select.input { width: auto; }
 .pg-band { font-size: calc(var(--doc-fs) - 2.5px); color: var(--muted); line-height: 1.5; }
 .pg-band.pg-top { margin-top: 0; }
 .pg-band.pg-bottom { margin-bottom: 0; }
-.pg-rule-below::after, .pg-rule-above::before { content: ''; display: block; border-top: 1px solid var(--border); }
+.pg-rule-below::after, .pg-rule-above::before {
+  content: ''; display: block;
+  /* v11：**颜色与粗细照抄 PDF**（服务端把原件 stroke 存进 `payload.rule`，
+     `_furn_style` 再吐成 `--rule-c` / `--rule-w`）。原先是硬编码的 1px 浅灰 ——
+     PDF 原件是纯黑 0.99pt，宿主看到的是「线还是没有」（浅到看不见）。 */
+  border-top: var(--rule-w, 1px) solid var(--rule-c, var(--border));
+}
 .pg-rule-below::after { margin: 5px 0 14px; }
 .pg-rule-above::before { margin: 14px 0 5px; }
 /* 标题的 `<h1..h4>` 外壳由阅读器出，服务端只能回一个 `<span>` 兜住装饰
    （`<h2>` 里塞 `div` 会被浏览器甩出去）→ 扶正成块级，线才横跨得起来。 */
 span.pg-rule-below, span.pg-rule-above { display: block; }
+/* 页边底纹（v11）：`CRITICAL REVIEW` 后面那条浅灰带 —— 颜色照抄 PDF（`--shade-c`），
+   左右负向抵消同一份内边距，让色带与正文列对齐（原件色块从列边缘起）。 */
+.pg-shade { background: var(--shade-c, transparent); padding: .12em .38em; margin-inline: -.38em; border-radius: 2px; }
+/* 页边装饰图（v11）：出版社/期刊标识（`deco` 块，服务端渲好的透明 PNG）。 */
+.deco { margin: 8px 0; line-height: 0; }
+.deco.deco-top { margin: 0 0 12px; }
+.deco.deco-bottom { margin: 12px 0 0; }
+.deco.deco-left { text-align: left; }
+.deco.deco-right { text-align: right; }
+/* ⚠️ `display: inline-block` 是**必需**的（2026-09-17 真浏览器实测踩到）：本文件第 60 行有
+   一条全局 `img { display: block }`，块级元素**不听 `text-align`** —— 结果 `deco-right`
+   与 `deco-left` 全被压在左边（PDF 里标识是左右交替的：奇数页右下、偶数页左下），
+   且"看着还挺像"（导出件是对的，只有屏幕上错）。
+   `line-height: 0` 的容器 + 唯一一个 inline-block 子元素，不会有基线缝。 */
+.deco img { display: inline-block; max-width: 100%; height: auto; vertical-align: middle; }
 
 .doc-head { margin-bottom: 20px; padding-bottom: 16px; border-bottom: 1px solid var(--border); }
 .doc-venue { font-family: var(--font-mono); font-size: 11px; color: var(--muted); letter-spacing: 0.03em; margin: 0 0 10px; }

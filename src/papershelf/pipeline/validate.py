@@ -41,8 +41,10 @@ _CJK_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]")
 _DIGIT_RE = re.compile(r"\d+(?:\.\d+)?")
 _WORD_RE = re.compile(r"[A-Za-z]{3,}")
 
-# 按 prompt 规则**本就应保持英文**的块类型：参考文献条目、纯公式
-NO_ZH_TYPES = {"refs", "eq"}
+# 按 prompt 规则**本就应保持英文**的块类型：参考文献条目、纯公式、
+# 以及页边装饰块（`deco` = 出版社/期刊标识的透明 PNG，见 `parse._add_graphic` ——
+# 它压根没有文字，要求它"有中文"会立刻变成一场永不收敛的重译）
+NO_ZH_TYPES = {"refs", "eq", "deco"}
 # LaTeX 化之后，「可译散文」的判据：剥掉数学与 LaTeX 命令后**还剩至少 1 个实词**
 MIN_WORDS_FOR_ZH = 1
 # 数学函数名不算散文（否则 "inf u ∈ R^m …" 会被要求译，模型给不出中文 → 死循环）

@@ -52,12 +52,32 @@ p.ref-item{font-size:13.5px;color:#444;margin:0 0 6px;padding-left:20px;text-ind
 .pg-band{font-size:.84em;color:#6b6b6b;line-height:1.5}
 .pg-band.pg-top{margin-top:0}
 .pg-band.pg-bottom{margin-bottom:0}
-.pg-rule-below::after,.pg-rule-above::before{content:"";display:block;border-top:1px solid var(--rule)}
+/* 线的**颜色与粗细照抄 PDF**（v11）：解析阶段把原件的 stroke 存进 `payload.rule`
+   （`{side,color,width}`），渲染端用两个 CSS 变量接住 —— 内联样式只能作用在元素上，
+   而线是伪元素画的，变量可以继承进伪元素。变量缺省时才退回主题色。 */
+.pg-rule-below::after,.pg-rule-above::before{content:"";display:block;
+  border-top:var(--rule-w,1px) solid var(--rule-c,var(--rule))}
 .pg-rule-below::after{margin:6px 0 16px}
 .pg-rule-above::before{margin:16px 0 6px}
 /* 标题的 `<h1..h4>` 外壳由阅读器出（`wrap=False`），服务端只能回一个 `<span>` 兜住装饰
    （`<h2>` 里塞 `div` 会被浏览器甩出去）→ 这里把它扶正成块级，线才横跨得起来。 */
 span.pg-rule-below,span.pg-rule-above{display:block}
+/* 页边底纹（v11）：`CRITICAL REVIEW` 后面那条浅灰带 —— 颜色照抄 PDF（`--shade-c`），
+   左右各负向抵消一点内边距，让色带与正文列对齐（原件色块从列边缘起）*/
+.pg-shade { background: var(--shade-c, transparent); padding: .12em .38em; margin-inline: -.38em; border-radius: 2px; }
+/* ── 页边装饰图（`deco`：出版社/期刊标识，v11）─────────────────────────────
+   解析阶段把矢量标识**原样**渲染成透明 PNG（`parse._render_graphic`），尺寸也按原件的
+   物理尺寸折算好放进 `payload`（`w`/`h`，CSS px）—— 渲染端只负责摆位，不重新缩放。
+   ⚠️ 不要用 `figure` 的那套样式：标识没有图注，套上灰底加边框就不像原件了。 */
+.deco{margin:8px 0;line-height:0}
+.deco.deco-top{margin:0 0 12px}
+.deco.deco-bottom{margin:12px 0 0}
+.deco.deco-left{text-align:left}
+.deco.deco-right{text-align:right}
+/* 标识图**必须是 inline 级**：`deco-left`/`deco-right` 靠 `text-align` 摆位，
+   块级元素不听 `text-align`（阅读器那份 CSS 里有一条全局 `img{display:block}`，
+   实测把左右交替整个压平到左边；这里显式写死，两份 CSS 口径一致）。 */
+.deco img{display:inline-block;max-width:100%;height:auto;vertical-align:middle}
 [data-b]{scroll-margin-top:14px}
 """
 
@@ -83,9 +103,37 @@ def _esc(s: str) -> str:
 #    万一有个真标题落在页顶带里，也不该被压成灰字。横线则与块类型无关。
 _BAND_TYPES = ("p", "refs")
 
+#: PDF stroke 颜色（`parse._hex_color` 产出）—— 只有这个形状允许进 HTML 属性
+_RE_HEX_COLOR = re.compile(r"#[0-9a-fA-F]{6}")
+
+
+def _rule_side(b: Block) -> str | None:
+    """块的页边横线在**哪一侧**（`below`/`above`）；没有则为 None。
+
+    ⚠️ v10 的 `payload["rule"]` 是字符串（"below"），v11 起是字典
+    （`{"side","color","width"}`，见 `parse._rule_marks`）—— 这里两种都认：
+    存量文档（解析版本 10 及以前落的库）与 ①c agent 改过的块都还在库里，
+    读不出来就等于**那条线在屏幕上消失**（不会报错，只会少一条线）。
+    """
+    rule = b.payload.get("rule") if isinstance(b.payload, dict) else None
+    side = rule.get("side") if isinstance(rule, dict) else rule
+    return side if side in ("below", "above") else None
+
+
+def _shade_color(b: Block) -> str:
+    """块背后那块**底纹**的颜色（`#rrggbb`）；没有或不合格则空串。
+
+    值来自 PDF 的填充色（`parse._margin_shades`），必须校验后再拼进 HTML 属性 ——
+    宁可没有底纹，也不能把 PDF 里的字符串当 CSS 用（同 `_furn_style` 对线宽的颜色校验）。
+    """
+    p = b.payload if isinstance(b.payload, dict) else {}
+    shade = p.get("shade")
+    color = shade.get("color") if isinstance(shade, dict) else None
+    return color if isinstance(color, str) and _RE_HEX_COLOR.fullmatch(color) else ""
+
 
 def _furn_cls(b: Block) -> str:
-    """块的**版面装饰** CSS 类（`pg-band pg-top` / `pg-rule-below` …）；没有则空串。
+    """块的**版面装饰** CSS 类（`pg-band pg-top` / `pg-rule-below` / `deco`…）；没有则空串。
 
     ⚠️ 只在**给人看的渲染**（`typeset=True`）里挂（`render_block` 里判）：
     校验/翻译/LaTeX 化 prompt 走的是 `typeset=False`，产物必须逐字不变
@@ -93,13 +141,54 @@ def _furn_cls(b: Block) -> str:
     """
     p = b.payload if isinstance(b.payload, dict) else {}
     out: list[str] = []
+    if b.type == "deco":
+        # 页边装饰图：`deco` + 贴页顶/页底 + 靠左/靠右（左右交替是原件的排版）
+        out.append("deco")
+        if p.get("band") in ("top", "bottom"):
+            out.append(f"deco-{p['band']}")
+        if p.get("align") in ("left", "right"):
+            out.append(f"deco-{p['align']}")
+        return " ".join(out)
     band = p.get("band")
     if band in ("top", "bottom") and b.type in _BAND_TYPES:
         out.append(f"pg-band pg-{band}")
-    rule = p.get("rule")
-    if rule in ("below", "above"):
-        out.append(f"pg-rule-{rule}")
+    side = _rule_side(b)
+    if side:
+        out.append(f"pg-rule-{side}")
+    if _shade_color(b):
+        out.append("pg-shade")
     return " ".join(out)
+
+
+def _furn_style(b: Block) -> str:
+    """页边横线的**颜色/粗细**（PDF 原件的值）→ 内联 CSS 变量；没有则空串。
+
+    只在 `typeset=True` 的渲染里用（同 `_furn_cls`）。线是伪元素画的，内联样式够不到
+    伪元素，所以这里用的是**可继承的自定义属性**（`--rule-c` / `--rule-w`），
+    在 `CSS` 里由 `::after`/`::before` 读。
+
+    ⚠️ 值来自 PDF，必须校验后再拼进 HTML 属性（`#rrggbb` / 正数）——
+    宁可退回主题色，也不能把 PDF 里的字符串当 CSS 用。
+    """
+    p = b.payload if isinstance(b.payload, dict) else {}
+    parts: list[str] = []
+    shade = _shade_color(b)
+    if shade:
+        # 底纹颜色同样是**PDF 原件的值**（`parse._margin_shades`），照抄
+        parts.append(f"--shade-c:{shade}")
+    rule = p.get("rule")
+    if not isinstance(rule, dict) or not _rule_side(b):
+        return ";".join(parts)
+    color = rule.get("color")
+    if isinstance(color, str) and _RE_HEX_COLOR.fullmatch(color):
+        parts.append(f"--rule-c:{color}")
+    try:
+        width = float(rule.get("width") or 0)
+    except (TypeError, ValueError):
+        width = 0.0
+    if 0 < width <= 8:
+        parts.append(f"--rule-w:{width:g}px")
+    return ";".join(parts)
 
 
 def _mathy(text: str, *, typeset: bool) -> str:
@@ -326,8 +415,11 @@ def render_block(b: Block, *, lang: str, marker: bool = True, typeset: bool = Fa
     attr = f' data-b="{b.id}"' + (' data-nt="1"' if nt else "") if marker else ""
     t = b.type
     mine = [m for m in (marks or []) if m.get("lang") == lang]
-    # 版面装饰类（页边带 + 页边横线）；**只给人看的渲染**挂（见 `_furn_cls`）。
+    # 版面装饰类（页边带 + 页边横线 + 装饰图）与线的颜色/粗细；**只给人看的渲染**挂
+    # （见 `_furn_cls` / `_furn_style`）。
     furn = _furn_cls(b) if typeset else ""
+    fstyle = _furn_style(b) if typeset else ""
+    st = f' style="{fstyle}"' if fstyle else ""
 
     def elem(tag: str, base: str = "") -> str:
         """开标签：把版面装饰类与这个类型本来的类名合成**一个** `class` 属性。
@@ -337,7 +429,7 @@ def render_block(b: Block, *, lang: str, marker: bool = True, typeset: bool = Fa
         装饰**静默失效**（这类"多写一个属性"的坑没有报错，只有肉眼看才看得出来）。
         """
         cls = " ".join(x for x in (base, furn) if x)
-        return f'<{tag} class="{cls}"{attr}>' if cls else f"<{tag}{attr}>"
+        return f'<{tag} class="{cls}"{attr}{st}>' if cls else f"<{tag}{attr}{st}>"
 
     def prose(chunk: str) -> str:
         """正文段的内部 HTML：划痕 + 偏移锚点（都在公式渲染**之前**按裸文本切好）。"""
@@ -359,10 +451,27 @@ def render_block(b: Block, *, lang: str, marker: bool = True, typeset: bool = Fa
         # —— 用一个 `<span>` 兜住（`<h2>` 里只允许短语内容，`div` 会被浏览器甩出去），
         # `span.pg-rule-*` 在 CSS 里是 `display:block`，线照样横跨一行。
         if furn:
-            return f'<span class="{furn}">{body}</span>'
+            return f'<span class="{furn}"{st}>{body}</span>'
         return body
     if t == "abstract":
         return f"{elem('div', 'abstract')}{prose(text)}</div>"
+    if t == "deco":
+        # 页边装饰图（v11：出版社/期刊标识）。**没有文字**：不参与翻译也不参与校验
+        # （`validate.NO_ZH_TYPES`），所以这里只吐一张按原件尺寸摆好的图。
+        # ⚠️ `data-b` 标记照旧要吐（校验器按标记比对 EN/ZH 两份产物，缺一个标记
+        # 就会被判成"块丢失"）—— 所以没有 src 时也照样吐这个空壳。
+        src = b.payload.get("src", "")
+        size = ""
+        try:
+            w, h = float(b.payload.get("w") or 0), float(b.payload.get("h") or 0)
+            # 显示尺寸是**给人看的**（导出/阅读器用），与其余装饰一样只挂在 `typeset=True`
+            # 那一份里；机器面（校验/翻译 prompt）只需要 `data-b` 这个身份标记。
+            if typeset and w > 0 and h > 0:
+                size = f' style="width:{w:g}px;height:{h:g}px"'
+        except (TypeError, ValueError):
+            size = ""
+        img = f'<img src="{_esc(src)}"{size} alt="">' if src else ""
+        return f"{elem('div')}{img}</div>"
     if t == "figure":
         src = b.payload.get("src", "")
         # 图注也走翻译通道：中文视图用译文，未译时回落英文原文（图片本体由 payload.src 渲染）

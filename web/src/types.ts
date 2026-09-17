@@ -9,6 +9,9 @@
 export type BlockType =
   | 'meta' | 'abstract' | 'h1' | 'h2' | 'h3' | 'h4'
   | 'p' | 'figure' | 'table' | 'eq' | 'refs'
+  /** 页边装饰图（v11）：出版社/期刊的**矢量标识**栅格化成的透明 PNG
+   *  （`parse._margin_graphics`）。没有文字、免中文、不参与校验。 */
+  | 'deco'
 
 export type ZhSource = 'none' | 'mt' | 'human'
 

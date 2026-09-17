@@ -156,6 +156,31 @@ export function DocBlock({ b, mode, assets, selected, flash, onPick }: {
     )
   }
 
+  if (b.type === 'deco') {
+    /* 页边装饰图（v11）：**出版社/期刊的矢量标识**（Springer 马标、"Check for updates"
+       徽标…）。这类东西在 PDF 里是**画出来的矢量填充**，`get_text()` 与图片层都拿不到，
+       所以从来没进过产物（宿主 2026-09-17：「Springer 的图还是没有」）。服务端现在把它们
+       栅格化成**透明 PNG** 落成 `deco` 块（`parse._margin_graphics` / `_add_graphic`）。
+
+       ⚠️ 必须在这里显式出一支，不能指望"落到正文兜底分支也能显示"：
+       兜底分支会把它包进 `.t-en`（`text-align: justify` + 正文行高），且
+       `payload.band/align` 的贴边/左右交替整个丢失 —— 标识会跑到正文流的中间。
+       `width`/`height` 用服务端算好的 CSS px（PDF pt × 1.45，见 `parse._PT_TO_PX`），
+       挂成 img 属性 → 图**下载完成前**就占好位置（不挂会整篇高度上浮、大纲跳转偏位）。 */
+    const src = b.payload?.src ? String(b.payload.src) : ''
+    if (!src) return null
+    const band = String(b.payload?.band || '')
+    const align = String(b.payload?.align || '')
+    return (
+      <div className={`blk deco${band ? ` deco-${band}` : ''}${align ? ` deco-${align}` : ''}`}
+           data-b={b.id}>
+        <img src={src} alt="" loading="lazy"
+             width={Number(b.payload?.w) || undefined}
+             height={Number(b.payload?.h) || undefined} />
+      </div>
+    )
+  }
+
   if (b.type === 'table') {
     /* 表格块（决策㊴ 重建 / ㊵ 并排 + 可划）。
      *

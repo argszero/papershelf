@@ -1,4 +1,5 @@
-"""页面家具：**页眉/页脚文字**与**页边横线**（`PARSE_VERSION` v10）—— 离线，不联网、不调 LLM。
+"""页面家具：**页眉/页脚文字**、**页边横线**与**页边底纹**（`PARSE_VERSION` v10/v11）
+—— 离线，不联网、不调 LLM。
 
 宿主 2026-09-17 两条原话（截图 + 文字）：
 
@@ -32,7 +33,7 @@ import pytest
 
 from papershelf.pipeline.markup import CSS, _furn_cls, render_block
 from papershelf.pipeline.model import Block
-from papershelf.pipeline.parse import _RULE_MAX_GAP, _rule_marks
+from papershelf.pipeline.parse import _Line, _PT_TO_PX, _RULE_MAX_GAP, _rule_marks
 
 ROOT = Path(__file__).resolve().parents[1]
 READER_CSS = ROOT / "web" / "src" / "styles.css"
@@ -50,9 +51,12 @@ def test_header_rule_is_attached_to_the_text_line_below_it():
     """页眉线：线在文字**之上**、贴着它 ⇒ 挂在那一行上，标 `below`（线在块下方）。"""
     head = _blk(51, 32, 540, 42)                 # 期刊页眉（贴页顶）
     body = _blk(51, 120, 540, 700)               # 正文
-    lines = [(52.0, 52.0, 40.0, 560.0)]          # 通栏细线，距页眉下沿 10pt
+    lines = [_Line(52.0, 52.0, 40.0, 560.0, "#000000", 0.8)]   # 通栏细线，距页眉下沿 10pt
     marks = _rule_marks([head, body], lines, _H)
-    assert marks == {id(head): "below"}
+    # v11：值从字符串变成 `{side,color,width}` —— 颜色/粗细是**PDF 原件的**，
+    # 渲染端不再自己编那条浅灰线（v10 的实际表现就是"线太浅，像没有"）。
+    assert marks == {id(head): {"side": "below", "color": "#000000",
+                               "width": round(0.8 * _PT_TO_PX * 2) / 2}}
 
 
 def test_rule_inside_the_body_is_never_taken_for_a_page_rule():
@@ -62,32 +66,32 @@ def test_rule_inside_the_body_is_never_taken_for_a_page_rule():
     那张表的横线 `x=[208,544]` 就落在正文带，若只按"又细又长"判就会被当成页眉线）。
     """
     body = _blk(51, 120, 540, 700)
-    lines = [(400.0, 400.0, 40.0, 560.0)]
+    lines = [_Line(400.0, 400.0, 40.0, 560.0)]
     assert _rule_marks([body], lines, _H) == {}
 
 
 def test_half_width_line_is_not_a_rule():
     """半截线（分栏装饰、单元格竖线的横段）不算：必须横跨正文文字列。"""
     head = _blk(51, 32, 540, 42)
-    lines = [(52.0, 52.0, 51.0, 300.0)]
+    lines = [_Line(52.0, 52.0, 51.0, 300.0)]
     assert _rule_marks([head], lines, _H) == {}
 
 
 def test_line_far_from_any_text_is_not_attached():
     """离文字太远的线不挂：线必须**紧贴**某一行（否则"谁的那条线"无从判断）。"""
     body = _blk(51, 120, 540, 700)
-    lines = [(52.0, 52.0, 40.0, 560.0)]
+    lines = [_Line(52.0, 52.0, 40.0, 560.0)]
     assert _rule_marks([body], lines, _H) == {}
     # 把线挪到刚好在容许距离内，就该挂上了（证明上一条不是因为别的条件被拒）
     near = _blk(51, 20, 540, 52 - _RULE_MAX_GAP)
-    assert _rule_marks([near], lines, _H) == {id(near): "below"}
+    assert _rule_marks([near], lines, _H) == {id(near): {"side": "below", "color": None, "width": 1.0}}
 
 
 def test_footer_rule_is_marked_above():
     """页脚线：文字在**线之下**（`Vol.:(0123456789)` 那一带的横线）⇒ 标 `above`。"""
     foot = _blk(51, 760, 540, 772)
-    lines = [(750.0, 750.0, 40.0, 560.0)]
-    assert _rule_marks([foot], lines, _H) == {id(foot): "above"}
+    lines = [_Line(750.0, 750.0, 40.0, 560.0)]
+    assert _rule_marks([foot], lines, _H) == {id(foot): {"side": "above", "color": None, "width": 1.0}}
 
 
 # ── 2. 端到端：跨页重复的页眉**留着**（合成两页 PDF）──────────────────────
@@ -122,7 +126,12 @@ def test_repeated_page_header_survives_and_is_tagged(tmp_path):
     assert len(heads) == 2, "跨页重复的页眉被丢掉了（v10 起不再这么做）"
     for b in heads:
         assert b.payload.get("band") == "top", "页眉没有被标成页边带（渲染端就没法把它渲成小字）"
-        assert b.payload.get("rule") == "below", "页眉下那条横线没有被找回来"
+        rule = b.payload.get("rule")
+        assert isinstance(rule, dict) and rule.get("side") == "below", \
+            f"页眉下那条横线没有被找回来：{rule!r}"
+        # v11：颜色/粗细也要带过来（PDF 画的是纯黑 0.8pt；没有它们渲染端只能自己编）
+        assert rule.get("color") == "#000000", rule
+        assert float(rule.get("width") or 0) >= 1.0, rule
         assert b.payload.get("page") in (1, 2)
     # 正文块**不许**沾上版面戳（沾上就会把正文渲成小灰字、还多画一条线）
     body = [b for b in doc.blocks if (b.en or "").startswith("Body text")]
@@ -188,7 +197,8 @@ def _class_names() -> set[str]:
     """`_furn_cls` 可能吐出的**全部**类名（从产出反推，不是手抄一份）。"""
     names: set[str] = set()
     combos = [{"band": "top", "rule": "below"}, {"band": "bottom", "rule": "above"},
-              {"band": "top"}, {"band": "bottom"}, {"rule": "below"}, {"rule": "above"}]
+              {"band": "top"}, {"band": "bottom"}, {"rule": "below"}, {"rule": "above"},
+              {"shade": {"color": "#c5c6c6"}}]
     for pay in combos:
         names.update(_furn_cls(_p(**pay)).split())
     return names
@@ -201,7 +211,8 @@ def test_every_furniture_class_is_defined_in_both_stylesheets():
     导出件上有线、屏幕上没有（或反过来），只能靠肉眼看出来。
     """
     names = _class_names()
-    assert names == {"pg-band", "pg-top", "pg-bottom", "pg-rule-below", "pg-rule-above"}
+    assert names == {"pg-band", "pg-top", "pg-bottom", "pg-rule-below", "pg-rule-above",
+                     "pg-shade"}
     reader = READER_CSS.read_text(encoding="utf-8")
     missing_server = sorted(n for n in names if f".{n}" not in CSS)
     missing_reader = sorted(n for n in names if f".{n}" not in reader)

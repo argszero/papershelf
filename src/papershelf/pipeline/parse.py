@@ -12,7 +12,7 @@ from __future__ import annotations
 import re
 from collections import Counter
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 import fitz  # PyMuPDF
 
@@ -59,7 +59,16 @@ from .model import Doc, make_block_id
 #         和 pdf 尽量保持一致」）；②盖 `payload["band"]`（页边带）与 `payload["rule"]`
 #         （**页边横线的位置**，见 `_rule_marks`）—— 矢量线条此前一条都没进产物，
 #         每页页眉下那条通栏细线整份文档都不见（宿主：「这里少了一条水平线」）
-PARSE_VERSION = 10
+#   v11 → ①页边横线**照抄 PDF 的粗细与颜色**（v10 只存了"哪一侧"，渲染端硬编码成
+#         `1px solid var(--border)` 的浅灰 —— PDF 原件是纯黑 0.99pt，宿主看到的是
+#         「线还是没有」；`payload["rule"]` 因此从字符串变成 `{side,color,width}`）；
+#         ②页边带里的**矢量图形**（出版社/期刊标识）取自 `get_drawings()` 并渲染成
+#         透明 PNG，作为 `deco` 块进产物（见 `_margin_graphics`）—— 这类标识既不是文字、
+#         也不是图片，**从来没进过产物**（宿主：「Springer 的图还是没有」）；
+#         ③**无图注的图片不再丢弃**（原先整批删掉"期刊 logo、作者头像"，实测把真图
+#         也误删 —— 图注压在图片边缘上时配不上注，图与图注一起消失）；
+#         ④图注配对允许**小幅纵向重叠**（`_CAP_*`），并改成"全局最近优先、一对一认领"。
+PARSE_VERSION = 11
 
 # 页面上下边缘（比例），落在其中的短文本块视为页眉/页脚候选
 EDGE_TOP, EDGE_BOTTOM = 0.075, 0.925
@@ -86,6 +95,49 @@ _RULE_BAND = 0.14           # 只在距页顶/页底这一比例内找页边横�
 _RULE_MAX_THICKNESS = 2.0   # 线的粗细上限（pt）：比这"厚"的是方框/色块，不是规则线
 _RULE_MAX_GAP = 26.0        # 线离那行文字多远之内才算"这行文字的线"（pt）
 _RULE_EDGE_SLACK = 0.06     # 线两端各允许离正文文字列边缘的比例（超过就不是通栏线）
+
+# ── 页边矢量图形（v11：出版社/期刊标识）─────────────────────────────────────
+# 「Springer 的马标 + 字标」这类标识在 PDF 里**不是图片，是画出来的矢量填充**：
+# 实测马头 84 个 items + "Springer" 字标 146 个 items，两块拼成 42.1×11.0pt 的一个整体，
+# 每页页脚一个、左右交替。于是它既不在 `get_text()` 里（那是文字层），也不在 image
+# block 里（那是图片层）—— **从来没进过产物**，不是"渲染丢了"（与 v10 那条页眉横线
+# 同一个道理：先问"取过没有"，再问"画出来没有"）。
+#
+# 判据宁可漏画、不许把正文截成图（截错会凭空多出一张"正文截图"）：
+_FIG_BAND = 0.14             # 只在距页顶/页底这一比例内找（与 `_RULE_BAND` 同一把尺）
+_FIG_MIN_SIZE = 4.0          # 小于这个尺寸的当噪声丢掉（pt）
+_FIG_MAX_HEIGHT = 40.0       # 高的不算"标识"（正文里的大插图自有图片块管）
+_FIG_MAX_WIDTH_RATIO = 0.40  # 宽度达到正文列宽这个比例的不算标识（通栏色带/装饰横带）
+_FIG_CLUSTER_GAP = 6.0       # 聚类：横向间隙上限（pt）—— 马头与字标之间就是这点距离
+_FIG_CLUSTER_DY = 20.0       # 聚类：纵向相差上限（pt）
+_FIG_MAX_PER_PAGE = 4        # 每页最多几个（判据万一走偏也不至于满页都是图）
+_FIG_RENDER_SCALE = 8.0      # 渲染倍率（PDF pt → PNG px）：显示宽度约 60px ⇒ 约 6 倍像素密度
+_FIG_TOL = 0.6               # 与文字/图片块的重叠容差（pt）
+
+# ── 页边色块/底纹（v11：`CRITICAL REVIEW` 后面那条浅灰底纹）──────────────────
+# 见 `_margin_shades`：判据是「色块**包着可见文字**」—— 反过来，包着**不可见白字**的
+# 色块（Springer 页脚 `Vol.:(0123456789)` 的**黑框**：白字 v9 已不入产物）必须排除，
+# 否则页脚会凭空多出两个黑方块。色块本身没有文字，所以它挂在**被它衬底的那个文字块**上。
+_SHADE_MIN_WIDTH = 20.0      # 窄于这个的不是底纹（是图标的一部分）
+_SHADE_MIN_HEIGHT = 4.0
+_SHADE_MAX_HEIGHT = 60.0     # 高于这个的是整块色板，不是一行字的底纹
+_SHADE_COVER = 0.60          # 文字有这么多比例落在色块里才算"衬底"
+_SHADE_MAX_SPREAD = 3.0      # 色块宽度上限 = 文字宽 × 这个倍数 + `_SHADE_PAD_ALLOW`（pt）
+_SHADE_PAD_ALLOW = 40.0
+
+# PDF pt → 阅读器 px：PDF 正文基准 10pt ↔ 阅读器 `--doc-fs` 14.5px（`web/src/styles.css`）。
+# 横线的粗细、图形的显示尺寸都按这个比例折算 —— 它们要和**读者看到的正文**成比例，
+# 而不是和"96dpi 的物理尺寸"成比例（阅读器的正文列比 PDF 的物理宽度略宽）。
+_PT_TO_PX = 1.45
+
+# ── 图注配对（v11 修正）──────────────────────────────────────────────────────
+# 旧判据「图注与图片 bbox 纵向重叠 ⇒ 不是图注」会把**真图连图注一起丢掉**：
+# Springer 的图注常压在图片上边缘（实测 Fig. 5：图 y=297–716、图注 y=295.1–317.9，
+# 重叠 20.9pt），于是配不上注 → 3b 判定"无图注的图" → 整张图被删。
+_CAP_MAX_GAP = 90.0          # 图注离图片多远之内还算它的图注（pt）
+_CAP_OVERLAP = 24.0          # 允许的纵向重叠上限（pt）—— 版面把图注压在图片边缘上
+_CAP_OVERLAP_RATIO = 0.25    # 或"重叠不超过图高的这个比例"（大图允许压得更多）
+_CAP_SIDE_PENALTY = 30.0     # 与图片**并排**（横向不重叠）的图注：可能是邻栏的话，代价更高
 
 # 章节编号模式（IEEE/学术常见）：顶层「I. / II.」，次级「A. / B.」，深层「1.1 / 2.3.1」
 _RE_H2 = re.compile(r"^([IVX]{1,6})\.\s+\S")
@@ -520,44 +572,86 @@ def _column_spill_seams(
     return out
 
 
-def _tag_furniture(blk: Any, band: str | None, rule: str | None) -> Any:
-    """给块盖**版面事实**戳：`band`（页边带：top/bottom）与 `rule`（页边横线：below/above）。
+def _tag_furniture(blk: Any, band: str | None, rule: dict[str, Any] | None,
+                   shade: dict[str, Any] | None = None) -> Any:
+    """给块盖**版面事实**戳：`band`（页边带：top/bottom）、`rule`（页边横线）、
+    `shade`（页边底纹）。
 
-    这两个戳只影响**渲染**（页眉/页脚的小字与那条线），不参与翻译、不参与校验：
-    `band` 只说"这一行贴在页面上下边缘"，`rule` 只说"它的一侧有一条页边横线"。
-    渲染端读它们（`markup.render_block` / 阅读器 / 导出），**不再自己按坐标猜**
-    （同 ㊴「配对判据只在服务端」：判据写两份，迟早漂开）。
+    这三个戳只影响**渲染**（页眉/页脚的小字与那条线、那行字背后的浅灰底纹），
+    不参与翻译、不参与校验：`band` 只说"这一行贴在页面上下边缘"，`rule` 只说
+    "它的一侧有一条什么样的页边横线"、`shade` 只说"它背后有一块什么颜色的底纹"
+    —— 形如 `{"side": "below", "color": "#000000", "width": 1.4}`（`width` 已是 CSS px，
+    见 `_PT_TO_PX`）与 `{"color": "#c6c6c7"}`。渲染端读它们（`markup.render_block` /
+    阅读器 / 导出），**不再自己按坐标猜、也不自己编颜色**（同 ㊴「配对判据只在服务端」：
+    判据写两份，迟早漂开；v10 就是渲染端把线硬编码成浅灰，看起来像"线没有"）。
     """
     if band:
         blk.payload["band"] = band
     if rule:
         blk.payload["rule"] = rule
+    if shade:
+        blk.payload["shade"] = shade
     return blk
 
 
-def _thin_lines(page: Any) -> list[tuple[float, float, float, float]]:
-    """这一页上**又细又长的横线**的包围盒 `(y0, y1, x0, x1)`。
+class _Line(NamedTuple):
+    """`get_drawings()` 里一条**又细又长**的横线（判据见 `_rule_marks`）。
 
-    只用 `get_drawings()` 的 `rect`，不碰 items —— 线条在 PDF 里是路径（`l`/`re`/`qu`），
-    逐条解释路径的成本与收益都不成比例（判据见 `_rule_marks`）。
+    `color` 是 PDF 里的 stroke 颜色（`#rrggbb`，取不到为 None）、`width` 是线宽（pt）——
+    v11 起它们一路进产物：v10 只记了"线在哪一侧"，渲染端便只能画一条自己的浅灰线。
     """
-    out: list[tuple[float, float, float, float]] = []
+    y0: float
+    y1: float
+    x0: float
+    x1: float
+    color: str | None = None
+    width: float = 0.0
+
+
+def _hex_color(rgb: Any) -> str | None:
+    """PDF 的 `(r,g,b)`（0–1 浮点）→ `#rrggbb`；取不到就 None（渲染端用默认色）。"""
+    if not rgb or len(rgb) < 3:
+        return None
     try:
-        drawings = page.get_drawings()
-    except Exception:                 # 极少数 PDF 的绘图字典会抛（宁可没线，不要断管线）
-        return out
+        return "#" + "".join(f"{max(0, min(255, round(float(c) * 255))):02x}" for c in rgb[:3])
+    except (TypeError, ValueError):
+        return None
+
+
+def _thin_lines(page: Any, drawings: list[Any] | None = None) -> list[_Line]:
+    """这一页上**又细又长的横线**（判据见 `_rule_marks`）。
+
+    只取 `get_drawings()` 的 `rect`（外加 stroke 的颜色/粗细），不碰 items ——
+    线条在 PDF 里是路径（`l`/`re`/`qu`），逐条解释路径的成本与收益都不成比例。
+
+    `drawings` 可传入**外部已取好**的绘图字典：`get_drawings()` 在整篇解析里是最贵的一次
+    调用之一，而同一页要用它的地方有两处（页边横线、页边矢量图形）——
+    取两遍等于整份文档白白多解析一遍矢量层（实测 37 页文档约 0.3s，翻倍就是白送）。
+    """
+    out: list[_Line] = []
+    if drawings is None:
+        drawings = _drawings(page)
     for dr in drawings:
         r = dr.get("rect")
         if r is None or r.width <= 0:
             continue
         if r.height <= _RULE_MAX_THICKNESS:
-            out.append((r.y0, r.y1, r.x0, r.x1))
+            out.append(_Line(r.y0, r.y1, r.x0, r.x1,
+                             _hex_color(dr.get("color")), float(dr.get("width") or 0.0)))
     return out
 
 
-def _rule_marks(blocks: list[dict[str, Any]], lines: list[tuple[float, float, float, float]],
-                height: float) -> dict[int, str]:
-    """页边横线 → `{id(块): "below"|"above"}`（线在这一块的哪一侧）。
+def _drawings(page: Any) -> list[Any]:
+    """`page.get_drawings()` 的安全壳：极少数 PDF 的绘图字典会抛，宁可没图不要断管线。"""
+    try:
+        return page.get_drawings() or []
+    except Exception:                 # noqa: BLE001 —— 解析失败一律降级（这条链最贵的是中止转换）
+        return []
+
+
+def _rule_marks(blocks: list[dict[str, Any]], lines: list[_Line],
+                height: float) -> dict[int, dict[str, Any]]:
+    """页边横线 → `{id(块): {"side": "below"|"above", "color": …, "width": …}}`。
 
     起因（2026-09-17 宿主实测截图）：「这里少了一条水平线」 —— 每页页眉文字下方都有一条
     横跨正文宽的细线（矢量 stroke），而 `get_text()` 只回文字，**矢量线条一条都不在产物里**，
@@ -575,8 +669,10 @@ def _rule_marks(blocks: list[dict[str, Any]], lines: list[tuple[float, float, fl
        它把"页边的一条线"变成"**这一行文字的那条线**"，于是线跟着文字走：
        页面重排、块被 ①c 改/挪都不会让线跑到别处，也不会把图框顶边当成页眉线。
 
-    返回的是**块 → 线在哪一侧**，不是"页 → 有线条"：渲染时线画在那个块上，
-    块在哪、线就在哪（出处是块的 `bbox`，与线条本体在 PDF 里的坐标无关）。
+    返回的是**块 → 线长什么样**（哪一侧 + 颜色 + 粗细），不是"页 → 有线条"：渲染时线画在
+    那个块上，块在哪、线就在哪（出处是块的 `bbox`，与线条本体在 PDF 里的坐标无关）。
+    v11 起**连颜色粗细一起带走** —— 否则渲染端只能画自己那条浅灰线（v10 的实际表现就是
+    "线其实画了，但太浅看不见"）。
     """
     if not lines or not blocks:
         return {}
@@ -586,27 +682,232 @@ def _rule_marks(blocks: list[dict[str, Any]], lines: list[tuple[float, float, fl
     if colw <= 0:
         return {}
     slack = colw * _RULE_EDGE_SLACK
-    marks: dict[int, str] = {}
-    for y0, y1, x0, x1 in lines:
-        if x0 > left + slack or x1 < right - slack:
+    marks: dict[int, dict[str, Any]] = {}
+
+    def _spec(ln: _Line, side: str) -> dict[str, Any]:
+        # 至少 1px（PDF 里存在 0.25pt 的细线，折算后四舍五入会归零 —— 归零等于又"没有线"）
+        px = max(1.0, round(ln.width * _PT_TO_PX * 2) / 2)
+        return {"side": side, "color": ln.color, "width": px}
+
+    for ln in lines:
+        if ln.x0 > left + slack or ln.x1 < right - slack:
             continue                                     # 半截线：不横跨正文列
-        if y0 <= height * _RULE_BAND:                    # 页眉线：文字在**线之上**
+        if ln.y0 <= height * _RULE_BAND:                 # 页眉线：文字在**线之上**
             best, side = None, None
             for b in blocks:
-                gap = y0 - b["bbox"][3]
+                gap = ln.y0 - b["bbox"][3]
                 if 0 <= gap <= _RULE_MAX_GAP and (best is None or gap < best):
                     best, side = gap, b
             if side is not None:
-                marks[id(side)] = "below"
-        elif y1 >= height * (1 - _RULE_BAND):            # 页脚线：文字在**线之下**
+                marks[id(side)] = _spec(ln, "below")
+        elif ln.y1 >= height * (1 - _RULE_BAND):         # 页脚线：文字在**线之下**
             best, side = None, None
             for b in blocks:
-                gap = b["bbox"][1] - y1
+                gap = b["bbox"][1] - ln.y1
                 if 0 <= gap <= _RULE_MAX_GAP and (best is None or gap < best):
                     best, side = gap, b
             if side is not None:
-                marks[id(side)] = "above"
+                marks[id(side)] = _spec(ln, "above")
     return marks
+
+
+def _rect_overlaps(a: Any, b: Any, tol: float = _FIG_TOL) -> bool:
+    """两个 bbox `(x0,y0,x1,y1)` 是否真的压在一起（每个轴都要超过 `tol` pt）。
+
+    `tol` 不是可有可无的：PDF 里"图的边框"与"图注第一行"常常差不到 0.5pt，
+    零容差会把它们判成重叠；反过来容差过大又会把相邻的真重叠放过。
+    """
+    return (a[0] < b[2] - tol and b[0] < a[2] - tol
+            and a[1] < b[3] - tol and b[1] < a[3] - tol)
+
+
+def _cluster_rects(rects: list[Any]) -> list[list[float]]:
+    """把相邻的矢量小块合成**一个整体**（返回 bbox `[x0,y0,x1,y1]`）。
+
+    Springer 的标识就是两块：马头 84 个 items、`Springer` 字标 146 个 items，
+    横间隙 4.2pt —— 不聚类就会变成两个"图"，一个在马头上、一个在字标上。
+    """
+    boxes = [[r.x0, r.y0, r.x1, r.y1] for r in rects]
+    merged = True
+    while merged:                      # 合并会放大 bbox，必须迭代到不再变化
+        merged = False
+        out: list[list[float]] = []
+        for box in boxes:
+            for prev in out:
+                dx = max(prev[0], box[0]) - min(prev[2], box[2])
+                dy = max(prev[1], box[1]) - min(prev[3], box[3])
+                if dx <= _FIG_CLUSTER_GAP and dy <= _FIG_CLUSTER_DY:
+                    prev[0], prev[1] = min(prev[0], box[0]), min(prev[1], box[1])
+                    prev[2], prev[3] = max(prev[2], box[2]), max(prev[3], box[3])
+                    merged = True
+                    break
+            else:
+                out.append(box)
+        boxes = out
+    return boxes
+
+
+def _margin_graphics(drawings: list[Any], texts: list[Any], images: list[Any],
+                     height: float) -> list[list[float]]:
+    """页边带里的**矢量图形**（出版社/期刊标识）→ 候选 bbox 列表。
+
+    为什么需要它：这类标识既不在 `get_text()`（文字层）里，也不在 image block（图片层）里
+    —— 它们是**画出来的矢量填充**（`get_drawings()`）。于是整份文档里它们**从来没出现过**
+    （宿主 2026-09-17：「Springer 的图还是没有」；与 v10 那条页眉横线同一个道理：
+    先问"取过没有"，再问"画出来没有"）。
+
+    判据 —— 方向是**宁可漏画，绝不把正文截成图**（截错会凭空多出一张"正文截图"）：
+
+    1. 每个绘图块足够**大**（`_FIG_MIN_SIZE`）且**不在正文带**（页边 `_FIG_BAND`）；
+       这条同时把又细又长的规则线排除掉了（它们 h≈0）；
+    2. 聚类后仍**不像正文**：宽 < 正文列宽的 `_FIG_MAX_WIDTH_RATIO`、高 ≤ `_FIG_MAX_HEIGHT`
+       —— 通栏色带/装饰横带不是"标识"；
+    3. **不压可见文字**（`texts` 是**已滤掉不可见白字**的块）：这条是主保险 ——
+       Springer 首页那块 `CRITICAL REVIEW` 灰底就压着标题，落选（实测）；
+    4. **不与图片块重叠**：那块区域的**图片块那一侧**会负责出图（主循环 → `_add_graphic`
+       整体栅格化，理由见那里的注释），这里再来一张就是重影
+       （实测 Springer 首页右上角"Check for updates"：既有 image block、也有同坐标的矢量块）。
+
+    实测（8 页 Springer 论文）：8 个候选 = 每页页脚的马标 + 首页右上角的徽标，**零误报**；
+    37 页那篇：37 个候选，同样零误报。
+    """
+    band = height * _FIG_BAND
+    cands = []
+    for dr in drawings:
+        r = dr.get("rect")
+        if r is None or r.width < _FIG_MIN_SIZE or r.height < _FIG_MIN_SIZE:
+            continue
+        if r.y1 > band and r.y0 < height - band:
+            continue                                     # 不在页顶/页底那条带里
+        cands.append(r)
+    if not cands:
+        return []
+    xs = [(t["bbox"][0], t["bbox"][2]) for t in texts]
+    colw = (max(x1 for _, x1 in xs) - min(x0 for x0, _ in xs)) if xs else 0.0
+    if colw <= 0:
+        return []
+    out = []
+    for c in _cluster_rects(cands):
+        if c[2] - c[0] > colw * _FIG_MAX_WIDTH_RATIO or c[3] - c[1] > _FIG_MAX_HEIGHT:
+            continue
+        if any(_rect_overlaps(c, t["bbox"]) for t in texts):
+            continue
+        if any(_rect_overlaps(c, i["bbox"]) for i in images):
+            continue
+        out.append(c)
+    # 大的优先（每页最多 `_FIG_MAX_PER_PAGE` 个 —— 判据万一走偏也不至于满页都是图）
+    out.sort(key=lambda b: -((b[2] - b[0]) * (b[3] - b[1])))
+    return out[:_FIG_MAX_PER_PAGE]
+
+
+def _rect_area(a: Any, b: Any) -> float:
+    """两个 bbox 的**交叠面积**（pt²），不相交为 0。"""
+    w = min(a[2], b[2]) - max(a[0], b[0])
+    h = min(a[3], b[3]) - max(a[1], b[1])
+    return w * h if w > 0 and h > 0 else 0.0
+
+
+def _margin_shades(drawings: list[Any], texts: list[Any], images: list[Any],
+                   height: float) -> dict[int, dict[str, Any]]:
+    """页边带里的**色块/底纹** → `{id(文字块): {"color": "#c6c6c7"}}`。
+
+    起因：Springer 首页 `CRITICAL REVIEW` 后面有一条浅灰底纹（矢量填充
+    `(51.0,60.5)-(289.1,79.4)`，`fill≈(0.774,0.776,0.778)`），我们也没有 ——
+    与页眉横线同一个道理：`get_text()` 只回文字，填充块从来不在产物里。
+
+    判据（主保险是第 3 条，它把"看不见的黑框"挡在门外）：
+
+    1. **是填充块**（`type == "f"`、有 `fill` 颜色）且尺寸像一行字的底纹
+       （`_SHADE_MIN/MAX_*`）—— 又细又长的走 `_rule_marks`（是线不是块）；
+    2. **在页边带里**（`_FIG_BAND`）：正文里的表格底纹、图例色块不归这里管；
+    3. **包着可见文字**（`_SHADE_COVER`，且色块不能比那行字宽太多）：色块**衬底**的
+       是**看得见的字**才照抄。反向的例子就在同一页：页脚 `Vol.:(0123456789)` 是纯白字
+       （v9 起不入产物），它那个**黑框**里就"没有可见文字"了 —— 不加这条判据，
+       每页页脚会多出两个黑方块；
+    4. **不压图片块**：那属于图的一部分（实测首页那个 "Check for updates" 圆环里
+       有两块灰色填充）。
+    """
+    if not drawings or not texts:
+        return {}
+    band = height * _FIG_BAND
+    out: dict[int, dict[str, Any]] = {}
+    for dr in drawings:
+        if dr.get("type") != "f" or not dr.get("fill"):
+            continue
+        r = dr.get("rect")
+        if r is None or r.width < _SHADE_MIN_WIDTH:
+            continue
+        if not (_SHADE_MIN_HEIGHT <= r.height <= _SHADE_MAX_HEIGHT):
+            continue
+        if r.y1 > band and r.y0 < height - band:
+            continue                                     # 不在页顶/页底那条带里
+        box = [r.x0, r.y0, r.x1, r.y1]
+        if any(_rect_overlaps(box, i["bbox"]) for i in images):
+            continue
+        best, best_cover = None, 0.0
+        for t in texts:
+            tb = t["bbox"]
+            if tb[1] > band and tb[3] < height - band:
+                continue                                 # 这行字不在页边带里
+            area = max(1.0, (tb[2] - tb[0]) * (tb[3] - tb[1]))
+            cover = _rect_area(box, tb) / area
+            if cover > best_cover:
+                best, best_cover = t, cover
+        if best is None or best_cover < _SHADE_COVER:
+            continue                                     # 没包着可见文字（白字黑框就在这一条被拒）
+        tb = best["bbox"]
+        if (r.x1 - r.x0) > (tb[2] - tb[0]) * _SHADE_MAX_SPREAD + _SHADE_PAD_ALLOW:
+            continue                                     # 宽太多：是色板，不是这行字的底纹
+        color = _hex_color(dr.get("fill"))
+        if color and id(best) not in out:
+            out[id(best)] = {"color": color}
+    return out
+
+
+def _render_graphic(page: Any, bbox: Any, path: Path) -> tuple[int, int] | None:
+    """把页面上这一小块**原样**渲染成透明 PNG（返回像素宽高）。
+
+    `alpha=True` 是关键：白底会变成透明 —— 标识贴在任何底色上都不会带一块白板
+    （深色模式下尤其明显）。出图倍率见 `_FIG_RENDER_SCALE`（显示尺寸另算，只有 60px 上下，
+    所以实际像素密度是 6 倍左右，缩放后边缘依然锐利）。
+
+    ⚠️ 这里的"原样"是字面意思：**不重绘、不识别**，只是把 PDF 上那一小块栅格化。
+    识别成"这是什么出版社的什么标识"再来重绘一遍，是另一件事（且必然失真）。
+    """
+    try:
+        clip = fitz.Rect(*bbox)
+        pix = page.get_pixmap(matrix=fitz.Matrix(_FIG_RENDER_SCALE, _FIG_RENDER_SCALE),
+                              clip=clip, alpha=True)
+        path.write_bytes(pix.tobytes("png"))
+        return pix.width, pix.height
+    except Exception:                 # noqa: BLE001 —— 出图失败只该少一张标识，不该毁整篇
+        return None
+
+
+def _band_of(bbox: Any, height: float) -> str | None:
+    """这块东西贴在页顶带、页底带，还是压根不在页边（正文里）？"""
+    if bbox[1] <= height * _FIG_BAND:
+        return "top"
+    if bbox[3] >= height * (1 - _FIG_BAND):
+        return "bottom"
+    return None
+
+
+def _graphic_placement(band: str, bbox: Any, width: float) -> dict[str, Any]:
+    """页边图形的**版面属性**：贴页顶还是页底、靠左还是靠右、显示多大（CSS px）。
+
+    左右**交替**是原件的真实排版（Springer 奇数页在右下、偶数页在左下），
+    所以这里从 `bbox` 的中心算，而不是一律靠右。
+    尺寸按 `_PT_TO_PX` 折算 —— 要与读者看到的**正文**成比例，而不是与 PDF 的物理尺寸
+    （阅读器的正文列比 493pt 宽）。
+    """
+    y0, y1, x0, x1 = bbox[1], bbox[3], bbox[0], bbox[2]
+    return {
+        "band": band,
+        "align": "left" if (x0 + x1) / 2 < width / 2 else "right",
+        "w": max(1, round((x1 - x0) * _PT_TO_PX)),
+        "h": max(1, round((y1 - y0) * _PT_TO_PX)),
+    }
 
 
 def _caption_like(text: str) -> bool:
@@ -946,36 +1247,72 @@ def _split_runin_heads(block: dict[str, Any], body_size: float) -> list[dict[str
 def _pair_captions_by_geometry(
     images: list[dict[str, Any]], texts: list[dict[str, Any]]
 ) -> tuple[dict[int, str], set[int]]:
-    """按几何就近把图注文本配给图片（优先图片下方，其次上方）。
+    """按几何就近把图注文本配给图片（优先图片下方，其次上方，允许小幅重叠）。
 
     跨栏大图（bbox 横跨两栏）在阅读序里会把图注甩到很远，顺序法不可靠；
     宿主既有管线的经验也是「用坐标交叉验证」，此处同理。
+
+    ⚠️ v11 两处修正（2026-09-17）—— 旧版把**真图连图注一起丢掉**：
+
+    1. **允许小幅纵向重叠**。旧判据是"纵向一重叠就不算图注"，而 Springer 的图注常压在
+       图片上边缘（实测 Fig. 5：图 `y=297–716`、图注 `y=295.1–317.9`，重叠 20.9pt）
+       ⇒ 配不上注 ⇒ `_finalize` 判"无图注的图" ⇒ **整张图被删**（37 页那篇丢了 4 张真图：
+       Fig. 5/8/20/25）。现在按 `_CAP_OVERLAP`（或图高的 `_CAP_OVERLAP_RATIO`）放行小幅重叠，
+       压得太多（图注压根在图里面）仍不算。
+    2. **全局最近优先 + 一对一认领**。旧版逐图各挑各的最近者，会**互相抢**：实测 23 页
+       上面那张图（Fig. 20，图注压在它上沿）没配上，反而把下面 Fig. 21 的图注抢了过来
+       —— 两张图的图注全错位。现在把所有 `(图, 图注, 距离)` 排序后依次认领，最近的先落定。
+       `_CAP_SIDE_PENALTY` 给"与图片并排（横向不重叠）"的候选加代价：并排的短文本
+       更可能是邻栏的话，而不是这张图的图注。
+    3. **并排（邻栏）的图注也算**。实测 Fig. 8/21/24：图占满右栏、图注排在被挤窄的
+       **左栏**，两块纵向几乎完全重叠 —— 旧代码在这种情形下量的是"纵向重叠深度 / 图高"，
+       重叠 80.5pt 对 0.25×318pt 的阈值，**差 0.9pt 被拒**。现在分成两条路：
+       横向有重叠 ⇒ 上下关系（量纵向距离）；横向不重叠 ⇒ 并排关系（量**横向间隙**，
+       纵向重叠是必然的，不做限制）。
     """
-    result: dict[int, str] = {}
-    used: set[int] = set()
-    for img in images:
+    cands: list[tuple[float, int, int]] = []
+    for ii, img in enumerate(images):
         iy0, iy1 = img["bbox"][1], img["bbox"][3]
-        best: tuple[float, dict[str, Any]] | None = None
-        for tb in texts:
-            if id(tb) in used:
-                continue
+        ih = max(1.0, iy1 - iy0)
+        for ti, tb in enumerate(texts):
             text = " ".join(_block_text(tb).split())
             if not _caption_like(text) or len(text) > 500:
                 continue
             ty0, ty1 = tb["bbox"][1], tb["bbox"][3]
-            if ty0 >= iy1:                       # 图片下方
-                dist = ty0 - iy1
-            elif ty1 <= iy0:                     # 图片上方（部分排版图注在前）
-                dist = (iy0 - ty1) + 8
+            x_overlap = min(img["bbox"][2], tb["bbox"][2]) - max(img["bbox"][0], tb["bbox"][0])
+            if x_overlap > 0:
+                # ── 上下关系（图注在图上/下方）：按纵向距离与重叠深度判
+                gap = max(iy0 - ty1, ty0 - iy1)       # >0 分离，<0 纵向重叠
+                if gap > _CAP_MAX_GAP:
+                    continue
+                if gap < -min(_CAP_OVERLAP, _CAP_OVERLAP_RATIO * ih):
+                    continue                          # 压得太深：图注在图里面，不是它的
+                score = abs(gap) + (8.0 if gap < 0 else 0.0)
             else:
-                continue                         # 纵向重叠，不视为图注
-            if dist > 90:
-                continue
-            if best is None or dist < best[0]:
-                best = (dist, tb)
-        if best is not None:
-            used.add(id(best[1]))
-            result[id(img)] = " ".join(_block_text(best[1]).split())
+                # ── 左右关系（图注在**邻栏**、与图并排）：v11 新增
+                # 实测（37 页那篇的 Fig. 8/21/24）：图占满右栏、图注排在被挤窄的**左栏**里，
+                # 两块**纵向几乎完全重叠**（Fig. 8：图 `y 397–716`、注 `y 395–478`）。
+                # 旧代码把这种"左右并排"的候选一律加 `_CAP_SIDE_PENALTY` 后按纵向距离打分，
+                # 而纵向重叠深度又用「图高比例」判 → 重叠 80.5pt > 0.25×318pt，**刚好被拒**
+                # （差 0.9pt），于是图注配不上 → 图与图注一起消失。
+                # 并排时该量的是**横向间隙**，纵向重叠反而是必然的。
+                if min(iy1, ty1) - max(iy0, ty0) <= 0:
+                    continue                          # 既不上下、也不并排 → 不相干
+                hgap = max(img["bbox"][0] - tb["bbox"][2], tb["bbox"][0] - img["bbox"][2])
+                if hgap > _CAP_MAX_GAP:
+                    continue
+                score = hgap + _CAP_SIDE_PENALTY
+            cands.append((score, ii, ti))
+    cands.sort()
+    result: dict[int, str] = {}
+    used: set[int] = set()
+    taken: set[int] = set()
+    for _score, ii, ti in cands:
+        if ii in taken or id(texts[ti]) in used:
+            continue
+        taken.add(ii)
+        used.add(id(texts[ti]))
+        result[id(images[ii])] = " ".join(_block_text(texts[ti]).split())
     return result, used
 
 
@@ -1027,18 +1364,17 @@ def _finalize(doc: Doc) -> Doc:
                 claimed.add(j)
             break
 
-    # 3b) 剔除仍无图注的图片（期刊 logo、作者头像）——记录在 meta 中便于追溯
-    dropped: list[dict[str, Any]] = []
-    kept: list[Any] = []
-    for i, b in enumerate(merged):
-        if i in claimed:
-            continue
-        if b.type == "figure" and not (b.payload.get("caption") or "").strip():
-            dropped.append({"src": b.payload.get("src", ""), "page": b.payload.get("page")})
-            continue
-        kept.append(b)
-    doc.meta["dropped_images"] = dropped
-    doc.meta["dropped_image_count"] = len(dropped)
+    # 3b) ⚠️ v11 起**不再剔除"无图注的图片"**（2026-09-17 宿主：「和 pdf 尽量保持一致」）。
+    #     原先这一步整批删掉"无图注的图片（期刊 logo、作者头像）"，但判据本身不可靠：
+    #     图注压在图片边缘上、或图注在图上方的排版配不上注 ⇒ **真图被当成 logo 删掉**
+    #     （实测 37 页论文丢 4 张真图：Fig. 5/8/20/25，每张都连着图注一起消失）。
+    #     宁可多留一张 logo，也不能少一张图：多出来的东西看得见，少掉的看不见。
+    #     `meta` 里保留这两个键（形状不变，历史上读过它的地方不会 KeyError）。
+    doc.meta["dropped_images"] = []
+    doc.meta["dropped_image_count"] = 0
+    #     3a 认领作图的那些文本块仍要从正文流里去掉（它们的文字已经成了图注，
+    #     留在正文就是同一句话出现两遍）—— 这正是 `kept` 在这里的唯一职责。
+    kept: list[Any] = [b for i, b in enumerate(merged) if i not in claimed]
 
     # 3c) 识别**文末材料**（参考文献 + 作者简介）：从「REFERENCES 小标题」起直到文末。
     #     意义有三层：
@@ -1101,6 +1437,28 @@ def _paged_adder(doc: Doc, page_no: int):
     return add
 
 
+def _add_graphic(page: Any, add: Any, out_dir: Path, name: str, bbox: Any,
+                 place: dict[str, Any]) -> bool:
+    """把页边矢量图形渲染成透明 PNG，并作为 `deco` 块加进文档。
+
+    `deco` 是**装饰块**（v11 新增的块类型）：没有文字、不参与翻译、不参与校验
+    （`validate.NO_ZH_TYPES`），渲染端只把它当一张按物理尺寸摆放的图。
+    ⚠️ 不复用 `figure`：`figure` 的语义是"有图注的插图"（图注要译、样式带边框底色），
+    一个出版社标识套进去就会出现灰底加边框、还会被 ①c agent 当成"缺图注的图"。
+
+    返回**是否真的加进去了** —— 出图失败时调用方要能退回原路（见主循环里
+    "无图注的小图片"那一段：栅格化不成，还得老老实实当 `figure` 贴内嵌图）。
+    """
+    if not _render_graphic(page, bbox, out_dir / name):
+        return False                                      # 出图失败：少一张标识，不毁整篇
+    add("deco", "", payload={
+        "src": f"assets/{name}",
+        "bbox": [round(float(v), 1) for v in bbox],
+        **place,
+    })
+    return True
+
+
 def parse_pdf(
     pdf_path: str | Path,
     assets_dir: str | Path | None = None,
@@ -1113,16 +1471,20 @@ def parse_pdf(
 
     src = fitz.open(pdf_path)
     raw_pages: list[list[dict[str, Any]]] = []
-    lines_per_page: list[list[tuple[float, float, float, float]]] = []
+    lines_per_page: list[list[_Line]] = []
+    draws_per_page: list[list[Any]] = []
     heights: list[float] = []
     widths: list[float] = []
 
     for page in src:
         rect = page.rect
         raw_pages.append(page.get_text("dict")["blocks"])
-        # 页边横线（页眉下那条通栏细线）用得着，但 `get_drawings()` 很贵 ——
-        # 这里只留**又细又长**的那几条包围盒，绘图字典本身不留在内存里（见 `_thin_lines`）。
-        lines_per_page.append(_thin_lines(page))
+        # 矢量层（`get_drawings()`）很贵，整篇只取一次，同一页的两个消费者共用：
+        #   ① 页边横线（页眉下那条通栏细线，v10）；
+        #   ② 页边矢量图形（出版社/期刊标识，v11 —— 它们在文字层与图片层里**都不存在**）。
+        drawings = _drawings(page)
+        draws_per_page.append(drawings)
+        lines_per_page.append(_thin_lines(page, drawings))
         heights.append(rect.height)
         widths.append(rect.width)
 
@@ -1136,6 +1498,7 @@ def parse_pdf(
     section = ""
     pending_figure = None
     fig_index = 0
+    deco_index = 0
 
     for page_no, blocks in enumerate(raw_pages, start=1):
         width = widths[page_no - 1]
@@ -1170,12 +1533,57 @@ def parse_pdf(
         # 必须放在 `_split_runin_heads` **之后**算：拆出来的两块是新字典，按 `id()`
         # 盖章要在最终这批块上，否则页眉那行拆开时线会丢。
         rules = _rule_marks(text_blocks, lines_per_page[page_no - 1], heights[page_no - 1])
+        # 页边**色块/底纹** → 挂在被它衬底的那个文字块上（`_margin_shades`）。
+        shades = _margin_shades(draws_per_page[page_no - 1], text_blocks, image_blocks,
+                                heights[page_no - 1])
+
+        # 页边带里的**矢量图形**（出版社/期刊标识）—— 渲染成透明 PNG 作为 `deco` 块。
+        # 放在本页正文**之前**：它们贴在页顶带（标识、徽标），而贴在页底带的那些
+        # 放在本页正文之后（见循环末尾）—— 于是渲染出来与 PDF 的上下位置一致。
+        # 判据只看**几何**（见 `_margin_graphics`），且必须用**已滤掉不可见白字**的
+        # `text_blocks`：Springer 页脚的 `Vol.:(0123456789)` 是纯白的、恰好压在标识上，
+        # 若把它当成"可见文字"，每页的马标都会因为"压着文字"被排除。
+        page_h = heights[page_no - 1]
+        graphics = _margin_graphics(draws_per_page[page_no - 1], text_blocks, image_blocks, page_h)
+        bottoms: list[list[float]] = []
+        for gbox in graphics:
+            band_top = _band_of(gbox, page_h) == "top"
+            if not band_top:
+                bottoms.append(gbox)
+                continue
+            deco_index += 1
+            _add_graphic(src[page_no - 1], add, out_dir, f"p{page_no}_deco{deco_index}.png",
+                         gbox, _graphic_placement("top", gbox, width))
 
         for b in ordered:
             if id(b) in caption_blocks:                  # 已配作图注的文本块，不再单独成段
                 continue
             if b.get("type") == 1:                       # ── 图片
                 fig_index += 1
+                cap = captions.get(id(b), "")
+                band = _band_of(b["bbox"], page_h)
+                # 无图注 **且** 贴在页边 **且** 尺寸像个标识（不是插图）= 出版社徽标/图标之类
+                # （v11 起不再丢弃，但也不该当成正文插图：`figure` 会带边框灰底、
+                # 还会被 ①c 当成"缺图注的图"）。
+                # 典型：Springer 首页右上角的 "Check for updates"。
+                # ⚠️ **不能直接把内嵌的图片对象贴出来**（v11 本地实测踩过）：那个 30×29
+                # 的内嵌图只是徽标底下那块**平坦灰底板**（226 字节），而圆环、"Check for
+                # updates" 字样都是**矢量绘制** —— 直接贴内嵌图，页面上就是一个空的灰方块
+                # （宿主原话：「springer 的图还是没有」）。徽标是"图 + 矢量"叠出来的**一个
+                # 整体**，只有把那一块区域整体栅格化（`_add_graphic` → `_render_graphic`）
+                # 才拿得全 —— 与旁边那条"矢量标识"走同一条路。
+                # ⚠️ 尺寸这一条不能省：页底那 110pt 带里常常压着一张**大插图**
+                # （实测 37 页论文的 Fig. 21 就落在页底带，360×213pt）—— 那是正文插图，
+                # 只是没配上图注而已，不能当成"出版社标识"贴到右下角去。
+                tiny = (b["bbox"][3] - b["bbox"][1] <= _FIG_MAX_HEIGHT)
+                if not cap and band and tiny:
+                    box = b["bbox"]
+                    if _add_graphic(src[page_no - 1], add, out_dir,
+                                    f"p{page_no}_deco{deco_index + 1}.png", box,
+                                    _graphic_placement(band, box, width)):
+                        deco_index += 1
+                        pending_figure = None
+                        continue
                 name = ""
                 raw_bytes = b.get("image")
                 if raw_bytes:
@@ -1198,7 +1606,7 @@ def parse_pdf(
                     "figure", "", section=section,
                     payload={
                         "src": f"assets/{name}" if name else "",
-                        "caption": captions.get(id(b), ""),
+                        "caption": cap,
                         "bbox": [round(v, 1) for v in b["bbox"]],
                     },
                 )
@@ -1220,25 +1628,35 @@ def parse_pdf(
 
             level = _heading_level(b, body_size)
             clean_src = _text_without_logo(b, body_size)
-            # 版面边带（页眉/页脚）与页边横线：**版面事实**，渲染端据此画页边装饰
+            # 版面边带（页眉/页脚）、页边横线与底纹：**版面事实**，渲染端据此画页边装饰
             # （宿主 2026-09-17：「页眉文字不需要有意丢掉。和 pdf 尽量保持一致」）。
             band = _edge_band(b, heights[page_no - 1])
             rule = rules.get(id(b))
+            shade = shades.get(id(b))
             if level == 1:
                 _tag_furniture(add("h1", _desmallcaps(clean_src), section=section, level=1),
-                               band, rule)
+                               band, rule, shade)
                 continue
             if level is not None:
                 clean = _desmallcaps(clean_src)
                 section = clean
-                _tag_furniture(add(f"h{level}", clean, section=section, level=level), band, rule)
+                _tag_furniture(add(f"h{level}", clean, section=section, level=level),
+                               band, rule, shade)
                 continue
 
-            blk = _tag_furniture(add("p", " ".join(text.split()), section=section), band, rule)
+            blk = _tag_furniture(add("p", " ".join(text.split()), section=section), band, rule, shade)
             # 疑似「栏间被切开的续段」→ 盖戳（**只标记**，"该不该并"交给①c 校对 agent，
             # 见 `_column_spill_seams`）。
             if id(b) in seams:
                 blk.payload["seam"] = seams[id(b)]
+
+        # 贴在页底带的矢量图形（出版社页脚标识）—— 放在本页正文**之后**，
+        # 于是它在分页容器里出现在页底，与 PDF 的位置一致（✕ 若一律放在页首，
+        # 页脚的 Springer 马标会跑到每页正文顶上）。左右按原件的排版交替（见 `_graphic_placement`）。
+        for gbox in bottoms:
+            deco_index += 1
+            _add_graphic(src[page_no - 1], add, out_dir, f"p{page_no}_deco{deco_index}.png",
+                         gbox, _graphic_placement("bottom", gbox, width))
 
     src.close()
     return _finalize(doc)
