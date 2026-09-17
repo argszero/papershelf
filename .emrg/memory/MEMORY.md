@@ -180,13 +180,18 @@ v10 白做；实测 agent **一个没删**（2 页 / 52k tokens）。`PARSE_VERS
 **待宿主**：生产已上线（CI 六 job 绿 / healthy / health 200 / bundle `index-8YofT6DN.js` 与本地逐字节一致 /
 容器内直调证明线上就是 v11 + `typeset=False` 干净 / 真浏览器三模式与三条 CSS 规则实测在位）；
 **页面上看到标识与灰底还要宿主自己点「重新提取」**（生产那篇是 v11 之前解析的）。
-⚠️ 顺带扒出一个**死配置**：`PAPERSHELF_TOKEN_BUDGET` 只有 `config.py` 读、没人用（成本护栏 = 空话），待宿主定语义。
+**死配置已定案删除**（2026-09-17 宿主「不需要 PAPERSHELF_TOKEN_BUDGET 限制」，`08dcd7f`）：
+`Settings.token_budget_per_paper` 全仓库没人用（107 万 tokens 也拦不下）⇒ 字段 + `.env.example` +
+`docs/install.md` 三处一起删，遗留待定项 **5 结**；**保留** `PAPERSHELF_PROOFREAD_TOKEN_BUDGET`（活代码）。
+新增 `tests/test_config_guard.py` 3 项**类不变式**护栏（配置项必须有消费端 / 死名不得被读 / 活那条必须仍接线）。
 
 ### 遗留待定项已结（M3 后全部结清或明确推后）
 1 会话机制 ✅ · 2 前端框架 ✅（React+TS+Vite）· 3 任务队列 ✅（**v1 常驻队列 + 启动恢复**，㉗）·
 7 翻译去重 ✅（PDF hash 缓存）· 8 公式渲染 ✅（**服务端 MathML**）· 10 版权警示 ✅ ·
-11 失败呈现 ✅（**全链**：行内显示失败原因全文）· 12 人工修订保护 ✅ · 13 进度回落 ✅（**auto 只增不减**；未读→清零）
-**明确推后**：4 术语表归属（v1 计划级）· 5 成本护栏数值 · 6 用量面板（已攒 `tokens_used`，v2）·
+11 失败呈现 ✅（**全链**：行内显示失败原因全文）· 12 人工修订保护 ✅ · 13 进度回落 ✅（**auto 只增不减**；未读→清零）·
+**5 成本护栏数值 ✅ 已结（2026-09-17）**：宿主定「**不做单篇总 token 预算**」→ 那个死配置已删，
+成本由 `MAX_CONCURRENCY` / `MAX_ATTEMPTS` / `PAPERSHELF_PROOFREAD_TOKEN_BUDGET`（①c 累计预算，活代码）三处挡住
+**明确推后**：4 术语表归属（v1 计划级）· 6 用量面板（已攒 `tokens_used`，v2）·
 9 图表 VLM（v2）· 14 标签词表（v1 自由标签）
 
-_Last updated: 2026-09-17T16:20:00+08:00_
+_Last updated: 2026-09-17T16:50:00+08:00_

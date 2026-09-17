@@ -255,7 +255,7 @@ DB 与 `.env` 部署前已备份。生产实测（宿主数据 paper 2）：`pro
 生产验收改用「取 `papershelf_session` cookie → curl PATCH → 查库 + 硬刷 UI」，
 **诚实边界**：那验的是服务端逻辑 + 前端渲染，真实滚轮那一段只在本地验过。
 
-_Last updated: 2026-09-17T16:20:00+08:00_
+_Last updated: 2026-09-17T16:50:00+08:00_
 
 ### 最近一轮（2026-09-16 晚）㊳ 标题行也能划重点 / 加笔记（宿主 19:14 截图报告）
 
@@ -474,3 +474,18 @@ DB 与 `.env` 事前已备份（`/tmp/*.bak.20260917-154522`）。
 
 **顺带发现死配置**：`PAPERSHELF_TOKEN_BUDGET` 只有 `config.py` 读、**无人使用**（真转换烧 107 万 tokens 也不会被拦）
 ⇒ 遗留待定项 5 的成本护栏目前是空话；修法有语义选择，等宿主定。
+
+### 同一轮：死配置 `PAPERSHELF_TOKEN_BUDGET` 定案删除（2026-09-17 16:4x，宿主「不需要限制」）
+
+宿主：「不需要 PAPERSHELF_TOKEN_BUDGET 限制」。它是一个**空话配置**：`config.py` 读进来存成
+`Settings.token_budget_per_paper`，**全仓库没有任何消费端** —— 真转换烧 107 万 tokens 一次都没拦过，
+而文档还写着「单篇 token 预算」（比没有护栏更糟：排障时会先去确认自己设对了）。
+⇒ `08dcd7f`：删字段 + `.env.example` + `docs/install.md`，`docs/design.md` 口径同步，遗留待定项 **5 结**。
+⚠️ **保留** `PAPERSHELF_PROOFREAD_TOKEN_BUDGET`（①c agent 累计预算，**活代码**，名字只差一个词）。
+新增 `tests/test_config_guard.py`（3 项）**类不变式**护栏：① 每个 `Settings` 字段都要有消费端；
+② 死名不得被读取（精确整名，注释里说明"为什么删"不算违规）；③ 活那条必须仍接线。
+变异检验：死字段加回 → 红；随便加个没人用的新字段 → 红。离线回归 **406 passed**；CI run 绿；**未上生产**
+（行为中性：删的是一段没人走的代码，生产 `.env` 里那行留着也无作用）。
+**教训（写进测试注释了）**：第一版判据写成"环境变量名要在别处出现"—— **判据错了**，
+把 `PAPERSHELF_PROOFREAD_DPI` 这类**真在用**的项全报成死配置（消费端写 `settings.proofread_dpi`）。
+**"被消费"要按代码里的字段名量，不是按变量名量。**

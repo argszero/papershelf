@@ -1847,7 +1847,7 @@ DB 与 `.env` 部署前已备份（`papershelf.db.bak.20260917-085812`、`.env.b
 | 2 | 前端框架 | React / Svelte / Vue 未定 |
 | 3 | ~~任务队列实现~~ | ✅ **已结（2026-09-12）** → 见决策 **㉗**：进程内常驻队列 + DB 轮询 + 启动恢复 + 原子认领（仍单 worker；横向扩再换实现） |
 | 4 | 术语表归属 | 应为计划级（与 ⑦ 一致），待确认 |
-| 5 | 成本护栏具体数值 | 并发、单篇 token 预算、重试上限（㉑ 无用量可见性 → 只能凭经验设） |
+| 5 | 成本护栏具体数值 | ✅ **已结（2026-09-17，宿主：「不需要 PAPERSHELF_TOKEN_BUDGET 限制」）**：**不做单篇总 token 预算** —— 原先那个字段全仓库没人用（真转换烧 107 万 tokens 也拦不下，文档却写着"单篇 token 预算"），已删。成本由三处挡住：`MAX_CONCURRENCY`（同时几篇）、`MAX_ATTEMPTS`（同一篇能重试几次）、`PAPERSHELF_PROOFREAD_TOKEN_BUDGET`（①c agent 累计预算，**活代码**）。同时新增 `tests/test_config_guard.py` 防"读了没人用"的配置复活 |
 | 6 | 用量/费用可见性 | ㉑ 明确 v1 不做；但 ⑧⑭ 是「他人消耗部署者资源」的结构，事后应补（管理员用量面板或告警） |
 | 7 | 翻译结果去重 | PDF hash 缓存以省重复 LLM 花费（不改 ⑦ 归属模型） |
 | 8 | 公式渲染方案 | ⑳ 确定前端自建渲染；**不应依赖 MathJax CDN**（离线/内网部署会失效），需定方案（KaTeX 本地化 / 服务端渲染公式为 SVG）。与 **15**（公式 LaTeX 化）联动 |
@@ -2074,9 +2074,19 @@ DB 与 `.env` 部署前已备份（`/tmp/papershelf.db.bak.20260917-154522`、`/
   顺带记一笔生产数据现状：只有 1 篇（`status=reading` / `convs_state=done` / `tokens_used=210044` /
   `updated_at 2026-09-17T06:13Z` = 本地 14:13，宿主自己跑过一轮），`notes 0 / highlights 0`。
 
-**⚠️ 本轮顺带发现一个死配置**：`PAPERSHELF_TOKEN_BUDGET`（文档 `docs/install.md` 写「单篇 token 预算」，默认 400k）
-**全仓库只有 `config.py` 读它、没有任何地方用它** —— 真实转换烧 107 万 tokens 也不会被它拦下。
-属遗留待定项 5（成本护栏数值）；修有语义选择（硬停 vs 只警告），**未动，待宿主定**。
+**⚠️ 本轮顺带发现一个死配置 → 同日宿主定案并删除**：`PAPERSHELF_TOKEN_BUDGET`
+（文档 `docs/install.md` 写「单篇 token 预算」，默认 400k）**全仓库只有 `config.py` 读它、没有任何地方用它**
+—— 真转换烧 107 万 tokens 也不会被拦。宿主 2026-09-17：「**不需要 PAPERSHELF_TOKEN_BUDGET 限制**」
+⇒ 已删（`08dcd7f`）：`Settings.token_budget_per_paper`、`.env.example`、`docs/install.md` 三处一起收；
+`docs/design.md` 的护栏条目同步改口径；遗留待定项 **5 结**（不做单篇总 token 预算）。
+⚠️ **`PAPERSHELF_PROOFREAD_TOKEN_BUDGET`（①c agent 的累计预算）保留** —— 名字只差一个词，但那条是活代码。
+**新增 `tests/test_config_guard.py`（3 项）**，判据是**类不变式**不是"某个名字有没有被删"：
+① `Settings` 每个字段都必须有消费端（`settings.<字段>` 或同文件派生属性）⇒ 任何"只读不用"的新配置项立刻转红；
+② `PAPERSHELF_TOKEN_BUDGET` 不得被**读取**（精确整名，不吃掉 `PROOFREAD_` 那条）—— 说明它被删的注释不算违规；
+③ 反向护栏：那条活的必须仍然接线（config → converter → agent 三处）。变异检验：死字段加回→红、随便加个没人用的新字段→红。
+> 这条测试自己踩的坑也值得记：**第一版判据写的是"环境变量名要在别处出现"—— 判据错了**，
+> 它把 `PAPERSHELF_PROOFREAD_DPI` 这些**真在用**的项全报成死配置（消费端写的是 `settings.proofread_dpi`，
+> 不是变量名）。**"被消费"要按代码里的字段名量，不是按变量名量。**
 
 ---
 

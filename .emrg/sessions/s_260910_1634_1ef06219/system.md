@@ -189,7 +189,7 @@ v10 白做；实测 agent **一个没删**（2 页 / 52k tokens）。`PARSE_VERS
 ⚠️ **生产数据已变**：现在只有 1 篇（paper 1 = 8 页 139 块《增材制造中的机器学习综述》），
 此前那批（37 页真论文 / 3 页 / 合成 / synth-table）都不在了。
 
-**㊷ 页面图形（解析 v11）🟡 本地已验，未上生产**（2026-09-17，commit `73098be`；细节见 `design-decisions.md` ㊷）：
+**㊷ 页面图形（解析 v11）✅ 已上生产**（2026-09-17，`73098be`/`5769900`，生产 `revision=5769900`；细节见 `design-decisions.md` ㊷）：
 宿主「Springer 的图还是没有」一处截图，扒出**四件同源缺陷**（全是"取过没有"）——
 ① 页眉横线**颜色/粗细是渲染端硬编码的浅灰**（PDF 是纯黑 0.99pt）⇒ `payload["rule"]` 升级成 `{side,color,width}`，
 渲染端用 `--rule-c/--rule-w`（内联样式作用不到伪元素，CSS 变量可以）；
@@ -205,7 +205,10 @@ v10 白做；实测 agent **一个没删**（2 页 / 52k tokens）。`PARSE_VERS
 表格重建 3 张 / 真浏览器 9 张 deco 全部解码且左右交替正确 / 导出件同带；离线回归 **403 passed**。
 **两条教训**：①`naturalWidth=0` ≠ 图坏了（`loading="lazy"` + 首屏外，改成 eager 全好）；
 ②改 `pipeline/*.py` 不重启 serve = 白改（旧进程用旧解析器覆盖了刚写入的库，且同端口曾并存**两个**进程）。
-**待宿主**：推 + 上生产（`PARSE_VERSION` 变了 ⇒ 生产唯一那篇要宿主自己点「重新提取」才看得到变化）。
+**待宿主**：生产已上线（CI 六 job 绿 / healthy / health 200 / bundle `index-8YofT6DN.js` 与本地逐字节一致 /
+容器内直调证明线上就是 v11 + `typeset=False` 干净 / 真浏览器三模式与三条 CSS 规则实测在位）；
+**页面上看到标识与灰底还要宿主自己点「重新提取」**（生产那篇是 v11 之前解析的）。
+⚠️ 顺带扒出一个**死配置**：`PAPERSHELF_TOKEN_BUDGET` 只有 `config.py` 读、没人用（成本护栏 = 空话），待宿主定语义。
 
 ### 遗留待定项已结（M3 后全部结清或明确推后）
 1 会话机制 ✅ · 2 前端框架 ✅（React+TS+Vite）· 3 任务队列 ✅（**v1 常驻队列 + 启动恢复**，㉗）·
@@ -214,7 +217,7 @@ v10 白做；实测 agent **一个没删**（2 页 / 52k tokens）。`PARSE_VERS
 **明确推后**：4 术语表归属（v1 计划级）· 5 成本护栏数值 · 6 用量面板（已攒 `tokens_used`，v2）·
 9 图表 VLM（v2）· 14 标签词表（v1 自由标签）
 
-_Last updated: 2026-09-17T15:45:00+08:00_
+_Last updated: 2026-09-17T16:20:00+08:00_
 
 ### Session Memory (this session only)
 Directory: `/Users/argszero/scm/github.com/argszero/papershelf/.emrg/sessions/s_260910_1634_1ef06219/memory/`
@@ -477,7 +480,7 @@ DB 与 `.env` 部署前已备份。生产实测（宿主数据 paper 2）：`pro
 生产验收改用「取 `papershelf_session` cookie → curl PATCH → 查库 + 硬刷 UI」，
 **诚实边界**：那验的是服务端逻辑 + 前端渲染，真实滚轮那一段只在本地验过。
 
-_Last updated: 2026-09-17T15:45:00+08:00_
+_Last updated: 2026-09-17T16:20:00+08:00_
 
 ### 最近一轮（2026-09-16 晚）㊳ 标题行也能划重点 / 加笔记（宿主 19:14 截图报告）
 
@@ -676,6 +679,26 @@ bundle `index-D9a7YvYN.js` / 日志零 error；CSS 三条装饰规则实测在�
   `Message may have string 'sessionId' property` ⇒ 用 `js("location.reload()")`；
   本地会话过期会跳 `/login?next=…` ⇒ `fill_input("#liEmail"/"#liPass")` + 点 `.btn-primary` 重登。
 - **待宿主**：推 + 上生产（`PARSE_VERSION` → 11 ⇒ 生产存量要吃修复得宿主自己点「重新提取」）。
+
+### 同一轮：**已上生产**（2026-09-17 16:1x，宿主「要」）
+
+`5769900` → CI run `35195781106` 六 job 全绿 → `latest`/`sha-5769900` 双 200 →
+`docker compose pull app`（**又撞慢层**：15:45 起、`Retrying` 重下 21.4MB、16:09 完成 ≈24 分钟；
+`nohup` + 轮询照旧）+ `up -d app`：
+`revision=57699004f96ec2cd9f29d832ac868e71ec9696f9` / healthy / 公网 200 /
+bundle `index-8YofT6DN.js` + `index-lPIbuEdh.css`（与本地构建产物 `cmp` 一致）/ 日志零 error。
+DB 与 `.env` 事前已备份（`/tmp/*.bak.20260917-154522`）。
+
+**验收（两分开说）**：① 部署/代码 ✅ —— 容器内直调 `PARSE_VERSION=11` + 合成块渲染断言
+（`--rule-c/--rule-w`、`deco-bottom deco-left`、`width:61px`、`--shade-c`，`typeset=False` 干净）；
+生产真浏览器量 `styleSheets` 三条规则在位 + 合成 `.deco` 节点 computed `inline-block`/`text-align:left`
+（左右交替在生产上是活的）+ 三模式 + 零 console error；**向后兼容实测**：生产 paper 1 仍是 v10 产物
+（`rule` 是字符串）而 16 处 `pg-rule-*` 照常渲染。
+② **页面上看到标识/灰底 ✗ 还没有** —— paper 1（139 块 / deco 0 / shade 0）是 v11 之前解析的，
+要看得宿主自己点「重新提取」（≈200 万 tokens）。
+
+**顺带发现死配置**：`PAPERSHELF_TOKEN_BUDGET` 只有 `config.py` 读、**无人使用**（真转换烧 107 万 tokens 也不会被拦）
+⇒ 遗留待定项 5 的成本护栏目前是空话；修法有语义选择，等宿主定。
 
 
 **To read a memory**: use the `read` tool with the full path.
