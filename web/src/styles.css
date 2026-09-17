@@ -445,6 +445,22 @@ select.input { width: auto; }
 .page-foot .pf-rule { flex: 1; height: 1px; background: var(--border); }
 .page-foot .pf-no { font-family: var(--font-mono); font-size: 10.5px; color: var(--muted); white-space: nowrap; }
 
+/* ── 页面家具：页眉/页脚小字 + 页边横线（v10）───────────────────────────────
+   解析阶段把**版面事实**盖在块上（`payload.band` = 贴在页顶/页底、`payload.rule` =
+   这一侧有一条通栏细线），服务端 `markup.render_block`（只在 `typeset=True`，即给人看
+   的渲染）据此给块挂 `pg-*` 类。**阅读器不自已算坐标** —— 类名与 `markup.CSS` 里
+   那几条必须成对（有护栏 `tests/test_style_guard.py` 钉住）。
+   字号/颜色照 PDF 的做法：页眉是 8.5pt 灰字（正文 10pt），所以这里比正文小一档、用 muted。 */
+.pg-band { font-size: calc(var(--doc-fs) - 2.5px); color: var(--muted); line-height: 1.5; }
+.pg-band.pg-top { margin-top: 0; }
+.pg-band.pg-bottom { margin-bottom: 0; }
+.pg-rule-below::after, .pg-rule-above::before { content: ''; display: block; border-top: 1px solid var(--border); }
+.pg-rule-below::after { margin: 5px 0 14px; }
+.pg-rule-above::before { margin: 14px 0 5px; }
+/* 标题的 `<h1..h4>` 外壳由阅读器出，服务端只能回一个 `<span>` 兜住装饰
+   （`<h2>` 里塞 `div` 会被浏览器甩出去）→ 扶正成块级，线才横跨得起来。 */
+span.pg-rule-below, span.pg-rule-above { display: block; }
+
 .doc-head { margin-bottom: 20px; padding-bottom: 16px; border-bottom: 1px solid var(--border); }
 .doc-venue { font-family: var(--font-mono); font-size: 11px; color: var(--muted); letter-spacing: 0.03em; margin: 0 0 10px; }
 .doc-title { font-family: var(--font-doc-serif); font-size: 27px; line-height: 1.18; letter-spacing: -0.01em; margin: 0 0 12px; }

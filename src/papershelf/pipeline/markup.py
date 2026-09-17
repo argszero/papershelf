@@ -44,6 +44,20 @@ table.datatable caption{caption-side:top;text-align:left;font-size:13.5px;color:
 table.datatable th,table.datatable td{border:1px solid var(--rule);padding:6px 9px;vertical-align:top}
 .abstract{background:var(--bg-abstract);border-left:3px solid var(--accent);padding:14px 18px;margin:0 0 22px}
 p.ref-item{font-size:13.5px;color:#444;margin:0 0 6px;padding-left:20px;text-indent:-20px}
+/* ── 页面家具（见 `_furn_cls`）─────────────────────────────────────────────
+   页眉/页脚小字：比正文小一号、灰。PDF 里它们是 8.5pt（正文 10pt），
+   「和 pdf 尽量保持一致」就是把这点字号差也带上。
+   页边横线：`::after`/`::before` 的 border —— 线跟着**承载它的那个块**走，
+   块被 ①c 改写/挪动时线不会跑到别处（这也正是把线挂在块上、而不是挂在页上的原因）。 */
+.pg-band{font-size:.84em;color:#6b6b6b;line-height:1.5}
+.pg-band.pg-top{margin-top:0}
+.pg-band.pg-bottom{margin-bottom:0}
+.pg-rule-below::after,.pg-rule-above::before{content:"";display:block;border-top:1px solid var(--rule)}
+.pg-rule-below::after{margin:6px 0 16px}
+.pg-rule-above::before{margin:16px 0 6px}
+/* 标题的 `<h1..h4>` 外壳由阅读器出（`wrap=False`），服务端只能回一个 `<span>` 兜住装饰
+   （`<h2>` 里塞 `div` 会被浏览器甩出去）→ 这里把它扶正成块级，线才横跨得起来。 */
+span.pg-rule-below,span.pg-rule-above{display:block}
 [data-b]{scroll-margin-top:14px}
 """
 
@@ -52,6 +66,40 @@ MATHJAX = ""   # 已移除 CDN 依赖：公式改为服务端 LaTeX → MathML�
 
 def _esc(s: str) -> str:
     return _html.escape(s or "", quote=False)
+
+
+# ── 页面家具（页眉/页脚小字 + 页边横线，v10 决策）───────────────────────────
+# 解析阶段把**版面事实**盖在块的 `payload` 上（`parse._tag_furniture`）：
+#   `band` = "top"/"bottom" —— 这行字贴在页面上下边缘（期刊页眉、页码、出版社页脚）；
+#   `rule` = "below"/"above" —— 这行字的一侧有一条横跨正文列的细线（Springer 页眉线）。
+# 渲染端只**读**这两个戳，不自己按坐标猜（同 ㊴「配对判据只在服务端」：判据写两份迟早漂开）。
+#
+# 为什么只有这几条样式：宿主 2026-09-17「页眉文字不需要有意丢掉。和 pdf 尽量保持一致」——
+# 文字留下来之后，如果按正文的 16.5px 渲染，屏幕上每页都顶着一行"和正文一样大的页眉"，
+# 看起来像重复段落。PDF 里它是 8.5pt（正文 10pt）的灰字，所以这里就把它渲成
+# **稍小 + 灰**，并在它那一侧补回那条线（矢量线此前一条都不在产物里）。
+#
+# ⚠️ 页边带的字号/颜色只作用于 `p`/`refs`（`_BAND_TYPES`）：标题有自己的字号层级，
+#    万一有个真标题落在页顶带里，也不该被压成灰字。横线则与块类型无关。
+_BAND_TYPES = ("p", "refs")
+
+
+def _furn_cls(b: Block) -> str:
+    """块的**版面装饰** CSS 类（`pg-band pg-top` / `pg-rule-below` …）；没有则空串。
+
+    ⚠️ 只在**给人看的渲染**（`typeset=True`）里挂（`render_block` 里判）：
+    校验/翻译/LaTeX 化 prompt 走的是 `typeset=False`，产物必须逐字不变
+    （它们要的是"块的文本"，多一层 class 属性只会让 prompt 变脏、让 diff 失真）。
+    """
+    p = b.payload if isinstance(b.payload, dict) else {}
+    out: list[str] = []
+    band = p.get("band")
+    if band in ("top", "bottom") and b.type in _BAND_TYPES:
+        out.append(f"pg-band pg-{band}")
+    rule = p.get("rule")
+    if rule in ("below", "above"):
+        out.append(f"pg-rule-{rule}")
+    return " ".join(out)
 
 
 def _mathy(text: str, *, typeset: bool) -> str:
@@ -278,6 +326,18 @@ def render_block(b: Block, *, lang: str, marker: bool = True, typeset: bool = Fa
     attr = f' data-b="{b.id}"' + (' data-nt="1"' if nt else "") if marker else ""
     t = b.type
     mine = [m for m in (marks or []) if m.get("lang") == lang]
+    # 版面装饰类（页边带 + 页边横线）；**只给人看的渲染**挂（见 `_furn_cls`）。
+    furn = _furn_cls(b) if typeset else ""
+
+    def elem(tag: str, base: str = "") -> str:
+        """开标签：把版面装饰类与这个类型本来的类名合成**一个** `class` 属性。
+
+        ⚠️ 必须合成而不能各写各的 —— 直接往 `attr` 前面再拼一个 `class="…"`
+        会得到 `<h2 class="sec" class="pg-rule-below">`，浏览器只认第一个，
+        装饰**静默失效**（这类"多写一个属性"的坑没有报错，只有肉眼看才看得出来）。
+        """
+        cls = " ".join(x for x in (base, furn) if x)
+        return f'<{tag} class="{cls}"{attr}>' if cls else f"<{tag}{attr}>"
 
     def prose(chunk: str) -> str:
         """正文段的内部 HTML：划痕 + 偏移锚点（都在公式渲染**之前**按裸文本切好）。"""
@@ -285,29 +345,37 @@ def render_block(b: Block, *, lang: str, marker: bool = True, typeset: bool = Fa
 
     if t in ("h1", "h2", "h3", "h4"):
         tag = {"h1": "h1", "h2": "h2", "h3": "h3", "h4": "h4"}[t]
-        cls = ' class="sec"' if t == "h2" else (' class="sub"' if t == "h3" else "")
+        cls = "sec" if t == "h2" else ("sub" if t == "h3" else "")
         # ⚠️ 标题也是**可选中的文字**，所以它同样必须走 `prose()`（2026-09-16 宿主：
         # 「标题行，选中后没有笔记工具的弹出 mark-bar」）。原先这里是 `_esc(text)`，
         # 于是标题既没有零宽锚点（前端量不出字符坐标）、也没有 `<mark>`（划痕渲染不出来）
         # —— 表现是"选中标题什么都不会发生"，看起来像前端坏了，其实是**渲染器少给了一把尺子**。
         # `typeset=False` 时 `prose()` 就是 `_esc()`，导出/校验产物逐字不变。
         body = prose(text)
-        return f"<{tag}{cls}{attr}>{body}</{tag}>" if wrap else body
+        if wrap:
+            return f"{elem(tag, cls)}{body}</{tag}>"
+        # `wrap=False`：`<h1..h4>` 外壳由阅读器出，这里只回内部 HTML。
+        # 但**页边横线不能就这么丢掉**（㊳ 的教训：渲染器少给一点，前端就整条路不可用）
+        # —— 用一个 `<span>` 兜住（`<h2>` 里只允许短语内容，`div` 会被浏览器甩出去），
+        # `span.pg-rule-*` 在 CSS 里是 `display:block`，线照样横跨一行。
+        if furn:
+            return f'<span class="{furn}">{body}</span>'
+        return body
     if t == "abstract":
-        return f'<div class="abstract"{attr}>{prose(text)}</div>'
+        return f"{elem('div', 'abstract')}{prose(text)}</div>"
     if t == "figure":
         src = b.payload.get("src", "")
         # 图注也走翻译通道：中文视图用译文，未译时回落英文原文（图片本体由 payload.src 渲染）
         cap = (text or "").strip() or b.payload.get("caption", "")
         img = f'<img src="{_esc(src)}" alt="">' if src else ""
         cap_html = f"<figcaption>{_mathy(cap, typeset=typeset)}</figcaption>" if cap else ""
-        return f"<figure{attr}>{img}{cap_html}</figure>"
+        return f"{elem('figure')}{img}{cap_html}</figure>"
     if t == "table":
         rows = table_cells(b, lang)
         if not rows:
             # 网格缺失（历史数据 / 别的生产者只填了 `en`）→ 按段落渲染，
             # 绝不吐一张空表壳（空表在页面上是"什么都没有"，比看到原文更糟）。
-            return f"<p{attr}>{prose(text)}</p>"
+            return f"{elem('p')}{prose(text)}</p>"
         cap = table_caption(b, lang)
         # ⚠️ **表格的每一格也要在划痕的坐标系里**（2026-09-16 决策㊵ —— 宿主：
         # 「表格也需要支持选中后出mark-bar」）。表格的裸文本是"表注一行 + 每行以
@@ -330,22 +398,22 @@ def render_block(b: Block, *, lang: str, marker: bool = True, typeset: bool = Fa
                 for j, c in enumerate(row)
             )
             body.append(f"<tr>{inner}</tr>")
-        return f'<table class="datatable"{attr}>{cap_html}{"".join(body)}</table>'
+        return f"{elem('table', 'datatable')}{cap_html}{''.join(body)}</table>"
     if t == "refs":
         # 同标题：参考文献条目也是可选中的文字（宿主常在上面标"这篇要读"），
         # 走 `prose()` 才有锚点与 `<mark>`；`typeset=False` 时输出与 `_esc()` 逐字相同。
-        return f'<p class="ref-item"{attr}>{prose(text)}</p>'
+        return f"{elem('p', 'ref-item')}{prose(text)}</p>"
     if t == "eq":
         latex = b.payload.get("latex", "") or text
         # eq 块的 payload 是**裸 LaTeX**（无定界符）→ 必须走 render_math_block
         if typeset:
             inner = render_math_block(latex, str(b.payload.get("number") or ""))
-            return f'<div class="eq"{attr}>{inner}</div>'
+            return f"{elem('div', 'eq')}{inner}</div>"
         # 校验用：保留源码，编号以 \tag{} 形式挂在公式末尾
         num = b.payload.get("number")
         tag = f" \\tag{{{num}}}" if num else ""
-        return f'<div class="eq"{attr}>\\[ {_esc(latex)}{tag} \\]</div>'
-    return f"<p{attr}>{prose(text)}</p>"
+        return f"{elem('div', 'eq')}\\[ {_esc(latex)}{tag} \\]</div>"
+    return f"{elem('p')}{prose(text)}</p>"
 
 
 def render_fragment(blocks: list[Block], *, lang: str, marker: bool = True,

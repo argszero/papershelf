@@ -54,11 +54,15 @@ from .model import Doc, make_block_id
 #        标题**之前**（宿主 2026-09-17 实测截图）
 #   v9 → 页眉/页脚带里的**白色（不可见）文字**不入产物（`_drop_invisible_spans`）：
 #        Springer 首页那行纯白 `Vol.:(0123456789)` 曾被当成正文段落渲染、还要白送翻译
-PARSE_VERSION = 9
+#   v10 → ①**不再有意丢弃页眉/页脚文字**（`_running_headers` 整个撤掉：跨页重复就删，
+#         删掉的是"和 pdf 一致"的版面内容 —— 宿主 2026-09-17：「页眉文字不需要有意丢掉。
+#         和 pdf 尽量保持一致」）；②盖 `payload["band"]`（页边带）与 `payload["rule"]`
+#         （**页边横线的位置**，见 `_rule_marks`）—— 矢量线条此前一条都没进产物，
+#         每页页眉下那条通栏细线整份文档都不见（宿主：「这里少了一条水平线」）
+PARSE_VERSION = 10
 
 # 页面上下边缘（比例），落在其中的短文本块视为页眉/页脚候选
 EDGE_TOP, EDGE_BOTTOM = 0.075, 0.925
-MIN_REPEAT_RATIO = 0.3   # 跨页重复比例超过此值 → 判为页眉/页脚
 CAPTION_PREFIXES = ("fig", "figure", "table", "tab.", "表", "图")
 
 # ── 阅读顺序（分区 + 栏间空白）──────────────────────────────────────────────
@@ -75,6 +79,13 @@ _MIN_COL_BLOCKS = 2
 # 版面边角带（比例）：落在距页顶/页底这条带内的块**可能是**页眉/页脚/页码/水印。
 # 它只用来判断"该不该参与分段/分栏"（见 `_marginal`），不决定取舍。
 _MARGIN_BAND = 0.05
+
+# ── 页边横线（期刊页眉下那条通栏细线）───────────────────────────────────────
+# 见 `_rule_marks`：PyMuPDF 的 `get_text()` 只回文字，**矢量线条一条都不在产物里**。
+_RULE_BAND = 0.14           # 只在距页顶/页底这一比例内找页边横线
+_RULE_MAX_THICKNESS = 2.0   # 线的粗细上限（pt）：比这"厚"的是方框/色块，不是规则线
+_RULE_MAX_GAP = 26.0        # 线离那行文字多远之内才算"这行文字的线"（pt）
+_RULE_EDGE_SLACK = 0.06     # 线两端各允许离正文文字列边缘的比例（超过就不是通栏线）
 
 # 章节编号模式（IEEE/学术常见）：顶层「I. / II.」，次级「A. / B.」，深层「1.1 / 2.3.1」
 _RE_H2 = re.compile(r"^([IVX]{1,6})\.\s+\S")
@@ -254,8 +265,10 @@ def _marginal(block: dict[str, Any], width: float, height: float,
     页眉页脚不是正文，本就不该参与分栏或段落流；把它们从**版面分段**里摘掉，
     顺序里不再出现"中间被边缘块打断"，正文两栏就能连续地一栏读到底。
 
-    ⚠️ 只影响**排列顺序**，不影响块的取舍：真正的过滤仍由 `_running_headers`
-    （跨页重复的短文本）与 `_RE_WATERMARK` 负责，这里不删任何内容。
+    ⚠️ 只影响**排列顺序**，不影响块的取舍：页眉/页脚文字**照旧留在产物里**
+    （v10 起 `_running_headers` 那道过滤已整个撤掉，见模块头的版本历史；宿主
+    2026-09-17：「页眉文字不需要有意丢掉。和 pdf 尽量保持一致」）。这里唯一还删的
+    是出版社水印（`_RE_WATERMARK`）与期刊 logo（`_RE_JUNK`），两条都与页眉无关。
     """
     if _edge_band(block, height) is None:
         return False
@@ -507,19 +520,93 @@ def _column_spill_seams(
     return out
 
 
-def _running_headers(pages: list[list[dict[str, Any]]], heights: list[float]) -> set[str]:
-    """跨页重复出现在页边短文本 → 页眉/页脚。"""
-    counter: Counter[str] = Counter()
-    for blocks, h in zip(pages, heights):
-        for b in blocks:
-            text = _block_text(b)
-            if not text or len(text) > 120:
-                continue
-            y0, y1 = b["bbox"][1], b["bbox"][3]
-            if y1 < h * EDGE_TOP or y0 > h * EDGE_BOTTOM:
-                counter[text] += 1
-    threshold = max(2, int(len(pages) * MIN_REPEAT_RATIO))
-    return {t for t, n in counter.items() if n >= threshold}
+def _tag_furniture(blk: Any, band: str | None, rule: str | None) -> Any:
+    """给块盖**版面事实**戳：`band`（页边带：top/bottom）与 `rule`（页边横线：below/above）。
+
+    这两个戳只影响**渲染**（页眉/页脚的小字与那条线），不参与翻译、不参与校验：
+    `band` 只说"这一行贴在页面上下边缘"，`rule` 只说"它的一侧有一条页边横线"。
+    渲染端读它们（`markup.render_block` / 阅读器 / 导出），**不再自己按坐标猜**
+    （同 ㊴「配对判据只在服务端」：判据写两份，迟早漂开）。
+    """
+    if band:
+        blk.payload["band"] = band
+    if rule:
+        blk.payload["rule"] = rule
+    return blk
+
+
+def _thin_lines(page: Any) -> list[tuple[float, float, float, float]]:
+    """这一页上**又细又长的横线**的包围盒 `(y0, y1, x0, x1)`。
+
+    只用 `get_drawings()` 的 `rect`，不碰 items —— 线条在 PDF 里是路径（`l`/`re`/`qu`），
+    逐条解释路径的成本与收益都不成比例（判据见 `_rule_marks`）。
+    """
+    out: list[tuple[float, float, float, float]] = []
+    try:
+        drawings = page.get_drawings()
+    except Exception:                 # 极少数 PDF 的绘图字典会抛（宁可没线，不要断管线）
+        return out
+    for dr in drawings:
+        r = dr.get("rect")
+        if r is None or r.width <= 0:
+            continue
+        if r.height <= _RULE_MAX_THICKNESS:
+            out.append((r.y0, r.y1, r.x0, r.x1))
+    return out
+
+
+def _rule_marks(blocks: list[dict[str, Any]], lines: list[tuple[float, float, float, float]],
+                height: float) -> dict[int, str]:
+    """页边横线 → `{id(块): "below"|"above"}`（线在这一块的哪一侧）。
+
+    起因（2026-09-17 宿主实测截图）：「这里少了一条水平线」 —— 每页页眉文字下方都有一条
+    横跨正文宽的细线（矢量 stroke），而 `get_text()` 只回文字，**矢量线条一条都不在产物里**，
+    于是整份文档的页眉线全没了。这里把它找回来，挂在**它所属的那一行文字**上。
+
+    判据（宁可漏画，不许画错 —— 画错线比没有线更像"排版事故"）：
+
+    1. **又细**（`_RULE_MAX_THICKNESS`）：表格的粗分隔线、图里的色块都不是"线"；
+    2. **在页边带里**（`_RULE_BAND`，比 `_MARGIN_BAND` 宽 —— Springer 首页那条线在
+       `y=60.0/791`，刚好落在 0.075 之外）：正文里的表格线/图框线一条都不算
+       （实测 Springer 第 3 页表格线 `x=[208,544]` 在正文带，落选）；
+    3. **横跨正文文字列**（两端各留 `_RULE_EDGE_SLACK`）：半截线（表格列的竖向分隔、
+       分栏装饰）落选 —— 实测那条 `x=[208,544]` 也过不了这一条；
+    4. **紧贴一行文字**（≤ `_RULE_MAX_GAP`，且文字整行在这条线的一侧）：这条最关键 ——
+       它把"页边的一条线"变成"**这一行文字的那条线**"，于是线跟着文字走：
+       页面重排、块被 ①c 改/挪都不会让线跑到别处，也不会把图框顶边当成页眉线。
+
+    返回的是**块 → 线在哪一侧**，不是"页 → 有线条"：渲染时线画在那个块上，
+    块在哪、线就在哪（出处是块的 `bbox`，与线条本体在 PDF 里的坐标无关）。
+    """
+    if not lines or not blocks:
+        return {}
+    xs = [(b["bbox"][0], b["bbox"][2]) for b in blocks]
+    left, right = min(x0 for x0, _ in xs), max(x1 for _, x1 in xs)
+    colw = right - left
+    if colw <= 0:
+        return {}
+    slack = colw * _RULE_EDGE_SLACK
+    marks: dict[int, str] = {}
+    for y0, y1, x0, x1 in lines:
+        if x0 > left + slack or x1 < right - slack:
+            continue                                     # 半截线：不横跨正文列
+        if y0 <= height * _RULE_BAND:                    # 页眉线：文字在**线之上**
+            best, side = None, None
+            for b in blocks:
+                gap = y0 - b["bbox"][3]
+                if 0 <= gap <= _RULE_MAX_GAP and (best is None or gap < best):
+                    best, side = gap, b
+            if side is not None:
+                marks[id(side)] = "below"
+        elif y1 >= height * (1 - _RULE_BAND):            # 页脚线：文字在**线之下**
+            best, side = None, None
+            for b in blocks:
+                gap = b["bbox"][1] - y1
+                if 0 <= gap <= _RULE_MAX_GAP and (best is None or gap < best):
+                    best, side = gap, b
+            if side is not None:
+                marks[id(side)] = "above"
+    return marks
 
 
 def _caption_like(text: str) -> bool:
@@ -1026,16 +1113,18 @@ def parse_pdf(
 
     src = fitz.open(pdf_path)
     raw_pages: list[list[dict[str, Any]]] = []
+    lines_per_page: list[list[tuple[float, float, float, float]]] = []
     heights: list[float] = []
     widths: list[float] = []
 
     for page in src:
         rect = page.rect
         raw_pages.append(page.get_text("dict")["blocks"])
+        # 页边横线（页眉下那条通栏细线）用得着，但 `get_drawings()` 很贵 ——
+        # 这里只留**又细又长**的那几条包围盒，绘图字典本身不留在内存里（见 `_thin_lines`）。
+        lines_per_page.append(_thin_lines(page))
         heights.append(rect.height)
         widths.append(rect.width)
-
-    headers = _running_headers(raw_pages, heights)
 
     doc = Doc(meta={"source": pdf_path.name, "pages": len(raw_pages)})
     if title_hint:
@@ -1051,7 +1140,9 @@ def parse_pdf(
     for page_no, blocks in enumerate(raw_pages, start=1):
         width = widths[page_no - 1]
         text_blocks = [b for b in blocks if b.get("type") == 0 and _block_text(b)]
-        text_blocks = [b for b in text_blocks if _block_text(b) not in headers]
+        # ⚠️ 这里曾经有一道 `_running_headers`（跨页重复的页边短文本 → 判页眉/页脚 → 整行丢）。
+        # 宿主 2026-09-17 定：「页眉文字不需要有意丢掉。和 pdf 尽量保持一致」→ 整条链撤掉
+        # （剩下的水印滤除 `_RE_WATERMARK` 只针对出版社版权声明，与页眉无关）。
         # 页边带里的**白色（不可见）文字**不入产物（Springer 的 `Vol.:(0123456789)`
         # 就是纯白画的；见 `_drop_invisible_spans`）。
         cleaned = [_drop_invisible_spans(b, heights[page_no - 1]) for b in text_blocks]
@@ -1075,6 +1166,10 @@ def parse_pdf(
         seams = _column_spill_seams(ordered, width, heights[page_no - 1],
                                     _page_gutter(ordered, width, heights[page_no - 1]))
         captions, caption_blocks = _pair_captions_by_geometry(image_blocks, text_blocks)
+        # 页边横线 → 挂在**它所属的那一行文字**上（`{id(块): "below"|"above"}`）。
+        # 必须放在 `_split_runin_heads` **之后**算：拆出来的两块是新字典，按 `id()`
+        # 盖章要在最终这批块上，否则页眉那行拆开时线会丢。
+        rules = _rule_marks(text_blocks, lines_per_page[page_no - 1], heights[page_no - 1])
 
         for b in ordered:
             if id(b) in caption_blocks:                  # 已配作图注的文本块，不再单独成段
@@ -1125,16 +1220,21 @@ def parse_pdf(
 
             level = _heading_level(b, body_size)
             clean_src = _text_without_logo(b, body_size)
+            # 版面边带（页眉/页脚）与页边横线：**版面事实**，渲染端据此画页边装饰
+            # （宿主 2026-09-17：「页眉文字不需要有意丢掉。和 pdf 尽量保持一致」）。
+            band = _edge_band(b, heights[page_no - 1])
+            rule = rules.get(id(b))
             if level == 1:
-                add("h1", _desmallcaps(clean_src), section=section, level=1)
+                _tag_furniture(add("h1", _desmallcaps(clean_src), section=section, level=1),
+                               band, rule)
                 continue
             if level is not None:
                 clean = _desmallcaps(clean_src)
                 section = clean
-                add(f"h{level}", clean, section=section, level=level)
+                _tag_furniture(add(f"h{level}", clean, section=section, level=level), band, rule)
                 continue
 
-            blk = add("p", " ".join(text.split()), section=section)
+            blk = _tag_furniture(add("p", " ".join(text.split()), section=section), band, rule)
             # 疑似「栏间被切开的续段」→ 盖戳（**只标记**，"该不该并"交给①c 校对 agent，
             # 见 `_column_spill_seams`）。
             if id(b) in seams:

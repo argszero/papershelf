@@ -27,6 +27,14 @@ from dataclasses import dataclass, field
 from html.parser import HTMLParser
 
 _TAG_RE = re.compile(r"<(/?)([a-zA-Z][\w-]*)([^>]*)>")
+# `<style>`/`<script>` 的**内容**不是 HTML 标记（`HTMLParser` 也按 CDATA 处理），
+# 但正则版数标签会照数 —— 见 `_strip_non_markup`。
+_NON_MARKUP_RE = re.compile(r"<(style|script)\b[^>]*>.*?</\1\s*>", re.S | re.I)
+
+
+def _strip_non_markup(html: str) -> str:
+    """去掉 `<style>`/`<script>` 的内容，只留真正的标记面（给正则数标签用）。"""
+    return _NON_MARKUP_RE.sub(" ", html or "")
 _TAG_BALANCE_EXCLUDE = {"img", "br", "hr", "meta", "link", "input", "source", "area", "base"}
 _TAG_NUM_RE = re.compile(r"\\tag\{([^}]*)\}")
 _CJK_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]")
@@ -169,9 +177,16 @@ def extract_blocks(html: str) -> tuple[list[str], dict[str, str]]:
 
 
 def tag_balance(html: str) -> dict[str, int]:
-    """返回开闭标签数量差（应为 0）。"""
+    """返回开闭标签数量差（应为 0）。
+
+    ⚠️ 数标签是**纯正则**（`_TAG_RE`），所以必须先把 `<style>`/`<script>` 的**内容**
+    剥掉（`_strip_non_markup`）：样式表里的选择器与注释文本会被当成真标签。
+    实测（v10）：往 CSS 注释里写了 `<h1..h4>` 三个字，整篇转换当场报
+    「标签不配对 {'h1': 1, 'span': 1, 'h2': 1}」——**改一句 CSS 文案就能炸掉转换**，
+    而报错指向的是"译文标签不配对"，与真因隔了十万八千里。
+    """
     diff: dict[str, int] = {}
-    for m in _TAG_RE.finditer(html):
+    for m in _TAG_RE.finditer(_strip_non_markup(html)):
         closing, tag = m.group(1), m.group(2).lower()
         if tag in _TAG_BALANCE_EXCLUDE:
             continue
