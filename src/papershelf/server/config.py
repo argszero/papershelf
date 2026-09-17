@@ -50,9 +50,14 @@ class Settings:
     llm_base_url: str = field(default_factory=lambda: os.environ.get("PAPERSHELF_LLM_BASE_URL", ""))
     llm_api_key: str = field(default_factory=lambda: os.environ.get("PAPERSHELF_LLM_API_KEY", ""))
     llm_model: str = field(default_factory=lambda: os.environ.get("PAPERSHELF_LLM_MODEL", "deepseek-chat"))
-    # 成本护栏（待定项 5 的初值）：并发上限 + 单篇 token 预算
+    # 成本护栏（待定项 5 的初值）：并发上限 + 单篇最大尝试次数。
+    # ⚠️ **没有"单篇 token 预算"这一项**（2026-09-17 宿主：「不需要 PAPERSHELF_TOKEN_BUDGET 限制」）。
+    # 原先有个 `token_budget_per_paper` 读 `PAPERSHELF_TOKEN_BUDGET`（默认 40 万），
+    # 但**全仓库没有任何地方用它** —— 真转换实测烧 107 万 tokens 也不会被拦，是一句空话
+    # （文档却写着"单篇 token 预算"，比没有更糟：它让人以为有护栏）。
+    # 成本真正被三处挡住：`max_concurrency`（同时几篇）、`max_conv_attempts`（同一篇能重试几次）、
+    # `PAPERSHELF_PROOFREAD_TOKEN_BUDGET`（①c agent 的累计预算，**这个是活代码**）。
     max_concurrency: int = field(default_factory=lambda: _int("PAPERSHELF_MAX_CONCURRENCY", 2))
-    token_budget_per_paper: int = field(default_factory=lambda: _int("PAPERSHELF_TOKEN_BUDGET", 400_000))
     max_conv_attempts: int = field(default_factory=lambda: _int("PAPERSHELF_MAX_ATTEMPTS", 3))
 
     # ── 原文抽取校对（VLM agent，管线 ①c）──

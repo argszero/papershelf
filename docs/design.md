@@ -444,7 +444,11 @@ fitz 抽出的数学是 **Unicode 文本且间距被拆散**（`L f V ( x ) := �
     2. **信号量必须惰性求值**：`concurrency_semaphore()` 是函数而非模块级 `_sem = Semaphore(...)`；
        后者在导入时求值，改环境变量/测试夹具都不生效。
     3. **`queued` 不是"排队中"，是"待认领"**：真正的互斥点在认领那一句，别处不得改 `conv_state`。
-- **护栏**（待定项 5）：全局并发上限、单篇 token 预算、`conv_attempts` 上限（如 3）
+- **护栏**（待定项 5）：全局并发上限、`conv_attempts` 上限（如 3）、以及 ①c agent 自己的累计 token 预算
+  （`PAPERSHELF_PROOFREAD_TOKEN_BUDGET`，**这一条是活代码**）。
+  ⚠️ **2026-09-17 宿主定：不要「单篇总 token 预算」** —— 原先那个 `PAPERSHELF_TOKEN_BUDGET`
+  只有 `config.py` 读、**全仓库没有任何地方使用**（真转换实测 107 万 tokens 也拦不下），已删除；
+  留着它比没有更糟：文档写着「单篇 token 预算」，让人以为有护栏。
 - **去重**（待定项 7 提案）：以 PDF/arXiv ID 的 hash 命中已有 `docs` 时，**复用块级 JSON**，只重放翻译（省 LLM 花费，不改 ⑦ 归属模型）
 
 ### 5.6b 元数据抽取（决策⑲，2026-09-12 补做）
@@ -754,7 +758,7 @@ services:
 | 2 | 前端框架 | ✅ **已落地**：React + TypeScript + Vite，`react-router-dom` 路由。**刻意不引** axios / react-query / 状态库 —— 端点只有十来个，多一层库只会把"错误怎么呈现"藏起来（决策⑨）；错误一律 `ApiError(status, detail)` 原样上屏 |
 | 3 | 任务队列 | ✅ **v1 已落地，2026-09-12 改为常驻队列**：进程内 `ConversionQueue`（常驻线程）+ DB 轮询 + 启动恢复（`doing→queued`）+ 原子认领。⚠️ 仍**只起单 worker**（见 §7），加 `-w` 会变成多份互不知情的队列 —— 要横向扩得先换队列实现 |
 | 4 | 术语表归属 | **计划级**（与 ⑦ 一致）；提示：同一概念跨计划需各配一次 |
-| 5 | 成本护栏 | 并发=2；单篇预算（如 200k token）；`conv_attempts` ≤3；超限置 failed 待人工重试。⚠️ **2026-09-15 才真正生效**：计数原先写在 `_set_state(..., "doing")` 里，而 `doing` 的转换由 `claim_paper` 做 → 那条分支从未被走到，**计数恒为 0**（护栏空转、日志「第 N 次尝试」永远显示 1）。现改为**认领即计数**（`claim_paper` 里 `+1`），且**人工入口归零**（`/convert` 重试、`/reextract`）—— 护栏防的是"自动重试烧钱"，不是防用户，否则"超限待人工重试"这句是空话 |
+| 5 | 成本护栏 | 并发=2；`conv_attempts` ≤3（**不做单篇总 token 预算** —— 2026-09-17 宿主定；①c agent 自己的累计预算 `PROOFREAD_TOKEN_BUDGET` 保留）；超限置 failed 待人工重试。⚠️ **2026-09-15 才真正生效**：计数原先写在 `_set_state(..., "doing")` 里，而 `doing` 的转换由 `claim_paper` 做 → 那条分支从未被走到，**计数恒为 0**（护栏空转、日志「第 N 次尝试」永远显示 1）。现改为**认领即计数**（`claim_paper` 里 `+1`），且**人工入口归零**（`/convert` 重试、`/reextract`）—— 护栏防的是"自动重试烧钱"，不是防用户，否则"超限待人工重试"这句是空话 |
 | 6 | 用量可见性 | v1 不做（㉑）；在 `docs`/`papers` 记录 `tokens_used` 字段**先攒数据**，v2 出面板 |
 | 7 | 翻译去重 | ✅ **已落地**：`doc_cache(fingerprint = sha256(pdf) + PARSE_VERSION)` 复用**解析+LaTeX 化**结果（①c 校对结果也在里面），翻译仍按需重放。⚠️ 指纹里必须带 `PARSE_VERSION`：否则改了**解析产物形状**（例如给块加 `payload.page`）而 PDF 没变时会永远命中旧产物（2026-09-11 踩过）。⚠️ 指纹**原本没有单篇失效出口**（唯一手段是改代码里的 `PARSE_VERSION` = 全库一起失效）→ 2026-09-15 补 **`POST /api/papers/{id}/reextract`**（文献库「重新提取」按钮）：删这一篇的缓存行 + 作废它的笔记/划痕 + 重新排队；语义是**全部作废、从零重跑**（宿主选 A） |
 | 8 | 公式渲染 | ✅ **已落地，且改为更省的路子**：**服务端 LaTeX → MathML**（`latex2mathml`，纯 Python）。理由见下 |
