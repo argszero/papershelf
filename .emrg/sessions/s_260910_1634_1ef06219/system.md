@@ -19,8 +19,6 @@ You are EMRG, an evolving AI agent running as a micro-kernel daemon (emrgd). You
 
 The following skills are available. When the user asks what skills you have or to list your skills, list the skills below by name and description (do not make up tools). When a skill seems relevant to the user's request, use the read tool to read the skill file at the listed path, then follow its instructions.
 
-- **browser-harness** (project, `/Users/argszero/.emrg/.emrg/skills/browser-harness.md`): Always use browser-harness for any web interaction: automation, scraping, testing, or site/app work.
-- **browser-install** (project, `/Users/argszero/.emrg/.emrg/skills/browser-install.md`): Install browser-harness and connect it to a browser fast.
 - **skill-catalog** (user, `/Users/argszero/.emrg/skills/skill-catalog.md`): Catalog of optional installable skills (browser-harness, etc.). Read this file when a task needs a capability you don't have — it lists what is installable, how to install, and how updates are checked.
 
 ## Memory
@@ -43,7 +41,7 @@ Index: `/Users/argszero/scm/github.com/argszero/papershelf/.emrg/memory/MEMORY.m
 | `b7e2a1c4` | reference | [existing-pdf-to-zh-pipeline.md](existing-pdf-to-zh-pipeline.md) | 宿主机已跑通的 PDF→中文 HTML 管线与踩坑教训；papershelf 是其产品化 |
 | `implemented-status` | project | → 见 `design-decisions.md` 末尾「实现落地状态」+「M3 前端 SPA 落地」两段 | **M1管线 ✅ / M2服务端 ✅ / M3前端SPA ✅ / M4 Docker ✅ / M5复刻原型 ✅**；小决策：**公式=服务端 LaTeX→MathML（零 CDN）**、`render_block(typeset)` 默认 False（渲染与校验分流）、管理员引导必须显式密码、导出默认内联图片；**M3 两条前端硬约束**：块 HTML 由服务端给（前端不排版公式/不拼资产 URL）、改块必须回完整块对象（否则"保存成功但界面不变"）|
 | `c4d81f30` | project | **[pipeline-v1-real-run.md](pipeline-v1-real-run.md)** | **转换管线 v1 首轮真实跑通**：实测数据（598 块 / 216 需翻 / 43.7k tokens / 9 分钟 / 校验一次通过）+ **三条硬教训**（校验必须收敛、免中文块必须豁免、图注与标题必须译）+ **决策㉓ 公式 LaTeX 化已落地**（display 57 / inline 366，超过参照产物 39/343）+ 渲染修复（数学行合并 / 中文回落 / 单栏横跨） |
-| `decisions-master` | decision | **[design-decisions.md](design-decisions.md)** | **设计决策总表 ①–㊶ —— 唯一事实来源；本条只做索引，细节/实测数据/踩坑全在文件里**：归属链 User→Plan→Paper（无 Team）／服务端统一 Key／Python 单体 + SPA（服务端同源托管）／只读分享（持链接 + 可撤销 + ≤24h）／开放注册限 `edu.cn,ac.cn`（⑮ 改邮箱验证码）／导入 = PDF 上传 + arXiv／元数据 = LLM 抽取 + 占位标题落列／**块级 JSON 入库、HTML 为导出格式**／最小管理页（配置走环境变量）／责任归用户（注册协议强校验 + 留档）。**决策号速查**：㉓ 公式全量 LaTeX 化（服务端 MathML，零 CDN）· ㉖ 分享管理 · ㉗ 常驻转换队列+启动恢复+原子认领 · ㉘ 元数据抽取 · ㉙ 删除文献（含磁盘产物）· ㉛ 划痕 = 任意字符区间 + 四支笔（服务端锚点尺子，`anchors` 默认 False）· ㉜ 阅读顺序分栏感知 · ㉝ ①c 原文校对 agent（全量逐页，`minimal` 思考，≈27k tokens/页）· ㉞ 重新提取（解析缓存单篇失效）· ㉟ 笔记按原文位置排序 · ㊱ 待读→在读 + `last_read_at` · ㊲ 栏间续段只标记（agent `merge_block`）· ㊳ 标题/参考文献都可划 · ㊴ 表格重建 = `set_table`（护栏三连：逐字来源/形状/不吃正文）· ㊵ 表格左右并排 + 每格可划 （已上生产 `51f671b`）· **㊶ 页面家具（v8 关键词行内拆分保序 / v9 页边带白字不入产物 / v10 页眉文字不再有意丢掉 + 补回页眉横线，`PARSE_VERSION`→10，`band`/`rule` 两戳只影响渲染；宿主选 A「照译」⇒ 6/8 页页眉会挂「待校对」）** ＋ 13 项遗留待定 + 5 条贯穿性约束 |
+| `decisions-master` | decision | **[design-decisions.md](design-decisions.md)** | **设计决策总表 ①–㊶ —— 唯一事实来源；本条只做索引，细节/实测数据/踩坑全在文件里**：归属链 User→Plan→Paper（无 Team）／服务端统一 Key／Python 单体 + SPA（服务端同源托管）／只读分享（持链接 + 可撤销 + ≤24h）／开放注册限 `edu.cn,ac.cn`（⑮ 改邮箱验证码）／导入 = PDF 上传 + arXiv／元数据 = LLM 抽取 + 占位标题落列／**块级 JSON 入库、HTML 为导出格式**／最小管理页（配置走环境变量）／责任归用户（注册协议强校验 + 留档）。**决策号速查**：㉓ 公式全量 LaTeX 化（服务端 MathML，零 CDN）· ㉖ 分享管理 · ㉗ 常驻转换队列+启动恢复+原子认领 · ㉘ 元数据抽取 · ㉙ 删除文献（含磁盘产物）· ㉛ 划痕 = 任意字符区间 + 四支笔（服务端锚点尺子，`anchors` 默认 False）· ㉜ 阅读顺序分栏感知 · ㉝ ①c 原文校对 agent（全量逐页，`minimal` 思考，≈27k tokens/页）· ㉞ 重新提取（解析缓存单篇失效）· ㉟ 笔记按原文位置排序 · ㊱ 待读→在读 + `last_read_at` · ㊲ 栏间续段只标记（agent `merge_block`）· ㊳ 标题/参考文献都可划 · ㊴ 表格重建 = `set_table`（护栏三连：逐字来源/形状/不吃正文）· ㊵ 表格左右并排 + 每格可划 （已上生产 `51f671b`）· **㊶ 页面家具（v8 关键词行内拆分保序 / v9 页边带白字不入产物 / v10 页眉文字不再有意丢掉 + 补回页眉横线，`PARSE_VERSION`→10，`band`/`rule` 两戳只影响渲染；宿主选 A「照译」⇒ 6/8 页页眉会挂「待校对」）** · **㊷ 页面图形（v11，`PARSE_VERSION`→11：横线**照抄 PDF 颜色的粗细** / 矢量标识（Springer 马标、Check-for-updates 徽标）整体栅格化成新块类型 `deco` / **不再删"无图注的图"**（37 页篇曾丢 4 张真图）+ 图注允许小幅重叠且全局最近优先认领 / 色块底纹照抄（主保险=色块里包可见文字，防白字黑框变黑方块）；⚠️ 徽标是「图片层+矢量层」叠的，只取内嵌图 = 一个灰方块）** ＋ 13 项遗留待定 + 5 条贯穿性约束 |
 | `repo-history-reset` | decision | **[repo-history-reset.md](repo-history-reset.md)** | **仓库历史重置：删库重建 + 单次初始化提交**（2026-09-13 宿主指示）。现远端 = **唯一初始化提交**（155 文件；旧 SHA `6f487c4`/`350f33f`/`52b142e`… 远端已不存在，只留本地 bundle 备份）。**三条实测结论**：①**删仓库不删 GHCR 包**（包是账号级的，删库后匿名拉 manifest 仍 200、生产容器照跑）—— 但**孤儿包的 linked repository 指向已删仓库 → 新仓库 `GITHUB_TOKEN` push 被拒 `denied: permission_denied: write_package`**（`test` 绿、两个 `build` 红）→ 修法 = **先删整个包**（`DELETE /user/packages/container/papershelf`，需 `delete:packages`）再重跑，同名包自动重建并 link 回新仓库；②**别用 `gh auth refresh` 等宿主**（内部轮询 deadline 太短 → `context deadline exceeded`，验证码其实还有效，白等两次）→ 自己跑 device flow 把 ~15 分钟窗口用满；③**本机 `github.com` 直连被墙**（`login/device/*` timeout）而 `api.github.com` 可用，git 全局代理 `http://172.16.0.40:6501`，gh/curl 打网页端点要显式 `HTTPS_PROXY`。验收：CI 六 job 绿 + `latest`/`sha-<该提交>` 双双 200 + 包 `repository: argszero/papershelf` + 生产 `revision`=该提交/healthy/health 200/bundle 指纹未变；**记忆里别钉这个 SHA**（写记忆即改 SHA） |
 | `localdev-node-asdf` | reference | [localdev-node-asdf.md](localdev-node-asdf.md) | **本机开发环境的两处坑**：①**node 在 asdf 下、不在 PATH**（`~/.asdf/installs/nodejs/26.5.0/bin`；`brew` 里没有、`python -m tsc` 报的 `No module named tsc` 是**假线索**）→ 前端必须 `export PATH=…:$PATH && npx tsc -b && npx vite build`；产物落 `src/papershelf/static/`，`emptyOutDir` 会删旧 bundle → **浏览器缓存的旧 index.html 指向已 404 的旧 JS**（表现为「改完刷新还是老界面」）→ 必须 `Page.reload(ignoreCache=True)` 硬刷；②**macOS 无 `setsid`/`timeout`** → 用 `(nohup sh scripts/dev.sh &)` + `curl health`；重启前先确认 PID 是 `papershelf.cli serve --port 8012`，**别误杀 emrg server** |
 | `m5-replicate-prototype` | decision | **[m5-replicate-prototype.md](m5-replicate-prototype.md)** | **M5 = 复刻原型（计划内视图）✅ 已落地**。①推翻了旧文档"总览/文献库/看板是跨计划视图、v1 刻意收窄"（实测原型 L1479 `papers()=activePlan().papers`，**没有跨计划聚合** → 实为**漏做**）；②**验收修掉 7 个真缺陷**（Share 页引用已删类名→无样式、移动端侧栏被藏死、搜索框与 URL 不同步、切换器格式、自造图例、大纲错显 H 徽标、新建按钮）；③**教训：复刻任务里"删旧样式"必须与"迁移页面"同步核对**（先删后迁会静默降级）；④**PDF 分页容器 ✅ 已落地**（宿主选 A，2026-09-11）：解析阶段给**每个块**盖 `payload.page`（`_paged_adder`）+ `doc_cache` 指纹混入 `PARSE_VERSION`（不混则永远命中旧解析产物、分页静默不出现）+ 阅读器/分享/导出三处同版式；⑤**顺带修掉既有真缺陷**：懒加载图无 `width/height` → 整篇高度事后上浮 7.3k px → **大纲跳转偏位 7.5k px**（把页 section 拍平后同样复现，证明与分页无关；已用资产宽高占位修掉） |
@@ -160,8 +158,8 @@ agent 看页图后 `merge_block`；端到端实测合并真的落进产物、译
 bundle `index-BuC2xeWi.js`（与本地同指纹）/ 日志零 error。离线回归 **348 passed**；
 端到端真产品路径 + 真浏览器三模式已验。⚠️ 这次 pull 又撞慢层（42.37MB 重试 ≈30 分钟）。
 
-**㊶ 页面家具 = 页眉文字不再丢 + 页边横线补回（解析 v8/v9/v10）✅ 本地已落地**
-（2026-09-17，`657388f`，**尚未上生产**；细节见 `design-decisions.md` ㊶）：宿主一次贴三条截图 ——
+**㊶ 页面家具 = 页眉文字不再丢 + 页边横线补回（解析 v8/v9/v10）✅ 已上生产**
+（2026-09-17，`657388f`/`f4476c4`，生产 `revision=f4476c4`；细节见 `design-decisions.md` ㊶）：宿主一次贴三条截图 ——
 ①关键词顺序不对（行内拆出的两块各带字形 bbox、y0 差 1.4pt → **纵向归一到源行**，v8）
 ②`Vol.:(0123456789)` 抽出来了（那串字是**纯白色**画的、白纸上等于看不见 → **页边带白字不入产物**，v9）
 ③「这里少了一条水平线」（每页页眉下那条**矢量细线**：`get_text()` 从不回线条，**不是新 bug**）→
@@ -178,6 +176,19 @@ v10 白做；实测 agent **一个没删**（2 页 / 52k tokens）。`PARSE_VERS
 ⚠️ **存量要吃修复必须「重新提取」**（`PARSE_VERSION` 变了）—— 由宿主自己操作（≈200 万 tokens/篇）。
 顺带修：`validate.tag_balance` 的正则会被 CSS 注释里的 `<` 干扰（改一句 CSS 文案就能炸掉整篇转换）。
 
+**→ 已上生产并验收（2026-09-17 12:0x）**：CI 六 job 全绿 → `docker compose pull`（52.85MB 层 Retrying 5 次）
++ `up -d app` → `revision=f4476c4` / healthy / 公网 200 / bundle `index-D9a7YvYN.js` / 日志零 error；
+生产 CSS 里 `.pg-band/.pg-rule-below/.pg-rule-above` 三条规则实测在位。
+生产真浏览器（paper 1）三模式逐列量测：dual `t-en 119/119 + t-zh 87/87`、`lang-zh` 下 `t-en 0/119`、
+`lang-en` 下 `t-zh 0/87`；硬刷后控制台**零 error**。**验收必须两分开说**：部署/渲染 ✅ 已验；
+**页面上看到页眉与横线 ✗ 还没有** —— 生产唯一那篇（paper 1，139 块）是 v10 之前解析的
+（有 `payload.page`、无 `band`/`rule`）⇒ 要看得宿主自己点「重新提取」。
+**新手法（可复用、零 token、不动数据）**：`docker exec papershelf python` + `base64` 塞脚本进容器，
+调 `render_block(...)` 断言产物含 `pg-band pg-top pg-rule-below`、且 `typeset=False` 产物逐字干净
+—— 比只看 bundle 指纹更直接地证明「线上跑的就是这份代码」。
+⚠️ **生产数据已变**：现在只有 1 篇（paper 1 = 8 页 139 块《增材制造中的机器学习综述》），
+此前那批（37 页真论文 / 3 页 / 合成 / synth-table）都不在了。
+
 ### 遗留待定项已结（M3 后全部结清或明确推后）
 1 会话机制 ✅ · 2 前端框架 ✅（React+TS+Vite）· 3 任务队列 ✅（**v1 常驻队列 + 启动恢复**，㉗）·
 7 翻译去重 ✅（PDF hash 缓存）· 8 公式渲染 ✅（**服务端 MathML**）· 10 版权警示 ✅ ·
@@ -185,7 +196,7 @@ v10 白做；实测 agent **一个没删**（2 页 / 52k tokens）。`PARSE_VERS
 **明确推后**：4 术语表归属（v1 计划级）· 5 成本护栏数值 · 6 用量面板（已攒 `tokens_used`，v2）·
 9 图表 VLM（v2）· 14 标签词表（v1 自由标签）
 
-_Last updated: 2026-09-17T11:35:00+08:00_
+_Last updated: 2026-09-17T12:10:00+08:00_
 
 ### Session Memory (this session only)
 Directory: `/Users/argszero/scm/github.com/argszero/papershelf/.emrg/sessions/s_260910_1634_1ef06219/memory/`
@@ -448,7 +459,7 @@ DB 与 `.env` 部署前已备份。生产实测（宿主数据 paper 2）：`pro
 生产验收改用「取 `papershelf_session` cookie → curl PATCH → 查库 + 硬刷 UI」，
 **诚实边界**：那验的是服务端逻辑 + 前端渲染，真实滚轮那一段只在本地验过。
 
-_Last updated: 2026-09-16T19:55:00+08:00_
+_Last updated: 2026-09-17T12:10:00+08:00_
 
 ### 最近一轮（2026-09-16 晚）㊳ 标题行也能划重点 / 加笔记（宿主 19:14 截图报告）
 
@@ -604,6 +615,30 @@ DB 与 `.env` 已备份（`…20260917-085812`）。
 
 **⚠️ 宿主还要自己「重新提取」**：护栏修复在 ①c 阶段，存量块里没有 `table` 块，不吃修复就还是没表格
 （宿主 20:48 已表态自己操作）。
+
+### 最近一轮（2026-09-17 上午→中午）v10 页面家具上生产 + 生产验收
+
+**本地**（`657388f`）：解析 v10（页眉文字不再有意丢掉 + 补回每页页眉横线，`PARSE_VERSION` → 10）+
+①c 提示词同步加护栏（页眉/页脚不属"重复块"、不许并入正文）+ `validate.tag_balance` 抗 CSS 注释；
+离线回归 **373 passed**（`tests/test_page_furniture.py` 12 项 + 变异检验转红）。
+
+**生产**（`f4476c4`，备份 `…bak.20260917-1150`）：`docker compose pull`（52.85MB 层 Retrying 5 次，
+`nohup` + 轮询照旧）→ `up -d app` → `revision=f4476c4` / healthy / 公网 200 /
+bundle `index-D9a7YvYN.js` / 日志零 error；CSS 三条装饰规则实测在位。
+
+**生产验收（真浏览器 + 容器内直调，零 token 零数据改动）**
+- 生产真浏览器（paper 1）三模式逐列量测：dual `t-en 119/119 + t-zh 87/87`、`lang-zh` 下 `t-en 0/119`、
+  `lang-en` 下 `t-zh 0/87`；硬刷后控制台**零 error**。数据零改动（`status=reading` / `last_read_at` 未变）。
+- **新手法**：`docker exec papershelf python` + `base64` 塞脚本，直调 `render_block(...)`，断言产物含
+  `pg-band pg-top pg-rule-below`、`typeset=False` 产物逐字干净 ⇒ 证明**线上跑的就是这份代码**。
+- **结论两分开说**：部署/渲染 ✅ 已验；**页面上看到页眉与横线 ✗ 还没有** —— 生产唯一那篇
+  （paper 1，139 块）是 v10 之前解析的（有 `payload.page`、无 `band`/`rule`）⇒ 要看得**宿主自己点「重新提取」**。
+- ⚠️ **生产数据已变**：只剩 1 篇（8 页 139 块《增材制造中的机器学习综述》），此前那批都不在了。
+
+**两条环境坑**：① `browser-harness` 的 `js()` **不接受 `await_promise`**（Promise 自动 await）、
+没有 `navigate()`（用 `goto_url()`），JS 里括号写错会被报成 `SyntaxError`（像 harness 坏了）；
+② 后台标签页里 `click_at_xy` **点按钮不生效**（模式纹丝不动）→ `Emulation.setFocusEmulationEnabled(True)`
+后 `visibilityState=visible` 立刻正常 —— 这是「后台标签页不算数」的正解。
 
 
 **To read a memory**: use the `read` tool with the full path.

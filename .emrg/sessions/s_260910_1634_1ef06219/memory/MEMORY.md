@@ -255,7 +255,7 @@ DB 与 `.env` 部署前已备份。生产实测（宿主数据 paper 2）：`pro
 生产验收改用「取 `papershelf_session` cookie → curl PATCH → 查库 + 硬刷 UI」，
 **诚实边界**：那验的是服务端逻辑 + 前端渲染，真实滚轮那一段只在本地验过。
 
-_Last updated: 2026-09-17T12:10:00+08:00_
+_Last updated: 2026-09-17T15:45:00+08:00_
 
 ### 最近一轮（2026-09-16 晚）㊳ 标题行也能划重点 / 加笔记（宿主 19:14 截图报告）
 
@@ -435,3 +435,22 @@ bundle `index-D9a7YvYN.js` / 日志零 error；CSS 三条装饰规则实测在�
 没有 `navigate()`（用 `goto_url()`），JS 里括号写错会被报成 `SyntaxError`（像 harness 坏了）；
 ② 后台标签页里 `click_at_xy` **点按钮不生效**（模式纹丝不动）→ `Emulation.setFocusEmulationEnabled(True)`
 后 `visibilityState=visible` 立刻正常 —— 这是「后台标签页不算数」的正解。
+
+### 最近一轮（2026-09-17 下午）㊷ 页面图形（解析 v11）：本地全验，**未上生产**
+
+宿主一句「Springer 的图还是没有」→ 四件同源缺陷（横线颜色/粗细硬编码 / 矢量标识从不入产物 /
+「无图注就剔除」删真图 / 灰底底纹从未照抄）+ 验收时扒出的第五件（徽标是"图片层 + 矢量层"叠的，
+只取内嵌字节 = 一个光灰方块）。细节全在项目记忆 **`design-decisions.md` ㊷** 与 `MEMORY.md` 进度段。
+
+- **本地真产品路径端到端已验**（`73098be`）：干净重启 8012（**旧进程仍活着会用旧解析器覆盖库**）→
+  `POST /api/papers/5/reextract` → 解析 158 块 / deco 9 / rule 8 / shade 1 → ①c **61 轮 / 103 万 tokens /
+  表格重建 3 张 / 9 个 deco 一个没删** → 翻译 → 全篇 1,072,896 tokens；
+  真浏览器 9 张 deco 全部解码 + 左右交替正确 + 3 张并排双语表格；导出件同带；
+  离线回归 **403 passed**（新增 `tests/test_page_graphics.py` 30 项）。
+- **两条教训**：① `naturalWidth=0` ≠ 图坏了（`loading="lazy"` + 首屏外天然 0×0，改 `eager` 后全好）
+  —— 同轮的"后 5 个 deco 加载失败"是**误判**；真缺陷只有"旧 serve 进程覆盖库"那一条。
+  ② 改 `pipeline/*.py` 不重启 serve = 白改（且同端口曾**并存两个**进程）。
+- browser-harness 小抄（本轮新增）：`activate_tab(target_id)` **要传参**；`cdp("Page.reload")` 报
+  `Message may have string 'sessionId' property` ⇒ 用 `js("location.reload()")`；
+  本地会话过期会跳 `/login?next=…` ⇒ `fill_input("#liEmail"/"#liPass")` + 点 `.btn-primary` 重登。
+- **待宿主**：推 + 上生产（`PARSE_VERSION` → 11 ⇒ 生产存量要吃修复得宿主自己点「重新提取」）。

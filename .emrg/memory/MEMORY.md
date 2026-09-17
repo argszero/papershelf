@@ -13,7 +13,7 @@
 | `b7e2a1c4` | reference | [existing-pdf-to-zh-pipeline.md](existing-pdf-to-zh-pipeline.md) | 宿主机已跑通的 PDF→中文 HTML 管线与踩坑教训；papershelf 是其产品化 |
 | `implemented-status` | project | → 见 `design-decisions.md` 末尾「实现落地状态」+「M3 前端 SPA 落地」两段 | **M1管线 ✅ / M2服务端 ✅ / M3前端SPA ✅ / M4 Docker ✅ / M5复刻原型 ✅**；小决策：**公式=服务端 LaTeX→MathML（零 CDN）**、`render_block(typeset)` 默认 False（渲染与校验分流）、管理员引导必须显式密码、导出默认内联图片；**M3 两条前端硬约束**：块 HTML 由服务端给（前端不排版公式/不拼资产 URL）、改块必须回完整块对象（否则"保存成功但界面不变"）|
 | `c4d81f30` | project | **[pipeline-v1-real-run.md](pipeline-v1-real-run.md)** | **转换管线 v1 首轮真实跑通**：实测数据（598 块 / 216 需翻 / 43.7k tokens / 9 分钟 / 校验一次通过）+ **三条硬教训**（校验必须收敛、免中文块必须豁免、图注与标题必须译）+ **决策㉓ 公式 LaTeX 化已落地**（display 57 / inline 366，超过参照产物 39/343）+ 渲染修复（数学行合并 / 中文回落 / 单栏横跨） |
-| `decisions-master` | decision | **[design-decisions.md](design-decisions.md)** | **设计决策总表 ①–㊶ —— 唯一事实来源；本条只做索引，细节/实测数据/踩坑全在文件里**：归属链 User→Plan→Paper（无 Team）／服务端统一 Key／Python 单体 + SPA（服务端同源托管）／只读分享（持链接 + 可撤销 + ≤24h）／开放注册限 `edu.cn,ac.cn`（⑮ 改邮箱验证码）／导入 = PDF 上传 + arXiv／元数据 = LLM 抽取 + 占位标题落列／**块级 JSON 入库、HTML 为导出格式**／最小管理页（配置走环境变量）／责任归用户（注册协议强校验 + 留档）。**决策号速查**：㉓ 公式全量 LaTeX 化（服务端 MathML，零 CDN）· ㉖ 分享管理 · ㉗ 常驻转换队列+启动恢复+原子认领 · ㉘ 元数据抽取 · ㉙ 删除文献（含磁盘产物）· ㉛ 划痕 = 任意字符区间 + 四支笔（服务端锚点尺子，`anchors` 默认 False）· ㉜ 阅读顺序分栏感知 · ㉝ ①c 原文校对 agent（全量逐页，`minimal` 思考，≈27k tokens/页）· ㉞ 重新提取（解析缓存单篇失效）· ㉟ 笔记按原文位置排序 · ㊱ 待读→在读 + `last_read_at` · ㊲ 栏间续段只标记（agent `merge_block`）· ㊳ 标题/参考文献都可划 · ㊴ 表格重建 = `set_table`（护栏三连：逐字来源/形状/不吃正文）· ㊵ 表格左右并排 + 每格可划 （已上生产 `51f671b`）· **㊶ 页面家具（v8 关键词行内拆分保序 / v9 页边带白字不入产物 / v10 页眉文字不再有意丢掉 + 补回页眉横线，`PARSE_VERSION`→10，`band`/`rule` 两戳只影响渲染；宿主选 A「照译」⇒ 6/8 页页眉会挂「待校对」）** ＋ 13 项遗留待定 + 5 条贯穿性约束 |
+| `decisions-master` | decision | **[design-decisions.md](design-decisions.md)** | **设计决策总表 ①–㊶ —— 唯一事实来源；本条只做索引，细节/实测数据/踩坑全在文件里**：归属链 User→Plan→Paper（无 Team）／服务端统一 Key／Python 单体 + SPA（服务端同源托管）／只读分享（持链接 + 可撤销 + ≤24h）／开放注册限 `edu.cn,ac.cn`（⑮ 改邮箱验证码）／导入 = PDF 上传 + arXiv／元数据 = LLM 抽取 + 占位标题落列／**块级 JSON 入库、HTML 为导出格式**／最小管理页（配置走环境变量）／责任归用户（注册协议强校验 + 留档）。**决策号速查**：㉓ 公式全量 LaTeX 化（服务端 MathML，零 CDN）· ㉖ 分享管理 · ㉗ 常驻转换队列+启动恢复+原子认领 · ㉘ 元数据抽取 · ㉙ 删除文献（含磁盘产物）· ㉛ 划痕 = 任意字符区间 + 四支笔（服务端锚点尺子，`anchors` 默认 False）· ㉜ 阅读顺序分栏感知 · ㉝ ①c 原文校对 agent（全量逐页，`minimal` 思考，≈27k tokens/页）· ㉞ 重新提取（解析缓存单篇失效）· ㉟ 笔记按原文位置排序 · ㊱ 待读→在读 + `last_read_at` · ㊲ 栏间续段只标记（agent `merge_block`）· ㊳ 标题/参考文献都可划 · ㊴ 表格重建 = `set_table`（护栏三连：逐字来源/形状/不吃正文）· ㊵ 表格左右并排 + 每格可划 （已上生产 `51f671b`）· **㊶ 页面家具（v8 关键词行内拆分保序 / v9 页边带白字不入产物 / v10 页眉文字不再有意丢掉 + 补回页眉横线，`PARSE_VERSION`→10，`band`/`rule` 两戳只影响渲染；宿主选 A「照译」⇒ 6/8 页页眉会挂「待校对」）** · **㊷ 页面图形（v11，`PARSE_VERSION`→11：横线**照抄 PDF 颜色的粗细** / 矢量标识（Springer 马标、Check-for-updates 徽标）整体栅格化成新块类型 `deco` / **不再删"无图注的图"**（37 页篇曾丢 4 张真图）+ 图注允许小幅重叠且全局最近优先认领 / 色块底纹照抄（主保险=色块里包可见文字，防白字黑框变黑方块）；⚠️ 徽标是「图片层+矢量层」叠的，只取内嵌图 = 一个灰方块）** ＋ 13 项遗留待定 + 5 条贯穿性约束 |
 | `repo-history-reset` | decision | **[repo-history-reset.md](repo-history-reset.md)** | **仓库历史重置：删库重建 + 单次初始化提交**（2026-09-13 宿主指示）。现远端 = **唯一初始化提交**（155 文件；旧 SHA `6f487c4`/`350f33f`/`52b142e`… 远端已不存在，只留本地 bundle 备份）。**三条实测结论**：①**删仓库不删 GHCR 包**（包是账号级的，删库后匿名拉 manifest 仍 200、生产容器照跑）—— 但**孤儿包的 linked repository 指向已删仓库 → 新仓库 `GITHUB_TOKEN` push 被拒 `denied: permission_denied: write_package`**（`test` 绿、两个 `build` 红）→ 修法 = **先删整个包**（`DELETE /user/packages/container/papershelf`，需 `delete:packages`）再重跑，同名包自动重建并 link 回新仓库；②**别用 `gh auth refresh` 等宿主**（内部轮询 deadline 太短 → `context deadline exceeded`，验证码其实还有效，白等两次）→ 自己跑 device flow 把 ~15 分钟窗口用满；③**本机 `github.com` 直连被墙**（`login/device/*` timeout）而 `api.github.com` 可用，git 全局代理 `http://172.16.0.40:6501`，gh/curl 打网页端点要显式 `HTTPS_PROXY`。验收：CI 六 job 绿 + `latest`/`sha-<该提交>` 双双 200 + 包 `repository: argszero/papershelf` + 生产 `revision`=该提交/healthy/health 200/bundle 指纹未变；**记忆里别钉这个 SHA**（写记忆即改 SHA） |
 | `localdev-node-asdf` | reference | [localdev-node-asdf.md](localdev-node-asdf.md) | **本机开发环境的两处坑**：①**node 在 asdf 下、不在 PATH**（`~/.asdf/installs/nodejs/26.5.0/bin`；`brew` 里没有、`python -m tsc` 报的 `No module named tsc` 是**假线索**）→ 前端必须 `export PATH=…:$PATH && npx tsc -b && npx vite build`；产物落 `src/papershelf/static/`，`emptyOutDir` 会删旧 bundle → **浏览器缓存的旧 index.html 指向已 404 的旧 JS**（表现为「改完刷新还是老界面」）→ 必须 `Page.reload(ignoreCache=True)` 硬刷；②**macOS 无 `setsid`/`timeout`** → 用 `(nohup sh scripts/dev.sh &)` + `curl health`；重启前先确认 PID 是 `papershelf.cli serve --port 8012`，**别误杀 emrg server** |
 | `m5-replicate-prototype` | decision | **[m5-replicate-prototype.md](m5-replicate-prototype.md)** | **M5 = 复刻原型（计划内视图）✅ 已落地**。①推翻了旧文档"总览/文献库/看板是跨计划视图、v1 刻意收窄"（实测原型 L1479 `papers()=activePlan().papers`，**没有跨计划聚合** → 实为**漏做**）；②**验收修掉 7 个真缺陷**（Share 页引用已删类名→无样式、移动端侧栏被藏死、搜索框与 URL 不同步、切换器格式、自造图例、大纲错显 H 徽标、新建按钮）；③**教训：复刻任务里"删旧样式"必须与"迁移页面"同步核对**（先删后迁会静默降级）；④**PDF 分页容器 ✅ 已落地**（宿主选 A，2026-09-11）：解析阶段给**每个块**盖 `payload.page`（`_paged_adder`）+ `doc_cache` 指纹混入 `PARSE_VERSION`（不混则永远命中旧解析产物、分页静默不出现）+ 阅读器/分享/导出三处同版式；⑤**顺带修掉既有真缺陷**：懒加载图无 `width/height` → 整篇高度事后上浮 7.3k px → **大纲跳转偏位 7.5k px**（把页 section 拍平后同样复现，证明与分页无关；已用资产宽高占位修掉） |
@@ -161,6 +161,24 @@ v10 白做；实测 agent **一个没删**（2 页 / 52k tokens）。`PARSE_VERS
 ⚠️ **生产数据已变**：现在只有 1 篇（paper 1 = 8 页 139 块《增材制造中的机器学习综述》），
 此前那批（37 页真论文 / 3 页 / 合成 / synth-table）都不在了。
 
+**㊷ 页面图形（解析 v11）🟡 本地已验，未上生产**（2026-09-17，commit `73098be`；细节见 `design-decisions.md` ㊷）：
+宿主「Springer 的图还是没有」一处截图，扒出**四件同源缺陷**（全是"取过没有"）——
+① 页眉横线**颜色/粗细是渲染端硬编码的浅灰**（PDF 是纯黑 0.99pt）⇒ `payload["rule"]` 升级成 `{side,color,width}`，
+渲染端用 `--rule-c/--rule-w`（内联样式作用不到伪元素，CSS 变量可以）；
+② **矢量标识**（Springer 马标、"Check for updates" 徽标）在 PDF 里是**画出来的填充**，
+`get_text()` 与图片层都拿不到 ⇒ 新增 `page.get_drawings()` 通道（`_margin_graphics` 三判据 → `_cluster_rects`
+→ `_render_graphic` 透明 PNG）→ **新块类型 `deco`**（免中文、不校验、只渲染，`band`/`align` 贴边 + 左右交替）；
+③ `_finalize` 的「**无图注就剔除**」把真图删了（37 页篇丢 4 张）⇒ 整段撤掉 + 图注几何配对改「优先下方、其次上方、
+允许小幅重叠、全局最近优先一对一」；④ 灰底 `CRITICAL REVIEW` 底纹从未照抄 ⇒ `_margin_shades`
+（**主保险 = 色块里包着可见文字**，防"白字黑框"被抄成黑方块）。`PARSE_VERSION` → **11**。
+⚠️ 验收中扒出第五件：那枚徽标是「**内嵌图片层 + 矢量层**」叠的，**只取内嵌字节 = 一个光灰方块**
+（226 字节的平底板）⇒ 页边带里的无图注小图**也走整体栅格化**。
+**真产品路径端到端已验**（`reextract` → ①c 61 轮 103 万 tokens → 翻译）：158 块 / **deco 9 一个没被删** /
+表格重建 3 张 / 真浏览器 9 张 deco 全部解码且左右交替正确 / 导出件同带；离线回归 **403 passed**。
+**两条教训**：①`naturalWidth=0` ≠ 图坏了（`loading="lazy"` + 首屏外，改成 eager 全好）；
+②改 `pipeline/*.py` 不重启 serve = 白改（旧进程用旧解析器覆盖了刚写入的库，且同端口曾并存**两个**进程）。
+**待宿主**：推 + 上生产（`PARSE_VERSION` 变了 ⇒ 生产唯一那篇要宿主自己点「重新提取」才看得到变化）。
+
 ### 遗留待定项已结（M3 后全部结清或明确推后）
 1 会话机制 ✅ · 2 前端框架 ✅（React+TS+Vite）· 3 任务队列 ✅（**v1 常驻队列 + 启动恢复**，㉗）·
 7 翻译去重 ✅（PDF hash 缓存）· 8 公式渲染 ✅（**服务端 MathML**）· 10 版权警示 ✅ ·
@@ -168,4 +186,4 @@ v10 白做；实测 agent **一个没删**（2 页 / 52k tokens）。`PARSE_VERS
 **明确推后**：4 术语表归属（v1 计划级）· 5 成本护栏数值 · 6 用量面板（已攒 `tokens_used`，v2）·
 9 图表 VLM（v2）· 14 标签词表（v1 自由标签）
 
-_Last updated: 2026-09-17T12:10:00+08:00_
+_Last updated: 2026-09-17T15:45:00+08:00_
