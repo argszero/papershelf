@@ -542,3 +542,16 @@ DB 与 `.env` 事前已备份（`/tmp/*.bak.20260917-154522`）。
   第一版 E2E 脚本在这里抛 `TypeError`；② 本地登录页提交按钮**用 `js(...).click()` 不生效**，
   要 `Emulation.setFocusEmulationEnabled(True)` + `Input.dispatchMouseEvent`（后台标签页那条教训的又一次复现）。
   ⚠️ 后端**本轮零改动**时也要 `npm run build` 一次确认指纹不变（本轮 `index-8YofT6DN.js` 未变）。
+
+### 最近一轮（2026-09-19 13:0x–13:4x）㊹ 修订二：「重建参考文献」实现 → 上生产 → 生产真跑
+
+宿主：「现在可以连上生产环境了」（生产 22 端口本轮恢复；此前 SSH 被封、只有 80/443 通）。
+- `9f0ef78`（实现 + v14 一并上）→ CI 六 job 绿 → 生产 `revision=9f0ef78` / healthy /
+  bundle `index-DLx3KrxJ.js` / 日志零 error；DB + `.env` 备份 `/tmp/papershelf.db.bak.20260919-130041`。
+- **生产 paper 1 真跑重建**：`ref 2→288`、288/288 有中文标题、282,605 tokens / 293s；
+  **11 笔记 + 229 划痕逐字段完全一致**（这是整件事的目的）；真浏览器三模式 + 零 console error。
+- 顺带：paper 4 也修了（177 条）—— **误点**，因为文献库按 `updated_at DESC` 排、row 0 ≠ paper 1。
+- 三条操作教训写进项目记忆：①按 href 认行（别按行号）；②browser-harness 的 await 卡死 =
+  后台标签页（`activate_tab` + `Emulation.setFocusEmulationEnabled` 是正解，第三次撞）；
+  ③日志口径（`refs` vs `refs_left`，`31c8c69` 已修）。
+- **未做**：paper 2（APA 体例）仍 0 条 —— 要覆盖得新加形状判据，待宿主拍板。
