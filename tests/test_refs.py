@@ -130,6 +130,31 @@ def test_split_refuses_words_before_any_number():
     assert split_ref_entries("This is just a normal paragraph without any numbering at all.") is None
 
 
+def test_entry_starts_do_not_have_to_begin_at_entry_one():
+    """连号判据不许**钉死起点 = 1**（生产事故，2026-09-19）。
+
+    参考文献流被跨页的页眉/页脚截成好几段，第二段之后天然从 `[3]`、`[56]`… 起头。
+    原先 `want` 从 1 起步 ⇒ 这些段一律回 0 起点 ⇒ 界面表现是「只翻译了两条，剩下的
+    既没翻译也没法重译」（实测生产那篇：段内 bracket 候选 53/56/62/51/52/12 个，全废）。
+    """
+    stream = ("[3] Gamma study of things C. J Test 3:3. "
+              "[4] Delta study of things D. J Test 4:4. "
+              "[5] Epsilon study of things E. J Test 5:5.")
+    got = split_ref_entries(stream)
+    assert got is not None and len(got[1]) == 3, got
+    assert got[1][0].startswith("[3] Gamma") and got[1][-1].startswith("[5] Epsilon")
+    assert _ref_entry_starts("[3] Gamma. [7] Far away.") == []   # 不连号照样不认
+
+
+def test_entry_starts_skip_a_false_candidate_without_breaking_the_chain():
+    """形状判据难免在条目正文里认出一个"编号"（DOI 的 `… / 1. Oe.`）——
+    为它把后面几十条正确的全丢掉才是真损失：跳过它，这一串接着往下走。"""
+    stream = ("[3] Gamma study of things. https:// doi. org/ 10. 1/ 1. Oe. 99. "
+              "[4] Delta study of things D. [5] Epsilon study of things E. [6] Zeta study.")
+    starts = _ref_entry_starts(stream)
+    assert len(starts) == 4, (starts, stream)
+
+
 def test_split_refuses_a_single_overlong_entry():
     """编号判据中途失效会让后面的条目**全被吞进最后一条** —— 上限挡住这种"两千字的条目"。"""
     stream = "1. Alpha " + ". ".join(["word " * 8] * 60)
@@ -197,6 +222,34 @@ def test_merge_entries_only_touches_the_tail_and_keeps_other_blocks():
     assert [b.type for b in out[3:]] == ["ref", "ref"]
 
 
+def test_merge_splits_every_run_of_a_multipage_reference_list():
+    """生产事故的形状：参考文献跨 4 页，页眉/页脚把碎片流截成 6 段 ⇒ **每一段都要切出条目**。
+
+    修前只有含 `[1]`/`[2]` 的第一段成功（这段恰好被页眉与下一段隔开），
+    后面 286 条一起沉默（`refs` 免中文 ⇒ 界面上既没译文也没重译入口）。
+    """
+    head = Block(id="b-0001", type="h2", en="REFERENCES")
+    blocks = [head]
+    blocks += [_frag("[1] Alpha study of things A. J Test 1:1.", page=8),
+               _frag("[2] Beta study of things B. J Test 2:2.", page=8),
+               _frag("75", band="bottom", page=9),                    # 页脚页码
+               _frag("J Test 160 (2026) 50-81", band="top", page=9)]  # 页眉刊名
+    blocks += [_frag(f"[{n}] Study number {n} of things. J Test {n}:{n}.", page=9)
+               for n in range(3, 9)]
+    blocks += [_frag("76", band="bottom", page=10),
+               _frag("J Test 160 (2026) 50-81", band="top", page=10)]
+    blocks += [_frag(f"[{n}] Study number {n} of things. J Test {n}:{n}.", page=10)
+               for n in range(9, 13)]
+    out = merge_ref_entries(blocks, 1)
+    refs = [b for b in out if b.type == "ref"]
+    assert len(refs) == 12, [b.en[:40] for b in refs]      # [1]..[12] 一条不落
+    assert [b.en.split("]")[0] for b in refs] == [f"[{n}" for n in range(1, 13)]
+    assert all(b.en.rstrip().endswith(".") for b in refs)  # 每条都完整（带着尾部的卷期页）
+    band = [b for b in out if (b.payload or {}).get("band")]
+    assert len(band) == 4 and all(b.type == "refs" for b in band)   # 页眉页脚原地不动
+    assert _flat("".join(b.en for b in out)) == _flat("".join(b.en for b in blocks))
+
+
 def test_merged_ref_entries_drop_the_stale_seam_stamp():
     """`seam`（栏间续段戳）描述"与前一块的关系"，而前一块已经并进来了 —— 必须一起丢掉。"""
     frags = [_frag("1. Alpha study of things A. J Test 1:1.", seam="col-spill", page=8),
@@ -258,6 +311,67 @@ def test_parse_keeps_non_reference_blocks_untouched(tmp_path):
     doc = parse_pdf(pdf, assets_dir=tmp_path / "assets")
     assert any(b.type == "p" and "machine learning in additive manufacturing" in b.en
                for b in doc.blocks), "正文段落被参考文献合并吃掉了"
+
+
+def _multipage_refs_pdf(path):
+    """合成**两页**：正文 → REFERENCES + 条目 1-3 → 页脚页码｜页眉刊名 → 条目 4-6。
+
+    这一页页眉/页脚就是生产形状的关键：它们是 `payload["band"]` 块，会把参考文献流
+    **截断成两段**，于是第二段从 `[4]` 起头（修前一段都切不出来）。离线、无网、不调模型。
+    """
+    fitz = pytest.importorskip("fitz")
+    src = fitz.open()
+    pg = src.new_page(width=595, height=842)
+    # 正文若干块：让 REFERENCES 落在 `REFS_TAIL_FRACTION` 判据的文末区
+    for k in range(8):
+        pg.insert_textbox(fitz.Rect(51, 60 + k * 45, 549, 100 + k * 45),
+                          f"Body paragraph {k + 1}: machine learning in additive "
+                          "manufacturing is studied here. " * 2, fontsize=10)
+    pg.insert_textbox(fitz.Rect(51, 440, 549, 475), "REFERENCES", fontsize=12)
+    pg.insert_textbox(fitz.Rect(51, 490, 549, 530),
+                      "1. Alpha S, Beta T (2024) Metal additive man-", fontsize=9)
+    pg.insert_textbox(fitz.Rect(51, 535, 549, 585),
+                      "ufacturing applications in vehicle parts. Metals 14(2):195. "
+                      "2. Gamma U (2023) A review on laser powder bed fusion of aluminium. "
+                      "Mater Res Express 11(2):022001.", fontsize=9)
+    pg.insert_textbox(fitz.Rect(51, 590, 549, 640),
+                      "3. Delta V, Epsilon W (2022) Fatigue of additively manufactured "
+                      "Ti-6Al-4V. Prog Mater Sci 115:106706.", fontsize=9)
+    pg.insert_textbox(fitz.Rect(51, 800, 549, 820), "75", fontsize=9)          # 页脚页码
+    pg2 = src.new_page(width=595, height=842)
+    pg2.insert_textbox(fitz.Rect(51, 25, 549, 45),
+                       "Journal of Test 160 (2026) 50-81", fontsize=9)          # 页眉刊名
+    for k, (num, auth, title, rest) in enumerate([
+            (4, "Zeta X, Eta Y", "In-situ monitoring of the melt pool", "Addit Manuf 38:101789."),
+            (5, "Theta Z", "Defect detection with machine learning", "J Manuf Process 58:1-12."),
+            (6, "Iota A", "Residual stress modelling in LPBF", "Acta Mater 180:1-15.")]):
+        pg2.insert_textbox(fitz.Rect(51, 80 + k * 50, 549, 125 + k * 50),
+                           f"{num}. {auth} (2019) {title}. {rest}", fontsize=9)
+    src.save(str(path))
+    src.close()
+
+
+def test_parse_merges_every_run_of_a_reference_list_spanning_pages(tmp_path):
+    """跨页参考文献：页眉/页脚把流截成两段，**两段都要切出条目**（生产事故，2026-09-19）。
+
+    修前只有含 `[1]`/`[2]` 的第一段成功；第二段从 `[4]` 起头 ⇒ 0 起点 ⇒ 三条全留在
+    `refs`（免中文）⇒ 界面上"既没有翻译，也无法重译"。
+    """
+    pdf = tmp_path / "multipage_refs.pdf"
+    _multipage_refs_pdf(pdf)
+    from papershelf.pipeline.parse import parse_pdf
+    doc = parse_pdf(pdf, assets_dir=tmp_path / "assets")
+    refs = [b for b in doc.blocks if b.type == "ref"]
+    assert [b.en.split(".")[0] for b in refs] == ["1", "2", "3", "4", "5", "6"], \
+        [(b.type, b.en[:30]) for b in doc.blocks]
+    assert "man-ufacturing" in refs[0].en              # 断词连字符保留（不许猜补）
+    assert "Acta Mater 180:1-15." in refs[5].en        # 每条都是完整条目
+    # 页眉/页脚原地不动、也没被吃进任何条目
+    band = [b for b in doc.blocks if (b.payload or {}).get("band")]
+    assert [b.type for b in band] == ["refs", "refs"]
+    assert "Journal of Test" not in " ".join(b.en for b in refs)
+    assert "75" not in " ".join(b.en for b in refs)
+    assert any(b.en.strip() == "REFERENCES" for b in doc.blocks)     # 小标题照旧在
 
 
 # ── 5. 「只译标题」的定位：模型把行末断词拼回去也要对得上 ─────────────────

@@ -88,7 +88,12 @@ log = logging.getLogger("papershelf.pipeline.parse")
 #         起标 `refs`"处理，条目被 PyMuPDF 的块检测切成一堆 ~200 字符的碎片
 #         （切口常落在**词中间**，一块里还常塞着下一条的前半截）：既没法译标题，
 #         读者看到的也不是"一条文献"。现在切出**整条** → 新块类型 `ref`（只译标题）。
-PARSE_VERSION = 13
+#   v14 → **修掉参考文献只合并出 2 条**（宿主 2026-09-19：「生产环境，References
+#         只翻译了两条，剩下的既没有翻译，也无法重译」）：`_ref_entry_starts` 原先把
+#         连号的起点钉死在 1，而页眉/页脚（`payload["band"]`）会把参考文献流截成好几段
+#         ⇒ **只有含 `[1]`/`[2]` 的第一段合并成功**，其余 286 条（每片都带着连号 `[N]`）
+#         一段都切不出来。改为取**最长的那一串连号**（起点不限），见 `_ref_entry_starts`。
+PARSE_VERSION = 14
 
 # 页面上下边缘（比例），落在其中的短文本块视为页眉/页脚候选
 EDGE_TOP, EDGE_BOTTOM = 0.075, 0.925
@@ -1064,26 +1069,50 @@ def _join_ref_fragments(parts: list[str]) -> str:
 
 
 def _ref_entry_starts(stream: str) -> list[int]:
-    """条目起点在流里的下标（**只认连号**的候选）。
+    """条目起点在流里的下标（**只认连号**的那一串）。
 
     两层判据，缺一不可：
     ① 形状：`[N] ` 或 `N. ` + 大写字母起头（两种编号风格分别试，取命中多的那个）；
-    ② **连号**：条目编号在原文本就是 1,2,3… 连续的 —— 把"连号"当判据才能真正挡住
+    ② **连号**：条目编号在原文本就是连续的 —— 把"连号"当判据才能真正挡住
        正文里那些长得像编号的东西（逗号后的年份、DOI 里的 `10.`）。
-       允许跳一号（原件偶有漏号），跳两号以上即停止认（剩下的全归最后一条）。
+       允许跳一号（原件偶有漏号），跳两号以上即断开这一串。
+
+    ⚠️ **连号判据不许钉死起点 = 1**（生产事故，2026-09-19）。原先 `want` 从 1 起步，
+    于是一段流**只有恰好从 `[1]`/`1.` 开始**才认得出条目。而"一段"的边界是
+    `merge_ref_entries` 划的：**跨页的页眉/页脚（`payload["band"]`）会把参考文献活生生截断**
+    （生产 paper 1 的参考文献跨 4 页，被截成 6 段）。后果是**只有第一段（含 `[1]`、`[2]`）
+    合并成功、译出 2 条**，后面 286 条明明每片都带着连号的 `[N]` 起点却一段都切不出来
+    （实测：段内 bracket 候选 53/56/62/51/52/12 个，`_ref_entry_starts` 一律回 0）
+    —— 界面表现正是"只翻译了两条，剩下的既没翻译也没法重译"（`refs` 免中文）。
+    改法：候选照旧按形状取，但要找的是**最长的那一串连号**，起点在哪儿都行。
     """
     best: list[int] = []
     for pattern in (_RE_REF_BRACKET, _RE_REF_NUM):
-        starts: list[int] = []
-        want = 1
-        for m in pattern.finditer(stream):
-            num = int(m.group(1))
-            if num in (want, want + 1):
-                starts.append(m.start())
-                want = num + 1
+        cands = [(int(m.group(1)), m.start()) for m in pattern.finditer(stream)]
+        starts = _longest_consecutive_run(cands)
         if len(starts) > len(best):
             best = starts
     return best if len(best) >= 2 else []
+
+
+def _longest_consecutive_run(cands: list[tuple[int, int]]) -> list[int]:
+    """`(编号, 下标)` 候选里最长的一串连号，返回它们的下标。
+
+    逐个候选当起点试着往下走：编号等于 `want` 或 `want+1`（后者 = 原件漏了一号）就接上，
+    否则**跳过这个候选但不中断这一串**（形状判据难免在条目正文里认错一两个"编号"，
+    为它把后面几十条正确的全丢掉才是真损失）。取最长的一串。
+    """
+    best: list[int] = []
+    for i, (seed, _) in enumerate(cands):
+        want = seed + 1
+        run = [cands[i][1]]
+        for num, start in cands[i + 1:]:
+            if num in (want, want + 1):
+                run.append(start)
+                want = num + 1
+        if len(run) > len(best):
+            best = run
+    return best
 
 
 def split_ref_entries(stream: str) -> tuple[str, list[str]] | None:
