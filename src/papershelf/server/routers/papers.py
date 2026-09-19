@@ -21,7 +21,7 @@ from pydantic import BaseModel
 from ...pipeline import Doc, en_html, looks_math, parse_pdf
 from ...pipeline.validate import expects_chinese
 from ..config import Settings, get_settings
-from ..converter import convert_paper
+from ..converter import convert_paper, enqueue
 from ..db import dump_json, rows_to_list, tx, utcnow
 from ..repo import doc_public, paper_public
 from ..security import current_user, get_conn, require_paper, require_plan
@@ -284,19 +284,19 @@ def get_doc(paper_id: int, conn: sqlite3.Connection = Depends(get_conn),
 def retrigger(paper_id: int, background: BackgroundTasks,
               conn: sqlite3.Connection = Depends(get_conn),
               user: dict[str, Any] = Depends(current_user)) -> dict[str, Any]:
-    """失败重试入口（§5.7：不阻塞其它文献）。"""
+    """失败重试入口（§5.7：不阻塞其它文献）。
+
+    `enqueue(..., job=None)` 是**必须显式写**的一步：把 `pending_job` 清成"完整转换"，
+    否则上一次「重建参考文献」留下的 `job='refs'` 会让这次重试**又跑一遍修文献**
+    （用户点的是"重新转换"，跑的是别的事 —— 静默且难查）。
+    `conv_attempts` 归零：**人工主动重试不该被自动护栏挡住**。`docs/design.md` 的原话是
+    「超限置 failed **待人工重试**」—— 人工重试若不能重置计数，这句话就是空话。
+    ⚠️ 修 `claim_paper` 之前计数恒为 0，这条护栏从未生效（2026-09-15 一并修）。
+    """
     paper = require_paper(conn, paper_id, user)
     if paper["conv_state"] == "doing":
         raise HTTPException(status.HTTP_409_CONFLICT, "该文献正在转换中")
-    with tx(conn):
-        # `conv_attempts` 归零：**人工主动重试不该被自动护栏挡住**。
-        # `docs/design.md` 的原话是「超限置 failed **待人工重试**」—— 人工重试若不能重置
-        # 计数，这句话就是空话（用户点到第 4 次会永远得到"超过最大重试次数"）。
-        # ⚠️ 修 `claim_paper` 之前计数恒为 0，这条护栏从未生效（2026-09-15 一并修）。
-        conn.execute(
-            "UPDATE papers SET conv_state='queued', conv_error=NULL, conv_attempts=0 WHERE id=?",
-            (paper_id,),
-        )
+    enqueue(conn, paper_id, reset_attempts=True)
     fingerprint = None
     if paper["pdf_path"] and Path(paper["pdf_path"]).exists():
         fingerprint = _pdf_fingerprint(Path(paper["pdf_path"]))
@@ -346,15 +346,55 @@ def reextract(paper_id: int, background: BackgroundTasks,
             conn.execute("DELETE FROM doc_cache WHERE fingerprint=?", (fingerprint,))
         conn.execute("DELETE FROM notes WHERE paper_id=?", (paper_id,))
         conn.execute("DELETE FROM highlights WHERE paper_id=?", (paper_id,))
-        conn.execute(
-            """UPDATE papers SET conv_state='queued', conv_error=NULL, conv_attempts=0,
-                      updated_at=? WHERE id=?""",
-            (utcnow(), paper_id),
-        )
+    # 排队**在事务之外**用共用入口：`job=None` 清掉可能残留的 `pending_job`
+    # （同 `retrigger` 的理由 —— 这里刻意点明是"完整转换"，不是"修文献"）。
+    enqueue(conn, paper_id, reset_attempts=True)
     log.info("paper=%s 重新提取：解析缓存已清（fingerprint=%s…）/ 笔记与划痕作废 → 重新排队",
              paper_id, fingerprint[:12] if fingerprint else "无（arXiv 路线）")
     background.add_task(convert_paper, paper_id, fingerprint)
     return {"ok": True, "conv_state": "queued", "cache_cleared": bool(fingerprint)}
+
+
+@router.post("/papers/{paper_id}/rebuild-refs", status_code=202)
+def rebuild_refs(paper_id: int, background: BackgroundTasks,
+                 conn: sqlite3.Connection = Depends(get_conn),
+                 user: dict[str, Any] = Depends(current_user)) -> dict[str, Any]:
+    """**重建参考文献**（㊹ 修订的存量出口，2026-09-19，宿主点单）。
+
+    宿主原话：「生产上你第一篇 pdf 我已经添加了不少笔记了，想办法在不影响笔记的情况下，
+    可以手动改一下后面的 References？」
+
+    ## 它与「重新提取」的区别（这是整个入口存在的理由）
+
+    | | 重新提取 | 重建参考文献 |
+    |---|---|---|
+    | 跑什么 | 解析 → 公式 → ①c 校对 → 翻译 → 校验（整篇） | 只重跑**文末文献段**的条目合并 |
+    | 笔记/划痕 | **全部删除** | **一条不动**（正文块 id 不变；钉在被合并碎片上的按坐标搬家） |
+    | 正文译文 | 全部重译 | 一个字不碰 |
+    | 代价 | ≈ 百万 tokens 量级 | 只译新增条目（生产那篇 ≈30 万） |
+
+    为什么「重新提取」不能替代它：批注锚在 `(block_id, lang, start, end)` 上，重解析后
+    块 id 与文本都会变，所以那个出口必须把批注删掉 —— 对已经读过并做了批注的篇目即等于
+    "拿不回以前的工作"。详见 `server/refsfix.py` 的模块 docstring。
+
+    ## 异步而非同步
+
+    一次几百条条目要跑好几分钟（每条一次 LLM 调用），所以走**常驻队列**
+    （`pending_job='refs'` → `converter._run_refs_fix`），与转换共用并发闸门、
+    共享启动恢复。返回 202 后前端看 `conv_state` 即可（与重新提取同一套观感）。
+
+    幂等：已经修过的篇目再点一次是 no-op（不落库、不调模型，`changed=false`）。
+    """
+    paper = require_paper(conn, paper_id, user)
+    if paper["conv_state"] == "doing":
+        raise HTTPException(status.HTTP_409_CONFLICT, "该文献正在转换中")
+    if paper["conv_state"] != "done":
+        raise HTTPException(status.HTTP_409_CONFLICT,
+                            f"该文献还没有可修复的产物（当前状态：{paper['conv_state']}）")
+    enqueue(conn, paper_id, job="refs", reset_attempts=True)
+    log.info("paper=%s 重建参考文献：已排入队列（只动文末文献段，笔记与划痕保留）", paper_id)
+    background.add_task(convert_paper, paper_id, None)
+    return {"ok": True, "conv_state": "queued", "job": "refs"}
 
 
 @router.get("/papers/{paper_id}/export")

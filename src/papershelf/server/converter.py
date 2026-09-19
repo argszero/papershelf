@@ -77,14 +77,42 @@ def claim_paper(conn: sqlite3.Connection, paper_id: int) -> bool:
 
 def _set_state(conn: sqlite3.Connection, paper_id: int, state: str,
                error: str | None = None, tokens: int = 0) -> None:
-    """只改状态与错误（**不再碰 `conv_attempts`** —— 它由 `claim_paper` 记，见其 docstring）。"""
+    """只改状态与错误（**不再碰 `conv_attempts`** —— 它由 `claim_paper` 记，见其 docstring）。
+
+    终态（`done`/`failed`）**一并清掉 `pending_job`**：那一列回答的是"轮到它时做什么"，
+    事情已经做完了（或已知做不成），留着只会让**下一次**排队被误当成上一次的活
+    （「修文献 → 用户又点重新转换 → 实际又跑了一遍修文献」是这条列最可能的坏结局）。
+    """
     with tx(conn):
         conn.execute(
             """UPDATE papers SET conv_state=?, conv_error=?, updated_at=?,
-                      tokens_used = tokens_used + ?
+                      tokens_used = tokens_used + ?, pending_job=NULL
                WHERE id=?""",
             (state, error, utcnow(), tokens, paper_id),
         )
+
+
+def enqueue(conn: sqlite3.Connection, paper_id: int, job: str | None = None,
+            *, reset_attempts: bool = False) -> None:
+    """把一篇文献**排进队列**（`conv_state='queued'`），并声明这次要跑什么。
+
+    **所有**排队入口都走这里（导入/arXiv 的 INSERT 除外 —— 它们新插的行本来就是
+    `queued` + `pending_job=NULL`）。为什么要一个函数：`pending_job` 是**跨请求存活**的，
+    而"重新提取"与"重建参考文献"都排同一列车 —— 若某个入口只改 `conv_state` 而不声明
+    `job`，上一轮残留的 `pending_job` 就会把这次转换劫持成另一次操作。
+    一处声明，别处不可能漏（`tests/test_refs_rebuild.py` 钉住"重试入口必须清掉旧 job"）。
+
+    `job=None` = 完整转换。`job="refs"` = 只重建文末参考文献（`server/refsfix.py`）。
+    `reset_attempts=True` = 人工入口（重试/重新提取/重建参考文献）把 `conv_attempts` 归零，
+    理由见 `retrigger`：护栏防的是自动重试烧钱，不是防用户。
+    """
+    cols = "conv_state='queued', conv_error=NULL, pending_job=?"
+    args: list[Any] = [job]
+    if reset_attempts:
+        cols += ", conv_attempts=0"
+    args.append(paper_id)
+    with tx(conn):
+        conn.execute(f"UPDATE papers SET {cols} WHERE id=?", args)
 
 
 def convert_paper(paper_id: int, fingerprint: str | None = None) -> None:
@@ -133,6 +161,9 @@ def convert_paper(paper_id: int, fingerprint: str | None = None) -> None:
 
             t0 = time.monotonic()
             with paper_log(paper_id, settings.logs_dir, enabled=settings.log_per_paper):
+                if (fresh["pending_job"] or "") == "refs":
+                    _run_refs_fix(conn, paper_id, t0)
+                    return
                 log.info("paper=%s 开始转换（第 %s 次尝试，来源=%s，PDF=%s）", paper_id,
                          int(fresh["conv_attempts"]) + 1, fresh["source"],
                          Path(str(fresh["pdf_path"] or "")).name or "—")
@@ -149,6 +180,48 @@ def convert_paper(paper_id: int, fingerprint: str | None = None) -> None:
                          paper_id, len(doc.blocks), tokens, time.monotonic() - t0)
     finally:
         conn.close()
+
+
+def _run_refs_fix(conn: sqlite3.Connection, paper_id: int, t0: float) -> None:
+    """`pending_job='refs'` 的那条支路：**只重建文末参考文献**，不重跑管线。
+
+    ## 为什么它必须挂在同一个队列/状态机上（而不是自己起一个线程）
+
+    这条活是**长任务**（生产那篇 288 条、≈30 万 tokens、好几分钟），所以：
+    - 不能塞在请求线程里（㉗ 的教训：任务活在 HTTP 请求里 = 一重启就人间蒸发）；
+    - 必须和转换**共用并发闸门**（`concurrency_semaphore`），否则一次点击能让
+      LLM 侧并发翻倍；
+    - 必须能被启动恢复捞回来（`doing → queued` 只看 `conv_state`，`pending_job` 原样留着，
+      重启后它仍然知道自己该干"修文献"而不是"重跑整篇"）。
+
+    复用 `convert_paper` 的外壳（等槽位 → 认领 → 记日志 → 落终态）是唯一不重复实现
+    这些不变量、也不把转换路径搅乱的做法。
+    """
+    from .refsfix import rebuild_paper_refs
+
+    log.info("paper=%s 开始重建参考文献（只动文末文献段；正文、笔记与划痕都不动）", paper_id)
+    try:
+        result = rebuild_paper_refs(conn, paper_id, log=log.info)
+    except Exception as exc:                           # noqa: BLE001
+        log.exception("paper=%s 重建参考文献失败（%.1fs）", paper_id, time.monotonic() - t0)
+        _set_state(conn, paper_id, "failed", f"{type(exc).__name__}: {exc}")
+        return
+    tokens = int(result.get("tokens", 0) or 0)
+    if not result.get("ok"):
+        # `ok=False` = 这篇根本没有产物（转换还没完成 / 已被删）。不是失败，
+        # 但也**不能**写 `done`：那会让界面显示"转换完成"而实际一片空白。
+        _set_state(conn, paper_id, "failed", str(result.get("reason") or "没有可修复的产物"))
+        return
+    if not result.get("changed"):
+        log.info("paper=%s 重建参考文献：无事可做（%s），未改动库也未调模型",
+                 paper_id, result.get("reason"))
+    else:
+        log.info("paper=%s 重建参考文献完成：%s 条条目（余下未切出的碎片 %s 个）/ %d tokens / "
+                 "批注搬家 %s 条（落空 %s 条）/ 用时 %.1fs",
+                 paper_id, result.get("entries"), result.get("refs"), tokens,
+                 result.get("anchors_moved"), result.get("anchors_dropped"),
+                 time.monotonic() - t0)
+    _set_state(conn, paper_id, "done", None, tokens=tokens)
 
 
 def _writeback_meta(conn: sqlite3.Connection, paper_id: int, paper: dict[str, Any],

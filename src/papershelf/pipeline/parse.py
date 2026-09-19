@@ -12,6 +12,7 @@ from __future__ import annotations
 import logging
 import re
 from collections import Counter
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, NamedTuple
 
@@ -1041,7 +1042,8 @@ def merge_math_runs(blocks: list[Any]) -> list[Any]:
 #
 # 所以这里做**纯结构**的合并：把碎片按阅读顺序接成一条流 → 按条目编号切成整条 →
 # 每块一个 `ref` 块。判定与内容都**只用已经抽出来的文字**，不碰 PDF、不调模型。
-def _join_ref_fragments(parts: list[str]) -> str:
+def _join_ref_fragments(parts: list[str], *,
+                        spans: list[tuple[int, int]] | None = None) -> str:
     """把碎片按阅读顺序接成一整条流 —— **只动空白，一个字符都不增删**。
 
     接缝规则只有三条，都来自实测形状：
@@ -1053,19 +1055,74 @@ def _join_ref_fragments(parts: list[str]) -> str:
       这里只做"不丢字、不加字"的拼接。
     - 任一侧已有空白（PDF 换行处通常留着尾随空格）→ 直接接。
     - 两侧都是非空白字符 → 补**一个**空格（否则两个词会粘成一个）。
+
+    `spans` 传一个空列表进来时，函数会把**每片文字在流里的 `[起, 止)`** 追加进去
+    （顺序与 `parts` 一一对应）—— 「重建参考文献」要靠它把钉在旧碎片上的笔记/划痕
+    搬到新条目上（见 `rebuild_ref_entries`）。碎片文字本身**原样出现**在流里，
+    所以那个区间就是它的坐标；接缝处补的那个空格落在区间**之外**。
     """
     out = ""
     for p in parts:
         if not out:
             out = p
-            continue
-        if out.endswith("-") and p[:1].isalpha():
+        elif out.endswith("-") and p[:1].isalpha():
             out += p
         elif out[-1:].isspace() or p[:1].isspace():
             out += p
         else:
             out += " " + p
+        if spans is not None:
+            spans.append((len(out) - len(p), len(out)))
     return out
+
+
+def _normalize_with_map(stream: str, a: int, b: int) -> tuple[str, list[int]]:
+    """`" ".join(stream[a:b].split())` + **逐字符回流下标**（流下标 → 归一化文本下标）。
+
+    为什么需要这张表：新条目的文字是 `stream[a:b]` **压平空白**后的结果
+    （连续空白并成一个空格、首尾空白去掉），于是"第 N 个字符"在两边**不是同一个位置**。
+    笔记/划痕存的是**裸文本字符偏移**（㉛），搬进新条目时必须换算，否则高亮会偏。
+    空白字符没有自己的位置（它可能被合并掉），一律映射到**它后面那个非空白字符**的位置；
+    尾部空白映射到文本末尾。
+    """
+    text = " ".join(stream[a:b].split())
+    offsets = [-1] * (b - a)
+    n = 0
+    for i in range(a, b):
+        if stream[i].isspace():
+            continue
+        if n and stream[i - 1].isspace():
+            n += 1                       # 词间那一个空格
+        offsets[i - a] = n
+        n += 1
+    assert n == len(text), (n, len(text), stream[a:b])
+    # 空白位回填：指向"下一个可见字符"的下标（尾部空白指向末尾）
+    nxt = len(text)
+    for j in range(len(offsets) - 1, -1, -1):
+        if offsets[j] < 0:
+            offsets[j] = nxt
+        else:
+            nxt = offsets[j]
+    return text, offsets
+
+
+@dataclass
+class RefSpan:
+    """一条**旧碎片**的文字落在某个新块里的位置（笔记/划痕搬家的坐标系）。
+
+    `offsets[i]` = 流里第 `start + i` 个字符在新块**归一化文本**里的下标。
+    """
+    new_id: str
+    base: int            # 旧碎片文字在流里的起点
+    start: int           # 新块在流里的区间 `[start, end)`
+    end: int
+    offsets: list[int]
+
+    def move(self, s: int, e: int) -> tuple[int, int]:
+        """旧碎片上的裸文本区间 `[s, e)` → 新块上的区间（越界处夹到本块边界）。"""
+        p = min(max(self.base + s, self.start), self.end - 1)
+        q = min(max(self.base + e, p + 1), self.end)
+        return self.offsets[p - self.start], self.offsets[q - 1 - self.start] + 1
 
 
 def _ref_entry_starts(stream: str) -> list[int]:
@@ -1144,13 +1201,54 @@ def merge_ref_entries(blocks: list[Any], from_index: int) -> list[Any]:
     - 段里切不出条目（没有编号，或编号判据中途失效）→ **原样返回那一段**，
       不产出一个两千字的"条目"，也不丢字。
     """
+    return _merge_ref_tail(blocks, from_index, None, want_moves=False)[0]
+
+
+def rebuild_ref_entries(blocks: list[Any],
+                        from_index: int) -> tuple[list[Any], dict[str, list[RefSpan]]]:
+    """**在已经落库的块上**重跑参考文献合并 —— 供「重建参考文献」维护操作使用。
+
+    与解析期 `merge_ref_entries` 的两点不同：
+
+    1. **新块有唯一 ID**（`b-<现有最大号 + k>`）：解析期那一遍是在最后统一重编号的，
+       而这里整篇的 ID 已经被笔记/划痕钉住了 —— 绝不能因为尾部的块数变了就把
+       **正文块重新编号**（那等于把所有批注挪到别的句子上）。
+    2. 返回 `moves`：**旧碎片 id → 它在哪个新块里**（`RefSpan`），供调用方把钉在
+       被合并掉的那些碎片上的笔记/划痕搬到新条目上（偏移量一并换算）。
+    """
+    return _merge_ref_tail(blocks, from_index, _NewIds(blocks), want_moves=True)
+
+
+class _NewIds:
+    """给新 `ref` 块发唯一 ID：接着现有最大号往下发（`b-0821`、`b-0822`…）。
+
+    ⚠️ 不能复用被合并掉的那些碎片 ID：一个碎片里可能塞着**两条**条目
+    （`… 195. [21] Esmaeil…`），复用会撞 ID —— 而 `blocks` 的主键是 `(paper_id, id)`。
+    """
+
+    def __init__(self, blocks: list[Any]) -> None:
+        nums = [int(b.id[2:]) for b in blocks
+                if isinstance(b.id, str) and b.id.startswith("b-") and b.id[2:].isdigit()]
+        self._n = max(nums, default=0)
+
+    def __call__(self) -> str:
+        self._n += 1
+        return make_block_id(self._n)
+
+
+def _merge_ref_tail(blocks: list[Any], from_index: int, ids: Any,
+                    *, want_moves: bool) -> tuple[list[Any], dict[str, list[RefSpan]]]:
     head, tail = blocks[:from_index], blocks[from_index:]
     out: list[Any] = []
+    moves: dict[str, list[RefSpan]] = {}
     run: list[Any] = []
 
     def flush() -> None:
         if run:
-            out.extend(_merge_ref_run(run))
+            merged, mv = _merge_ref_run_mapped(run, ids)
+            out.extend(merged)
+            for k, v in mv.items():
+                moves.setdefault(k, []).extend(v)
             run.clear()
 
     for b in tail:
@@ -1160,31 +1258,76 @@ def merge_ref_entries(blocks: list[Any], from_index: int) -> list[Any]:
             flush()
             out.append(b)
     flush()
-    return head + out
+    return head + out, (moves if want_moves else {})
 
 
 def _merge_ref_run(run: list[Any]) -> list[Any]:
     """合并一段连续的参考文献碎片；切不出条目时**原样**返回。"""
+    return _merge_ref_run_mapped(run, None)[0]
+
+
+def _merge_ref_run_mapped(run: list[Any],
+                          ids: Any) -> tuple[list[Any], dict[str, list[RefSpan]]]:
+    """合并一段连续的参考文献碎片；切不出条目时**原样**返回。
+
+    `ids` 为空 = 解析期（新块 ID 留空，最后统一重编号）；非空 = 「重建参考文献」
+    （逐个发唯一 ID，并记录 `moves`）。
+    """
     first = run[0]
-    stream = _join_ref_fragments([b.en for b in run])
+    frag_spans: list[tuple[int, int]] = []
+    stream = _join_ref_fragments([b.en or "" for b in run], spans=frag_spans)
     split = split_ref_entries(stream)
     if split is None:
         log.info("  · 参考文献区 %d 个碎片块切不出条目（无编号/编号不连续）→ 保持原样", len(run))
-        return run
+        return run, {}
     leading, texts = split
-    # 条目继承首片的 `page`（分页容器按它归页）与其余版面戳；`seam`（栏间续段戳）
-    # 合并后已无意义 —— 它描述的是"与前一块的关系"，而前一块已经并进来了。
-    payload = {k: v for k, v in (first.payload or {}).items() if k != "seam"}
-    payload["ref_fragments"] = len(run)
+    starts = _ref_entry_starts(stream)
     out: list[Any] = []
+    moves: dict[str, list[RefSpan]] = {}
+
+    def payload_at(pos: int) -> dict[str, Any]:
+        """**起点落在哪个碎片上，就用哪个碎片的版面戳**（分页/页边带是按块记的）。
+
+        原先整段条目一律继承**首片**的 `page`：一段碎片横跨两页时，后半段的条目
+        会被归到上一页的页 section 里（读者看到"第 5 页"底下挂着第 6 页的文献）。
+        另外 `seam`（栏间续段戳）描述的是"与前一块的关系"，前一块已经并进来了 → 丢掉。
+        """
+        owner = first
+        for b, (s0, s1) in zip(run, frag_spans):
+            if s0 <= pos < s1:
+                owner = b
+                break
+        pay = {k: v for k, v in (owner.payload or {}).items() if k != "seam"}
+        pay["ref_fragments"] = len(run)
+        return pay
+
+    def register(a: int, b: int, new_id: str) -> None:
+        """把 `stream[a:b]`（某个新块的文字）的坐标表登记给**它覆盖到的每个碎片**。"""
+        if not ids:                      # 解析期不需要搬家表
+            return
+        if b <= a:
+            return
+        _, offsets = _normalize_with_map(stream, a, b)
+        for frag, (s0, s1) in zip(run, frag_spans):
+            if s1 <= a or s0 >= b:
+                continue
+            moves.setdefault(frag.id, []).append(
+                RefSpan(new_id=new_id, base=s0, start=a, end=b, offsets=offsets))
+
     if leading.strip():                  # 条目 1 之前若还有文字，单独留一块（绝不吞）
-        out.append(Block(id=first.id, type="refs", en=leading, section=first.section,
-                         payload=dict(payload)))
-    for text in texts:
-        out.append(Block(id="", type="ref", en=text, section=first.section,
-                         payload=dict(payload)))
+        lead = Block(id=first.id, type="refs", en=leading, section=first.section,
+                     payload=payload_at(0))
+        out.append(lead)
+        register(0, starts[0], lead.id)
+    for i, text in enumerate(texts):
+        a = starts[i]
+        b = starts[i + 1] if i + 1 < len(starts) else len(stream)
+        blk = Block(id=ids() if ids else "", type="ref", en=text,
+                    section=first.section, payload=payload_at(a))
+        out.append(blk)
+        register(a, b, blk.id)
     log.info("  · 参考文献 %d 个碎片块 → %d 条（%s）", len(run), len(texts), first.id)
-    return out
+    return out, moves
 
 
 def _desmallcaps(text: str) -> str:

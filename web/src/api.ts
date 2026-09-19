@@ -95,6 +95,12 @@ export const api = {
   reextractPaper: (id: number) =>
     request<{ ok: boolean; conv_state: string; cache_cleared: boolean }>(
       `/api/papers/${id}/reextract`, { method: 'POST' }),
+  // 重建参考文献（㊹ 修订的存量出口，宿主 2026-09-19 点单）：只重跑**文末文献段**的
+  // 条目合并 —— 正文块 id 不变 ⇒ **笔记与划痕一条不动**，代价只有新增条目的翻译。
+  // 异步（几百条要跑几分钟），完成后 `conv_state` 回到 `done`（与重新提取同一套观感）。
+  rebuildRefs: (id: number) =>
+    request<{ ok: boolean; conv_state: string; job: string }>(
+      `/api/papers/${id}/rebuild-refs`, { method: 'POST' }),
 
   // ── 阅读（块级 JSON 是唯一事实来源，决策⑳）──
   doc: (paperId: number) => request<PaperDoc>(`/api/papers/${paperId}/doc`),

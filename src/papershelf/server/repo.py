@@ -21,24 +21,34 @@ from ..pipeline.validate import NO_ZH_TYPES  # noqa: F401  （下游 routers 会
 def save_doc(conn: sqlite3.Connection, paper_id: int, doc: Doc) -> None:
     """整篇覆盖写入（转换完成时调用；块级修订请用 `update_block`）。"""
     with tx(conn):
-        conn.execute("DELETE FROM blocks WHERE paper_id=?", (paper_id,))
-        conn.executemany(
-            """INSERT INTO blocks (paper_id, id, ord, type, level, section, en, zh, zh_source, payload)
-               VALUES (?,?,?,?,?,?,?,?,?,?)""",
-            [
-                (paper_id, b.id, i, b.type, b.level, b.section, b.en, b.zh, b.zh_source,
-                 dump_json(b.payload))
-                for i, b in enumerate(doc.blocks)
-            ],
-        )
-        conn.execute(
-            """INSERT INTO docs (paper_id, meta, assets, block_count, version, created_at, updated_at)
-               VALUES (?,?,?,?,1,?,?)
-               ON CONFLICT(paper_id) DO UPDATE SET
-                 meta=excluded.meta, assets=excluded.assets,
-                 block_count=excluded.block_count, updated_at=excluded.updated_at""",
-            (paper_id, dump_json(doc.meta), dump_json(doc.assets), len(doc.blocks), utcnow(), utcnow()),
-        )
+        write_doc(conn, paper_id, doc)
+
+
+def write_doc(conn: sqlite3.Connection, paper_id: int, doc: Doc) -> None:
+    """`save_doc` 的**不带事务**内核。
+
+    拆出来是为了让「块与批注必须在同一个事务里改完」的调用方用得上（`server.refsfix`：
+    它要在同一次提交里改写 `blocks` **并** 把笔记/划痕的锚点搬到新块上）。
+    ⚠️ `db.tx` **不可重入** —— 内层一提交，外层就失去回滚能力（㉛ 补全踩过同款）。
+    """
+    conn.execute("DELETE FROM blocks WHERE paper_id=?", (paper_id,))
+    conn.executemany(
+        """INSERT INTO blocks (paper_id, id, ord, type, level, section, en, zh, zh_source, payload)
+           VALUES (?,?,?,?,?,?,?,?,?,?)""",
+        [
+            (paper_id, b.id, i, b.type, b.level, b.section, b.en, b.zh, b.zh_source,
+             dump_json(b.payload))
+            for i, b in enumerate(doc.blocks)
+        ],
+    )
+    conn.execute(
+        """INSERT INTO docs (paper_id, meta, assets, block_count, version, created_at, updated_at)
+           VALUES (?,?,?,?,1,?,?)
+           ON CONFLICT(paper_id) DO UPDATE SET
+             meta=excluded.meta, assets=excluded.assets,
+             block_count=excluded.block_count, updated_at=excluded.updated_at""",
+        (paper_id, dump_json(doc.meta), dump_json(doc.assets), len(doc.blocks), utcnow(), utcnow()),
+    )
 
 
 def load_doc(conn: sqlite3.Connection, paper_id: int) -> Doc | None:

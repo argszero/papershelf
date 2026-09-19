@@ -119,6 +119,11 @@ CREATE TABLE IF NOT EXISTS papers (
   last_read_at  TEXT,
   conv_state    TEXT NOT NULL DEFAULT 'none',      -- none|queued|doing|done|failed（②）
   conv_error    TEXT,
+  -- 本次排队**要跑什么**（㊹ 修订的存量出口，2026-09-19）：NULL/`convert` = 完整转换，
+  -- `refs` = 只重建文末参考文献（`server/refsfix.py`）。它与 `conv_state` 是两件事：
+  -- 后者回答"轮到谁了"，前者回答"轮到它时做什么"。跑完即清空（见 `converter._set_state`），
+  -- 所以它**不会**残留成"下次转换被误当成修文献"。
+  pending_job   TEXT,
   conv_attempts INTEGER NOT NULL DEFAULT 0,
   tokens_used   INTEGER NOT NULL DEFAULT 0,        -- 用量可见性（待定项 6）
   -- 标题是不是「导入时随手写下、用户从未改过」的占位值（⑲ + 2026-09-12 修复）。
@@ -337,6 +342,10 @@ def _migrate(conn: sqlite3.Connection) -> None:
     #  否则会出现"进度 13% 但最近阅读：未读"的自相矛盾）。
     # `progress = 0` 的行一律留 NULL（= 从没读过），不编时间戳。
     pcols = {r["name"] for r in conn.execute("PRAGMA table_info(papers)")}
+    # 「这次排队要跑什么」（㊹ 修订的存量出口，2026-09-19）。存量行留 NULL = 完整转换，
+    # 正是它们本来的语义（加这一列**不改任何既有行的行为**）。
+    if "pending_job" not in pcols:
+        conn.execute("ALTER TABLE papers ADD COLUMN pending_job TEXT")
     if "last_read_at" not in pcols:
         conn.execute("ALTER TABLE papers ADD COLUMN last_read_at TEXT")
         conn.execute("UPDATE papers SET last_read_at=updated_at WHERE progress > 0")

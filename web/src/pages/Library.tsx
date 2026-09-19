@@ -121,6 +121,26 @@ export function LibraryPage() {
     } finally { setBusy(null) }
   }, [reload])
 
+  // 重建参考文献（㊹ 修订的存量出口，宿主 2026-09-19）：解析 v14 之前的产物里，
+  // 文末参考文献被页眉/页脚截成好几段 ⇒ 只有第一段能合并成条目、其余既不翻译也无法重译。
+  // ⚠️ 与「重新提取」的分工必须写在确认框里：这个**保留笔记与划痕**（正文块 id 不变），
+  //    只重跑文末那一段；重新提取是"整篇从零"，批注会全没。代价只说两条：
+  //    会重新翻译新增条目（token）；只对已生成的文献可用。
+  const rebuildRefs = useCallback(async (p: Paper) => {
+    const name = paperLabel(p)
+    if (!window.confirm(
+      `重建${name}的参考文献？\n\n` +
+      '只重跑文末参考文献段的条目合并（把被页眉/页脚截断的碎片接成整条，并翻译标题）。\n' +
+      '正文译文、笔记与划痕都会保留，只有新增的参考文献条目会翻译（有 token 成本）。')) return
+    setBusy(p.id)
+    try {
+      await api.rebuildRefs(p.id)
+      await reload()
+    } catch (e) {
+      window.alert(e instanceof Error ? e.message : '重建参考文献失败')
+    } finally { setBusy(null) }
+  }, [reload])
+
   if (!plan) return <><TopBar title="文献库" sub="还没有阅读计划" /><NoPlan /></>
 
   const chips: Array<{ k: 'all' | PaperStatus; label: string }> = [
@@ -191,6 +211,15 @@ export function LibraryPage() {
                                       aria-label={`重新提取《${p.title || p.id}》`}
                                       disabled={busy === p.id || p.conv_state === 'doing' || p.conv_state === 'queued'}
                                       onClick={(e) => { e.stopPropagation(); void reextract(p) }}>重新提取</button>
+                              {/* 重建参考文献（㊹ 修订）：只对**已生成**的文献可用（没有产物就没什么可重建的）。
+                                  与「重新提取」并列放在一起 —— 两者都是"这篇的产物我不满意"的出口，
+                                  区别只在于破坏性（这个保批注，那个不保），所以并排放才好比较。 */}
+                              {p.conv_state === 'done' && (
+                                <button className="t-edit t-fix" title="只重建文末参考文献（笔记、划痕与正文译文都保留）"
+                                        aria-label={`重建《${p.title || p.id}》的参考文献`}
+                                        disabled={busy === p.id}
+                                        onClick={(e) => { e.stopPropagation(); void rebuildRefs(p) }}>重建参考文献</button>
+                              )}
                               <button className="t-edit t-del" title="删除这篇文献"
                                       aria-label={`删除《${p.title || p.id}》`}
                                       disabled={busy === p.id}

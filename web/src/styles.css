@@ -372,6 +372,10 @@ select.input { width: auto; }
 /* 「重新提取」是**中等破坏性**（作废笔记/划痕 + 花 token，但不丢这篇文献）：
    hover 给 warn 色，三个并排的胶囊各自可辨（编辑=accent / 重新提取=warn / 删除=danger）。 */
 .ptable .t-re:hover { color: var(--warn); border-color: var(--warn); }
+/* 「重建参考文献」（㊹ 修订的存量出口）是**非破坏性**的（保批注、保正文译文），
+   所以给它绿色而不是 warn —— 四个并排的胶囊各自可辨：
+   编辑=accent / 重新提取=warn（保文献但不保批注）/ 重建参考文献=绿（都保）/ 删除=danger。 */
+.ptable .t-fix:hover { color: var(--st-read); border-color: var(--st-read); }
 .ptable .t-edit:disabled { opacity: .4; cursor: not-allowed; }
 /* 触屏没有 hover，永远看得见（否则该入口等于不存在） */
 @media (hover: none) { .ptable .t-edit { opacity: 1; } }

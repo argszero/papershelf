@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from typing import Any
 
 import typer
 
@@ -357,6 +358,84 @@ def backfill_meta(
         tail = f"，{failed} 篇抽取失败" if failed else ""
         typer.echo(f"\n✅ 完成：{changed} 篇更新{tail}，合计 {tokens} tokens"
                    f"（≈{tokens // max(changed + failed, 1)}/篇）")
+    finally:
+        conn.close()
+
+
+@app.command("rebuild-refs")
+def rebuild_refs(
+    paper: int = typer.Option(0, "--paper", help="只处理这一篇（文献 id，0 = 全部）"),
+    dry_run: bool = typer.Option(False, "--dry-run", help="只打印会合并出几条，不调模型、不落库"),
+    no_translate: bool = typer.Option(False, "--no-translate", help="只重排结构，不翻译新条目"),
+) -> None:
+    """**只修文末参考文献**（解析 v14 的存量出口）—— 正文块 id 不变，笔记/划痕无损。
+
+    为什么不是「重新提取」：那个出口会**清掉 `notes` / `highlights`**（块 id 与文本都会变），
+    对已经读过并做了批注的篇目不可接受；而重跑整篇还要重烧百万级 token。
+    本命令只做一件事：把文末的 `refs` 碎片合并成整条 `ref` 条目（只译标题），
+    并把钉在**被合并掉的那些碎片**上的批注按坐标搬到新条目上（见 `server/refsfix.py`）。
+
+    ⚠️ 必须先停掉正在跑的 `serve`（或至少确认它没在转换同一篇）：本命令直接改库，
+    而服务的常驻队列会在这之后用旧产物覆盖 —— 改完重启服务即可。
+    """
+    from .server.config import get_settings
+    from .server.db import connect, init_db
+    from .server.refsfix import rebuild_paper_refs
+
+    settings = get_settings(refresh=True)
+    init_db(settings)
+    conn = connect(settings)
+    try:
+        sql = "SELECT id, title FROM papers WHERE conv_state='done' ORDER BY id"
+        args: tuple[Any, ...] = ()
+        if paper:
+            sql = "SELECT id, title FROM papers WHERE id=?"
+            args = (paper,)
+        rows = [dict(r) for r in conn.execute(sql, args).fetchall()]
+        if not rows:
+            typer.echo("没有可处理的文献（conv_state=done）。")
+            raise typer.Exit(0)
+
+        def _log(*a: object) -> None:
+            typer.echo("    " + " ".join(str(x) for x in a))
+
+        if dry_run:
+            # dry-run 只跑**纯结构**那一段（不构造翻译器、不联网、不落库）：
+            # 它回答的是"这篇到底有没有可合并的碎片"，那也正是要不要花钱的问题。
+            from .pipeline.parse import rebuild_ref_entries
+            from .server.repo import load_doc
+
+            for p in rows:
+                doc = load_doc(conn, p["id"])
+                if doc is None:
+                    typer.echo(f"  · #{p['id']} 无产物 → 跳过")
+                    continue
+                blocks, moves = rebuild_ref_entries(doc.blocks, 0)
+                n_refs = sum(1 for b in doc.blocks if b.type == "refs")
+                n_new = sum(1 for b in blocks
+                            if b.type == "ref" and b.id not in {x.id for x in doc.blocks})
+                typer.echo(f"  · #{p['id']} {p['title'][:34]!r}：碎片 {n_refs} → 新条目 {n_new}"
+                           f"（批注搬家表 {len(moves)} 个碎片块）")
+            typer.echo("\n（--dry-run：未调用模型、未落库）")
+            raise typer.Exit(0)
+
+        tokens = changed = skipped = 0
+        for p in rows:
+            typer.echo(f"· #{p['id']} {p['title'][:34]!r}")
+            got = rebuild_paper_refs(conn, p["id"], translate=not no_translate, log=_log)
+            tokens += int(got.get("tokens") or 0)
+            if not got.get("ok"):
+                typer.echo(f"  ✗ {got.get('reason')}")
+                continue
+            if not got.get("changed"):
+                skipped += 1
+                typer.echo(f"  ✓ 无需处理（{got.get('reason')}）")
+                continue
+            changed += 1
+            typer.echo(f"  ✓ 条目 {got['entries']} 条；批注搬家 {got['anchors_moved']} 条"
+                       f"（落空 {got['anchors_dropped']}）")
+        typer.echo(f"\n✅ 完成：{changed} 篇重建、{skipped} 篇本来就好，合计 {tokens} tokens")
+        typer.echo("⚠️ 新条目若没译出标题会标「待校对」，可用阅读器的块级修订兜底（决策⑯）。")
     finally:
         conn.close()
 
