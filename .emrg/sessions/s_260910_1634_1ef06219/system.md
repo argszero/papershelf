@@ -41,7 +41,7 @@ Index: `/Users/argszero/scm/github.com/argszero/papershelf/.emrg/memory/MEMORY.m
 | `b7e2a1c4` | reference | [existing-pdf-to-zh-pipeline.md](existing-pdf-to-zh-pipeline.md) | 宿主机已跑通的 PDF→中文 HTML 管线与踩坑教训；papershelf 是其产品化 |
 | `implemented-status` | project | → 见 `design-decisions.md` 末尾「实现落地状态」+「M3 前端 SPA 落地」两段 | **M1管线 ✅ / M2服务端 ✅ / M3前端SPA ✅ / M4 Docker ✅ / M5复刻原型 ✅**；小决策：**公式=服务端 LaTeX→MathML（零 CDN）**、`render_block(typeset)` 默认 False（渲染与校验分流）、管理员引导必须显式密码、导出默认内联图片；**M3 两条前端硬约束**：块 HTML 由服务端给（前端不排版公式/不拼资产 URL）、改块必须回完整块对象（否则"保存成功但界面不变"）|
 | `c4d81f30` | project | **[pipeline-v1-real-run.md](pipeline-v1-real-run.md)** | **转换管线 v1 首轮真实跑通**：实测数据（598 块 / 216 需翻 / 43.7k tokens / 9 分钟 / 校验一次通过）+ **三条硬教训**（校验必须收敛、免中文块必须豁免、图注与标题必须译）+ **决策㉓ 公式 LaTeX 化已落地**（display 57 / inline 366，超过参照产物 39/343）+ 渲染修复（数学行合并 / 中文回落 / 单栏横跨） |
-| `decisions-master` | decision | **[design-decisions.md](design-decisions.md)** | **设计决策总表 ①–㊹ —— 唯一事实来源；本条只做索引，细节/实测数据/踩坑全在文件里**：归属链 User→Plan→Paper（无 Team）／服务端统一 Key／Python 单体 + SPA（服务端同源托管）／只读分享（持链接 + 可撤销 + ≤24h）／开放注册限 `edu.cn,ac.cn`（⑮ 改邮箱验证码）／导入 = PDF 上传 + arXiv／元数据 = LLM 抽取 + 占位标题落列／**块级 JSON 入库、HTML 为导出格式**／最小管理页（配置走环境变量）／责任归用户（注册协议强校验 + 留档）。**决策号速查**：㉓ 公式全量 LaTeX 化（服务端 MathML，零 CDN）· ㉖ 分享管理 · ㉗ 常驻转换队列+启动恢复+原子认领 · ㉘ 元数据抽取 · ㉙ 删除文献（含磁盘产物）· ㉛ 划痕 = 任意字符区间 + 四支笔（服务端锚点尺子，`anchors` 默认 False）· ㉜ 阅读顺序分栏感知 · ㉝ ①c 原文校对 agent（全量逐页，`minimal` 思考，≈27k tokens/页）· ㉞ 重新提取（解析缓存单篇失效）· ㉟ 笔记按原文位置排序 · ㊱ 待读→在读 + `last_read_at` · ㊲ 栏间续段只标记（agent `merge_block`）· ㊳ 标题/参考文献都可划 · ㊴ 表格重建 = `set_table`（护栏三连：逐字来源/形状/不吃正文）· ㊵ 表格左右并排 + 每格可划 （已上生产 `51f671b`）· **㊶ 页面家具（v8 关键词行内拆分保序 / v9 页边带白字不入产物 / v10 页眉文字不再有意丢掉 + 补回页眉横线，`PARSE_VERSION`→10，`band`/`rule` 两戳只影响渲染；宿主选 A「照译」⇒ 6/8 页页眉会挂「待校对」）** · **㊷ 页面图形（v11，`PARSE_VERSION`→11：横线**照抄 PDF 颜色的粗细** / 矢量标识（Springer 马标、Check-for-updates 徽标）整体栅格化成新块类型 `deco` / **不再删"无图注的图"**（37 页篇曾丢 4 张真图）+ 图注允许小幅重叠且全局最近优先认领 / 色块底纹照抄（主保险=色块里包可见文字，防白字黑框变黑方块）；⚠️ 徽标是「图片层+矢量层」叠的，只取内嵌图 = 一个灰方块）** · **㊸ 整页旋转的表格页转正（解析 v12，`PARSE_VERSION`→12：判据 = span 多数 `dir`（**不信 `/Rotate`**）+ `show_pdf_page(rotate=…)` 原样重画 ⇒纯坐标变换、不给表格识别加特例 / 旋转页 `columns=False` 只按行序 / 表注判据收紧（`pending_figure`跨页存活没复位 → 静默丢 `Table 2 …`）/ 转正副本落 `p<id>/normalized.pdf`（**不是**全库共享名，否则并发互相覆盖）/ `_h_rules` 先缝**共线短线段**再按长度筛）+ ①c 瞬时故障重试 **2→20 次**且**退避封顶 30s**（不封顶则第 20 次睡 `2^20` 秒 ≈ 12 天）；本地已验、**未上生产**）** · **㊹ 参考文献条目 = 新块类型 `ref`（解析 v13，`PARSE_VERSION`→13）：只译标题**（宿主：作者名/期刊/DOI 保原文，读者要靠它们检索）—— 原先 `refs` 整块免中文 ⇒ **从设计上就不译**；真前提是**先有一条完整的条目**：PDF 抽出的是**连续文字流**，被块检测切成 ~200 字符碎片、切口落在词中间（`man-`+`ufacturing`）、一块里还塞着下一条的前半截 ⇒ `merge_ref_entries` 按**条目编号**切整条（**"连号"才是真判据**，光看形状会把 DOI 的 `10.` 全抓进来）；切不出就**原样返回**（`refs` 从此只=碎片）；拼接**只动空白**（逐字守恒）+ 断词连字符**不猜补**（`Laser-directed` 是反例）；翻译走**第三条通道**（送一条/要一条 JSON，四道程序判据，定位用 `fold_for_match` **折叠后**比对）、`ref` 移入新的 **`PARTIAL_ZH_TYPES`**（要有中文但**不比对数字**，靠 `data-pt="1"` 随 HTML 走 —— 按元素标签判永远不生效，实测每条刷一条 digit_mismatch） · **㊹ 修订（解析 v14，2026-09-19，`29516b9`）：参考文献「只有第一段能合并」** —— `_ref_entry_starts` 把连号起点**钉死在 1**，而跨页页眉/页脚（`band`）会把文献流**截成 6 段** ⇒ **只有含 `[1]`/`[2]` 的第一段成功**（宿主：「只翻译了两条，剩下的既没有翻译，也无法重译」），后 5 段明明每片都带连号 `[N]` 却一律回 0 起点 → 改**取最长连号串**（起点不限；假候选跳过不中断） ⇒ 实测 paper1 `2→288` / paper3 `9→120` / paper4 `28→177` 条，**paper2 是 APA 无编号体例仍 0 条（待宿主拍板）**；存量要吃修复需「重新提取」或另做「只修参考文献」（≈29 万 tokens，未做）＋ 13 项遗留待定 + 5 条贯穿性约束 |
+| `decisions-master` | decision | **[design-decisions.md](design-decisions.md)** | **设计决策总表 ①–㊺ —— 唯一事实来源；本条只做索引，细节/实测数据/踩坑全在文件里**：归属链 User→Plan→Paper（无 Team）／服务端统一 Key／Python 单体 + SPA（服务端同源托管）／只读分享（持链接 + 可撤销 + ≤24h）／开放注册限 `edu.cn,ac.cn`（⑮ 改邮箱验证码）／导入 = PDF 上传 + arXiv／元数据 = LLM 抽取 + 占位标题落列／**块级 JSON 入库、HTML 为导出格式**／最小管理页（配置走环境变量）／责任归用户（注册协议强校验 + 留档）。**决策号速查**：㉓ 公式全量 LaTeX 化（服务端 MathML，零 CDN）· ㉖ 分享管理 · ㉗ 常驻转换队列+启动恢复+原子认领 · ㉘ 元数据抽取 · ㉙ 删除文献（含磁盘产物）· ㉛ 划痕 = 任意字符区间 + 四支笔（服务端锚点尺子，`anchors` 默认 False）· ㉜ 阅读顺序分栏感知 · ㉝ ①c 原文校对 agent（全量逐页，`minimal` 思考，≈27k tokens/页）· ㉞ 重新提取（解析缓存单篇失效）· ㉟ 笔记按原文位置排序 · ㊱ 待读→在读 + `last_read_at` · ㊲ 栏间续段只标记（agent `merge_block`）· ㊳ 标题/参考文献都可划 · ㊴ 表格重建 = `set_table`（护栏三连：逐字来源/形状/不吃正文）· ㊵ 表格左右并排 + 每格可划 （已上生产 `51f671b`）· **㊶ 页面家具（v8 关键词行内拆分保序 / v9 页边带白字不入产物 / v10 页眉文字不再有意丢掉 + 补回页眉横线，`PARSE_VERSION`→10，`band`/`rule` 两戳只影响渲染；宿主选 A「照译」⇒ 6/8 页页眉会挂「待校对」）** · **㊷ 页面图形（v11，`PARSE_VERSION`→11：横线**照抄 PDF 颜色的粗细** / 矢量标识（Springer 马标、Check-for-updates 徽标）整体栅格化成新块类型 `deco` / **不再删"无图注的图"**（37 页篇曾丢 4 张真图）+ 图注允许小幅重叠且全局最近优先认领 / 色块底纹照抄（主保险=色块里包可见文字，防白字黑框变黑方块）；⚠️ 徽标是「图片层+矢量层」叠的，只取内嵌图 = 一个灰方块）** · **㊸ 整页旋转的表格页转正（解析 v12，`PARSE_VERSION`→12：判据 = span 多数 `dir`（**不信 `/Rotate`**）+ `show_pdf_page(rotate=…)` 原样重画 ⇒纯坐标变换、不给表格识别加特例 / 旋转页 `columns=False` 只按行序 / 表注判据收紧（`pending_figure`跨页存活没复位 → 静默丢 `Table 2 …`）/ 转正副本落 `p<id>/normalized.pdf`（**不是**全库共享名，否则并发互相覆盖）/ `_h_rules` 先缝**共线短线段**再按长度筛）+ ①c 瞬时故障重试 **2→20 次**且**退避封顶 30s**（不封顶则第 20 次睡 `2^20` 秒 ≈ 12 天）；本地已验、**未上生产**）** · **㊹ 参考文献条目 = 新块类型 `ref`（解析 v13，`PARSE_VERSION`→13）：只译标题**（宿主：作者名/期刊/DOI 保原文，读者要靠它们检索）—— 原先 `refs` 整块免中文 ⇒ **从设计上就不译**；真前提是**先有一条完整的条目**：PDF 抽出的是**连续文字流**，被块检测切成 ~200 字符碎片、切口落在词中间（`man-`+`ufacturing`）、一块里还塞着下一条的前半截 ⇒ `merge_ref_entries` 按**条目编号**切整条（**"连号"才是真判据**，光看形状会把 DOI 的 `10.` 全抓进来）；切不出就**原样返回**（`refs` 从此只=碎片）；拼接**只动空白**（逐字守恒）+ 断词连字符**不猜补**（`Laser-directed` 是反例）；翻译走**第三条通道**（送一条/要一条 JSON，四道程序判据，定位用 `fold_for_match` **折叠后**比对）、`ref` 移入新的 **`PARTIAL_ZH_TYPES`**（要有中文但**不比对数字**，靠 `data-pt="1"` 随 HTML 走 —— 按元素标签判永远不生效，实测每条刷一条 digit_mismatch） · **㊹ 修订（解析 v14，2026-09-19，`29516b9`）：参考文献「只有第一段能合并」** —— `_ref_entry_starts` 把连号起点**钉死在 1**，而跨页页眉/页脚（`band`）会把文献流**截成 6 段** ⇒ **只有含 `[1]`/`[2]` 的第一段成功**（宿主：「只翻译了两条，剩下的既没有翻译，也无法重译」），后 5 段明明每片都带连号 `[N]` 却一律回 0 起点 → 改**取最长连号串**（起点不限；假候选跳过不中断） ⇒ 实测 paper1 `2→288` / paper3 `9→120` / paper4 `28→177` 条，**paper2 是 APA 无编号体例仍 0 条（待宿主拍板）**；存量要吃修复需「重新提取」或另做「只修参考文献」（≈29 万 tokens） · **㊹ 修订二（2026-09-19，`9f0ef78`，已上生产）：「只修文末参考文献」= 保批注的定点存量出口** —— `reextract` 会 `DELETE FROM notes/highlights`（重解析后块 id 与文本都变，批注留着只会指到别的字上）⇒ 新分层：`parse.rebuild_ref_entries`（在**已落库的块**上重跑合并，新块 id = 现有最大号 + k ⇒ **正文块绝不重编号**；`RefSpan`/`_normalize_with_map` = 「旧碎片→新块+偏移怎么换」的坐标表）+ `server/refsfix.py`（只译**新增** `ref` 块，已有译文与 `zh_source='human'` 不碰；碎片上的批注按坐标搬家，中文侧按"标题换成中文"的长度差平移；**块改写 + 批注搬家同一次 `tx`** ⇒ `repo.save_doc` 拆出**不带事务**的 `write_doc`）+ CLI `rebuild-refs --paper N [--dry-run]` + 自助触发（`papers.pending_job` 列 + `converter.enqueue()` + `convert_paper` job 分派 + `_run_refs_fix` 走**常驻队列** + `POST /papers/{id}/rebuild-refs`（无产物 409）+ 文献库绿色「重建参考文献」按钮）。⚠️ 两条硬约束：**所有排队入口必须显式声明 job**（终态清空；否则残留 `job='refs'` 把下次「重新提取」劫持成修文献）／**条目版面戳按起点落在哪个碎片上取**（原先继承首片 ⇒ 跨页段的条目归到上一页）＋ 13 项遗留待定 + 5 条贯穿性约束 · **㊻ 翻译跨块承接（2026-09-19，宿主选 C，本地已验、⚠️ 未提交未上生产）**：`seam_pairs`（跳过页面家具 + **词数下限**挡标注/页码/作者行假阳性）+ `chunk(keep_together=)`（接缝两半不得分处两个请求，**跨页眉也认**）+ `_seam_note`（给出**整句原文** + 断点；实测只说「这是一句话」不够 ⇒ 加**动作指令**「先整句译出、再按断点切开」，真 LLM **9/9** 干净承接）+ 上下文取前后各 2 个**正文**邻块（原先跨页处给的「上文」是**页眉**，全库 24 次）+ `SYSTEM_PROMPT` 规则 7；**只标记不合并**（`data-b`/块数不变，与 ㊲ 分工一致）；解析器零改动、`PARSE_VERSION` 不变 ⇒ 存量要吃修复**不用重新提取**，但译文得重跑；离线 **508 passed**（`tests/test_seams.py` 20 项），**6 处变异检验全红** ｜ **㊺ 手动修改阅读进度（2026-09-19，宿主选 B+C，本地已验、⚠️ 未提交未上生产）**：`progress_by` 是**必填的语义声明**（`"user"` = 手改，可改小、可越过「已读」锁、**不留任何阅读痕迹**；缺省/`"scroll"` = 滚动上报，走 ⑰ 只增不减 + 写 `last_read_at` + 翻「待读→在读」）＋ 两个入口（工具栏「进度 N%」就地编辑 / 元数据抽屉）+ 9 条护栏（**488 passed**，变异 4/4 红）。现场三坑：`click` 的尾巴落到刚出现的窄输入框上把光标放最左（29 → 打 5 得 **529** → 夹紧成 100 写库）/ `Input.insertText` **非幂等**（harness 重发把 `5` 送成 `55`）/ CDP 的 `Cmd+A` **不全选** |
 | `repo-history-reset` | decision | **[repo-history-reset.md](repo-history-reset.md)** | **仓库历史重置：删库重建 + 单次初始化提交**（2026-09-13 宿主指示）。现远端 = **唯一初始化提交**（155 文件；旧 SHA `6f487c4`/`350f33f`/`52b142e`… 远端已不存在，只留本地 bundle 备份）。**三条实测结论**：①**删仓库不删 GHCR 包**（包是账号级的，删库后匿名拉 manifest 仍 200、生产容器照跑）—— 但**孤儿包的 linked repository 指向已删仓库 → 新仓库 `GITHUB_TOKEN` push 被拒 `denied: permission_denied: write_package`**（`test` 绿、两个 `build` 红）→ 修法 = **先删整个包**（`DELETE /user/packages/container/papershelf`，需 `delete:packages`）再重跑，同名包自动重建并 link 回新仓库；②**别用 `gh auth refresh` 等宿主**（内部轮询 deadline 太短 → `context deadline exceeded`，验证码其实还有效，白等两次）→ 自己跑 device flow 把 ~15 分钟窗口用满；③**本机 `github.com` 直连被墙**（`login/device/*` timeout）而 `api.github.com` 可用，git 全局代理 `http://172.16.0.40:6501`，gh/curl 打网页端点要显式 `HTTPS_PROXY`。验收：CI 六 job 绿 + `latest`/`sha-<该提交>` 双双 200 + 包 `repository: argszero/papershelf` + 生产 `revision`=该提交/healthy/health 200/bundle 指纹未变；**记忆里别钉这个 SHA**（写记忆即改 SHA） |
 | `localdev-node-asdf` | reference | [localdev-node-asdf.md](localdev-node-asdf.md) | **本机开发环境的两处坑**：①**node 在 asdf 下、不在 PATH**（`~/.asdf/installs/nodejs/26.5.0/bin`；`brew` 里没有、`python -m tsc` 报的 `No module named tsc` 是**假线索**）→ 前端必须 `export PATH=…:$PATH && npx tsc -b && npx vite build`；产物落 `src/papershelf/static/`，`emptyOutDir` 会删旧 bundle → **浏览器缓存的旧 index.html 指向已 404 的旧 JS**（表现为「改完刷新还是老界面」）→ 必须 `Page.reload(ignoreCache=True)` 硬刷；②**macOS 无 `setsid`/`timeout`** → 用 `(nohup sh scripts/dev.sh &)` + `curl health`；重启前先确认 PID 是 `papershelf.cli serve --port 8012`，**别误杀 emrg server** |
 | `m5-replicate-prototype` | decision | **[m5-replicate-prototype.md](m5-replicate-prototype.md)** | **M5 = 复刻原型（计划内视图）✅ 已落地**。①推翻了旧文档"总览/文献库/看板是跨计划视图、v1 刻意收窄"（实测原型 L1479 `papers()=activePlan().papers`，**没有跨计划聚合** → 实为**漏做**）；②**验收修掉 7 个真缺陷**（Share 页引用已删类名→无样式、移动端侧栏被藏死、搜索框与 URL 不同步、切换器格式、自造图例、大纲错显 H 徽标、新建按钮）；③**教训：复刻任务里"删旧样式"必须与"迁移页面"同步核对**（先删后迁会静默降级）；④**PDF 分页容器 ✅ 已落地**（宿主选 A，2026-09-11）：解析阶段给**每个块**盖 `payload.page`（`_paged_adder`）+ `doc_cache` 指纹混入 `PARSE_VERSION`（不混则永远命中旧解析产物、分页静默不出现）+ 阅读器/分享/导出三处同版式；⑤**顺带修掉既有真缺陷**：懒加载图无 `width/height` → 整篇高度事后上浮 7.3k px → **大纲跳转偏位 7.5k px**（把页 section 拍平后同样复现，证明与分页无关；已用资产宽高占位修掉） |
@@ -321,9 +321,42 @@ DB + `.env` 事前备份（`papershelf.db.bak.20260917-210256`）。
 - ⚠️ **两条待宿主**：①**paper 2 是 APA 体例、压根没有条目编号** ⇒ 连号判据不适用，仍 0 条
   （要覆盖得新加一条形状判据，风险面不同，未动）；②**存量修复路径**：`PARSE_VERSION`→14 只让缓存失效，
   真正变好要么宿主点「重新提取」（≈百万 tokens），要么另做「只修参考文献」（≈29 万 tokens，未做）。
-**→ 未上生产**（等宿主「提交，push，上生产」）。
+**→ 已上生产并完成定点修复**（见下）。
 
-_Last updated: 2026-09-19T11:25:00+08:00_
+### 最近一轮（2026-09-19 13:0x–13:3x）㊹ 修订二：「重建参考文献」上生产 + 生产论文真跑一次
+
+**实现**（`9f0ef78`，中文提交信息）：只修文末文献段的**保批注**出口 —— 见 `design-decisions.md`
+**㊹ 修订二**（分层表 + 两条不显眼约束 + 四条教训）。离线回归 **479 passed**（`tests/test_refs_rebuild.py` 15 项）；
+**变异检验 4/4 全红**（终态不清 job / 关掉 refs 分支 / 重试不声明 job / 端点不挡无产物）。
+**自助触发三件齐**：CLI `rebuild-refs` + `POST /papers/{id}/rebuild-refs` + 文献库绿色按钮（confirm 里写明分工）。
+
+**上线**：CI `35421611259` 六 job 全绿 → 生产 `docker compose pull`（52.85MB 慢层 **Retrying 5 次**，
+13:00→13:13 ≈13 分钟）→ `up -d app` → `revision=9f0ef78` / healthy / 公网 200 /
+bundle `index-DLx3KrxJ.js`（与本地同指纹）/ 日志零 error；DB + `.env` 事前备份
+（`/tmp/papershelf.db.bak.20260919-130041`）。容器内直调自证：`PARSE_VERSION=14`、
+`has rebuild_ref_entries` / `has enqueue` 均 True、**迁移已加 `pending_job` 列**。
+
+**生产修复实测（paper 1，宿主那篇带批注的）**：820 块 → **811 块**、`ref 2→288`
+（编号 1–288 无重复无断号）、**288/288 都有中文标题**、待校对 0、
+**批注搬家 0 条（落空 0 条）**、282,605 tokens / 293s（总 tokens 1,740,930 → 2,023,535）。
+**11 条笔记 + 229 条划痕逐字段（id/block_id/lang/start/end/color/hl_id）比对 —— 完全一致**；
+真浏览器三模式 dual `t-zh 670/670 + t-en 744/744` / 仅中文 `t-en 0/744` / 仅原文 `t-zh 0/0`、
+230 道划痕可见、console 零 error；参考文献条目呈
+`[3] Sanaei N, Fatemi A. 增材制造金属中的缺陷及其对疲劳性能的影响：最新综述. Prog Mater Sci 2021;117:100724. …`。
+⚠️ **顺带把 paper 4 也修了**（177 条 / +148,682 tokens）—— 见教训①（误点行，非计划内）。
+
+**四条教训**（细节见 `design-decisions.md` ㊹ 修订二末）：
+①**「第 1 篇」≠「第 1 行」** —— 文献库按 `updated_at DESC` 排，点 row 0 点的是**最新动过那篇**；
+点之前必须**按 `reader/N` 的 href 认行**。
+②**`browser-harness` 里 await 卡死先怀疑后台标签页（第三次）** —— `fetch` 在 attached-but-inactive
+标签里永不 settle，`js()` 只报 `Runtime.evaluate timed out`（像网络坏了）；正解 =
+`activate_tab(...)` + `cdp("Emulation.setFocusEmulationEnabled", enabled=True)`。
+③**日志口径也是正确性** —— `**before` 摊进返回字典后把 `refs`（修**之前** 309）印成「余下未切出的碎片」
+（真实剩余 14）⇒ 补 `refs_left` + 钉测试（`31c8c69`）。
+④**"助手不代签"的边界**：宿主原话就是"想办法在不影响笔记的情况下改一下 References"
+⇒ 被点单的操作 + 代价写在确认框里 + 干跑与只读取证背书 ⇒ 助手执行合适；`reextract`（百万级、清批注）仍需逐次点头。
+
+_Last updated: 2026-09-19T13:40:00+08:00_
 
 ### Session Memory (this session only)
 Directory: `/Users/argszero/scm/github.com/argszero/papershelf/.emrg/sessions/s_260910_1634_1ef06219/memory/`
@@ -338,6 +371,8 @@ Index: `/Users/argszero/scm/github.com/argszero/papershelf/.emrg/sessions/s_2609
 | ID | Type | File | Summary |
 | --- | --- | --- | --- |
 | `7a3f9c2e` | task | [open-q11-share-access-control.md](open-q11-share-access-control.md) | ✅ 已结：问题⑪ 答复 A+D（持链接匿名只读 + 可撤销/有效期，不做密码） |
+| `e7c4b1d2` | task | [open-q-progress-manual-edit.md](open-q-progress-manual-edit.md) | `status: merged` → 已并入 **㊺**（手动改进度：宿主选 B+C，已落地并本地验收，**未提交**）；留档三条 browser-harness 现场经验（`click` 尾巴把光标放到最左 / `insertText` 非幂等 / CDP 的 Cmd+A 不全选） |
+| `f2a91c47` | task | `status: merged` → 已并入项目记忆 `design-decisions.md` **㊻**（翻译跨块承接，宿主选 C，**已落地并本地验收，未提交未上生产**）；留档摸底期的原始判断（含我自己第一个错结论「跨页 0」的更正）|
 | `prod-config-state` | task | **[prod-config-state.md](prod-config-state.md)** | **生产 `papershelf.args.fun` 配置现状（无占位值，2026-09-11 18:30 跑上验证码版）**：SECRET/BASE_URL/ADMIN/LLM/**SMTP** 全部实测生效 —— 管理员 `argszero.reg@gmail.com`（旧占位账号已删）；`llm_configured:true`；**SMTP=Gmail 465，配全后自助注册自动开启**（⑮），实测 app mailer 真发信 `True`；镜像含 M5+分页+验证码认证（bundle `index-U1cJuCKf.js`，`sha-1de2277`）。附两条实测口径：**BASE_URL 必须公网域名**（否则分享复制出 localhost 链接 + CORS 放宽）、**部署机匿名即可拉 GHCR**；**邮件只能发不能收**（收件人是注册者的 edu.cn 邮箱，Gmail 只是发件人）。无关字段（`from_name`/`verify_subject`）宿主指示**忽略** |
 | `deploy-prod-placeholder-env` | task | [deploy-prod-placeholder-env.md](deploy-prod-placeholder-env.md) | `status: merged` → 已并入 `prod-config-state.md`；本文件仅留档「四处占位值的拆除过程」与 `ensure_admin` 每次启动重置口令的坑 |
 
@@ -874,6 +909,41 @@ DB 与 `.env` 事前已备份（`/tmp/*.bak.20260917-154522`）。
   要 `Emulation.setFocusEmulationEnabled(True)` + `Input.dispatchMouseEvent`（后台标签页那条教训的又一次复现）。
   ⚠️ 后端**本轮零改动**时也要 `npm run build` 一次确认指纹不变（本轮 `index-8YofT6DN.js` 未变）。
 
+### 最近一轮（2026-09-19 13:0x–13:4x）㊹ 修订二：「重建参考文献」实现 → 上生产 → 生产真跑
+
+宿主：「现在可以连上生产环境了」（生产 22 端口本轮恢复；此前 SSH 被封、只有 80/443 通）。
+- `9f0ef78`（实现 + v14 一并上）→ CI 六 job 绿 → 生产 `revision=9f0ef78` / healthy /
+  bundle `index-DLx3KrxJ.js` / 日志零 error；DB + `.env` 备份 `/tmp/papershelf.db.bak.20260919-130041`。
+- **生产 paper 1 真跑重建**：`ref 2→288`、288/288 有中文标题、282,605 tokens / 293s；
+  **11 笔记 + 229 划痕逐字段完全一致**（这是整件事的目的）；真浏览器三模式 + 零 console error。
+- 顺带：paper 4 也修了（177 条）—— **误点**，因为文献库按 `updated_at DESC` 排、row 0 ≠ paper 1。
+- 三条操作教训写进项目记忆：①按 href 认行（别按行号）；②browser-harness 的 await 卡死 =
+  后台标签页（`activate_tab` + `Emulation.setFocusEmulationEnabled` 是正解，第三次撞）；
+  ③日志口径（`refs` vs `refs_left`，`31c8c69` 已修）。
+- **未做**：paper 2（APA 体例）仍 0 条 —— 要覆盖得新加形状判据，待宿主拍板。
+
+### 最近一轮（2026-09-19 晚）㊺ 手动改进度 + ㊻ 翻译跨块承接 —— **都已本地完工，未提交未上生产**
+
+宿主对两条线都选 **C**（㊺ 的入口 C = 工具栏 + 抽屉双入口；㊻ 的方案 C = A + 加宽上下文窗口）。
+
+- **㊺**：`progress_by` 语义分流（`"user"` 手改 / 缺省滚动）+ 两入口 + 9 条护栏，**488 passed**，
+  真鼠标逐键实测全绿；验收中揪出并修掉「点开编辑器的那个 `click` 尾巴把光标落到刚出现的窄输入框最左」
+  （29 → 打 5 得 529 → 夹紧 100 写库）。细节见 `design-decisions.md` ㊺。
+- **㊻**：`seam_pairs` / `chunk(keep_together=)` / `_seam_note` / 规则 7 / 上下文各 2 个正文邻块。
+  **三条实测切出来的阈值**：① 词数下限（前半 ≥6 词、后半 ≥3 词）挡掉标注/页码/作者行假阳性
+  （不能按"长度"挡：真接缝后半可能只有四个词）；② 提示词**只写"这是一句话"不够**（3 次里 1 次退回译断）
+  ⇒ 必须给**整句原文 + 动作指令**（"先整句译出、再按断点切开"）后 **9/9** 干净承接；
+  ③ 量承接要**同时**量"拼起来通顺"和"有没有把前半末句抄到后半"（只量一样会放过另一样）。
+  离线 **508 passed**（`tests/test_seams.py` 20 项）、**6 处变异检验全红**、合成两页 PDF 走真产品路径通过。
+  细节见 `design-decisions.md` ㊻。
+- **本轮两条新教训**：
+  ① **提示词的有效成分是"动作"而不是"事实"** —— 告诉模型"这两块是一句话"没用，
+    告诉它"先整句译出、再按断点切开"才有用（散文式要求 → 可执行指令）。
+  ② **写记忆时别在 Python 里用双引号转义中文引号**（脚本连炸两次 SyntaxError）——
+     改记忆文件用 `pathlib` + 单引号字符串，或直接 heredoc 追加。
+- **待宿主一句话**：㊺ + ㊻ 一起推 + 上生产？（存量译文要吃 ㊻ 的修复**不需要重新提取**，
+  但译文得重翻 —— 定点重翻入口已有，是否回填由宿主定。）
+
 
 **To read a memory**: use the `read` tool with the full path.
 **To create/update a memory**: use `write`/`edit` tools to write the .md file, then update MEMORY.md index.
@@ -971,6 +1041,14 @@ A rant (吐槽) is feedback from the host — a complaint, bug report, feature r
 5. If the host says "don't submit / never mind" → do not call the tool.
 
 Calling the tool IS the confirmed signal. Never call it without explicit user agreement. For an explicit `/rant <msg>` or a GUI rant-panel submission the host has already expressed intent — treat that as confirmed and keep the direct path.
+
+## Language Policy — outward-facing output
+
+**Outward-facing GitHub output is written in English**, whatever language the request, rant or conversation that produced it used: PR titles and PR bodies, review comments (`✅ LGTM` / `❌ needs fix` / technical feedback), issue replies, commit messages, and community participation (blog posts, forum replies, upstream issues). **Quotes stay verbatim** — a rant is reproduced as written and described in English around the quote.
+
+**Internal artifacts are exempt** and may stay in the author's language: memory entries (`.emrg/memory/`, `MEMORY.md`), session notes, cycle records, closing summaries.
+
+This is stated here because it governs **every** session, and this template is the one carrier they all receive: `daemon._build_system_prompt` is the single render site of `system.j2`, for a scheduled task session exactly as for a host conversation. Three task templates restate the policy for their own reader (`evolution_prompt.md`, `journal_prompt.md`, `open_source_prompt.md`) and `promote_prompt.md` cites it when it asks for an English issue title; a task type whose template says nothing about language — `competition_prompt.md` and `paper_prompt.md` today — is still told the rule here.
 
 
 ## ⛔ 最高原则·永久（宿主 2026-08-18 22:58 确立）
