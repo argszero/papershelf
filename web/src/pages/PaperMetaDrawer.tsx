@@ -24,6 +24,8 @@ export function PaperMetaDrawer({ paper, onClose, onSaved }: {
   const [venue, setVenue] = useState(paper.venue || '')
   const [year, setYear] = useState(paper.year ? String(paper.year) : '')
   const [tags, setTags] = useState((paper.tags || []).join(', '))
+  // ㊺ 手动改进度（宿主 2026-09-19 选 C：工具栏就地编辑 + 这里，两个入口同一接口）
+  const [progress, setProgress] = useState(String(paper.progress ?? 0))
   const [busy, setBusy] = useState(false)
   const [err, setErr] = useState('')
 
@@ -41,12 +43,19 @@ export function PaperMetaDrawer({ paper, onClose, onSaved }: {
       // ⚠️ `year` 空串必须发 null 而不是 0：后端 `year: int | None`，
       //    传 0 会被当成"公元 0 年"存进去，之后排序与显示全乱。
       const y = year.trim()
+      const p = progress.trim()
+      // 进度**只在真被改过时才发**：否则"改个标签"会顺带写一次进度，
+      // 而进度是非幂等的（`progress_by:"user"` 无条件生效、可改小、可越过「已读」锁）——
+      // 白白多写一次同一个值是小事，把它塞进每一次元数据保存是隐患。
+      const nextProgress = p === '' ? Number(paper.progress ?? 0) : Math.max(0, Math.min(100, Number(p)))
       await api.updatePaper(paper.id, {
         title: title.trim(),
         authors: authors.trim(),
         venue: venue.trim(),
         year: y ? Number(y) : null,
         tags: tags.split(/[,，、]/).map((t) => t.trim()).filter(Boolean),
+        ...(nextProgress !== (paper.progress ?? 0)
+          ? { progress: nextProgress, progress_by: 'user' as const } : {}),
       })
       onSaved()
       onClose()
@@ -99,6 +108,18 @@ export function PaperMetaDrawer({ paper, onClose, onSaved }: {
                    onChange={(e) => setTags(e.target.value)}
                    placeholder="如 增材制造, 缺陷检测" />
           </div>
+
+          <div className="field" style={{ maxWidth: '100%' }}>
+            <label>阅读进度（%）</label>
+            <input className="input" value={progress} inputMode="numeric"
+                   onChange={(e) => setProgress(e.target.value.replace(/[^0-9]/g, '').slice(0, 3))}
+                   placeholder="0-100" />
+          </div>
+
+          <p className="meta">
+            进度也可以直接点阅读器工具栏那行「进度 N%」改。改小之后**继续滚动仍会按
+            "只增不减"累计**（方案 B）—— 想让它停住，往下读之前先别滚。
+          </p>
 
           <p className="meta">
             这些字段由转换管线自动抽取（⑲）；这里填的值优先级更高 ——

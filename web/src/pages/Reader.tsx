@@ -294,6 +294,8 @@ export function ReaderPage() {
   const [fs, setFs] = useState<number>(() => readPref<number>('fs', 14.5))
   const [showTools, setShowTools] = useState(true)
   const [refreshing, setRefreshing] = useState(false)
+  const [progEdit, setProgEdit] = useState<string | null>(null)   // ㊺ 工具栏「进度 N%」就地编辑的草稿
+  const progDone = useRef(false)              // ㊺ 这一次输入是否已提交/取消（挡迟到的那次 blur）
   const [toast, setToast] = useState('')
 
   const scrollRef = useRef<HTMLDivElement>(null)
@@ -451,6 +453,41 @@ export function ReaderPage() {
       await reload()
       flash('已标记为「已整理」，进度锁定 100%')
     } catch (e) { flash(e instanceof Error ? e.message : '标记失败') }
+  }
+
+  /** ㊺ 手改进度（工具栏就地编辑 / 元数据抽屉，两个入口同一个函数）。
+   *
+   * `progress_by: 'user'` 是**这个功能的全部**（见 `api.updatePaper` 的注释）：
+   * 后端按它把"我说它是多少"与"滚到过哪里"分开 —— 前者可改小、可越过「已读」锁，
+   * 且**不写 `last_read_at`、不翻「待读→在读」**（填一个数字不等于此刻在读）。
+   *
+   * 存完必须 `reload()`：`paper` 是 `reload` 拉回来的，不回拉的话
+   * 屏幕上是本地草稿、库里是另一个值（同型坑：改块要回**完整块对象**，否则"保存成功但界面不变"）。
+   */
+  async function saveProgress(next: number | null) {
+    setProgEdit(null)
+    if (next === null) return                       // 空草稿 = 没输入东西，不写库
+    const cur = paper?.progress ?? 0
+    if (next === cur) return
+    try {
+      await api.updatePaper(pid, { progress: next, progress_by: 'user' })
+      await reload()
+      flash(`进度已改为 ${next}%`)
+    } catch (e) { flash(e instanceof Error ? e.message : '进度保存失败') }
+  }
+
+  /** 打开就地编辑器（草稿 = 当前值）。两条路径共用：鼠标 `mousedown`、键盘 `click`。 */
+  function openProgEdit() {
+    progDone.current = false
+    setProgEdit(String(paper?.progress ?? 0))
+  }
+
+  /** 草稿 → 0-100 的整数；空串/非数字返回 null（= 什么都不做）。
+   *  越界**夹紧**而不是报错：手打 150 的人想要的大概率是 100。 */
+  function parseProgress(draft: string): number | null {
+    const t = draft.trim()
+    if (!t || !/^\d+$/.test(t)) return null
+    return Math.max(0, Math.min(100, Number(t)))
   }
 
   async function refreshDoc() {
@@ -754,7 +791,46 @@ export function ReaderPage() {
           )}
           <button className="icon-btn" title="刷新本文档" aria-label="刷新"
                   disabled={refreshing} onClick={() => void refreshDoc()}>⟳</button>
-          <span className="meta" id="progLbl">进度 {paper?.progress ?? 0}%</span>
+          {/* ㊺ 手改进度（宿主 2026-09-19：「还需要支持手动修改进度」，入口选 **C** = 这里
+              与「编辑文献信息」抽屉两处都有）。原型里这行是只读文本 `#progLbl`；
+              只读分享态（`readonly`）**保持只读** —— 分享页本来就没有写入权。 */}
+          {readonly ? (
+            <span className="meta" id="progLbl">进度 {paper?.progress ?? 0}%</span>
+          ) : progEdit !== null ? (
+            <span className="meta prog-edit" id="progLbl">
+              进度
+              <input className="input prog-input" value={progEdit} autoFocus inputMode="numeric"
+                     aria-label="阅读进度百分比" placeholder="0-100"
+                     // 一获得焦点就**全选**：否则"点开 → 直接打字"会变成往旧值里插字
+                     // （实测：29 → 打 5 → `529` → 夹紧成 100 写进库，看着像对、其实是错的）。
+                     onFocus={(e) => e.currentTarget.select()}
+                     onChange={(e) => setProgEdit(e.target.value.replace(/[^0-9]/g, '').slice(0, 3))}
+                     onKeyDown={(e) => {
+                       if (e.key === 'Enter') { progDone.current = true; void saveProgress(parseProgress(progEdit)) }
+                       else if (e.key === 'Escape') { progDone.current = true; setProgEdit(null) }
+                     }}
+                     // 失焦 = 提交（不是取消）：**取消会静默吞掉刚打的字**，
+                     // 那正是本项目反复踩过的"看着改了、其实没改"。Esc 才是取消。
+                     // `progDone` 挡住 Enter/Esc 之后那次迟到 blur，免得同一次输入写两遍。
+                     onBlur={() => {
+                       if (progDone.current) return
+                       progDone.current = true
+                       void saveProgress(parseProgress(progEdit))
+                     }} />
+              %
+            </span>
+          ) : (
+            // ⚠️ 开编辑器挂在 **mousedown**（不是 click）：`click` 在 mouseup 之后才派发，
+            //    那时输入框已经渲染出来，鼠标松开的那一下会落在这个窄输入框上并**把光标放到最左**
+            //    （右对齐 ⇒ 框中心在文字左边）—— 于是"点开就打字"从第 0 位插入（实测 29 → 5 得到 529）。
+            //    mousedown 早于焦点/光标逻辑，输入框还没出现，尾巴落不到它身上。
+            //    `onClick` 保留给**键盘**（Tab 聚焦后回车）；鼠标路径上按钮已先卸载，不会重复触发。
+            <button className="meta prog-edit" id="progLbl" title="点击修改进度"
+                    onMouseDown={(e) => { e.preventDefault(); openProgEdit() }}
+                    onClick={openProgEdit}>
+              进度 {paper?.progress ?? 0}%
+            </button>
+          )}
           {!readonly && (
             <button className="btn btn-secondary btn-sm"
                     disabled={paper?.status === 'reviewed' || paper?.status === 'read'}

@@ -43,6 +43,13 @@ class PaperPatch(BaseModel):
     tags: list[str] | None = None
     status_: str | None = None       # unread|reading|read|reviewed（⑰）
     progress: int | None = None      # 0-100（⑰）
+    # **谁在报这个数字**（2026-09-19，宿主：「还需要支持手动修改进度」）：
+    #   · 缺省 `"scroll"` = **阅读器滚动上报**（唯一的自动来源）—— 走 ⑰ 的"只增不减"兜底；
+    #   · `"user"` = **用户手改**（阅读器那行「进度 N%」点开就地改）—— **无条件生效，含改小**。
+    # 为什么必须由调用方显式声明，而不是猜：两者是**同一个字段的两种含义**，靠值本身分不清
+    #   （手改 80→30 与"用户从底部滚回顶部"发的是同一个 `{"progress": 30}`）。猜错的后果是
+    #   把 ⑰ 那条护栏拆掉 —— 而它挡的是"进度条自己往回退"这个看起来像坏了的现象。
+    progress_by: str | None = None   # scroll | user
 
 
 def _pdf_fingerprint(path: Path) -> str:
@@ -197,10 +204,14 @@ def patch_paper(paper_id: int, body: PaperPatch, conn: sqlite3.Connection = Depe
     if body.progress is not None:
         if not 0 <= body.progress <= 100:
             raise HTTPException(status.HTTP_400_BAD_REQUEST, "进度须在 0-100")
+        if body.progress_by not in (None, "scroll", "user"):
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, "progress_by 取值不合法")
+        # 谁在报数（见 `PaperPatch.progress_by`）：`user` = 手改，无条件生效；否则是滚动上报。
+        by_user = body.progress_by == "user"
         row = conn.execute("SELECT status, progress, progress_mode FROM papers WHERE id=?",
                            (paper_id,)).fetchone()
         # ⑰：手动锁定后，滚动上报不得把它降下来（手动优先）
-        if body.status_ is None and row and row["progress_mode"] == "manual":
+        if not by_user and body.status_ is None and row and row["progress_mode"] == "manual":
             raise HTTPException(status.HTTP_409_CONFLICT, "已标记已读，进度已锁定")
         # ⑰ 补充（2026-09-15，宿主：「我有篇文章读了 13%，为什么『在读』还是 0 篇」）：
         # 这条路径 = **阅读器滚动上报**，也就是"此刻正在读"。所以：
@@ -210,7 +221,10 @@ def patch_paper(paper_id: int, body: PaperPatch, conn: sqlite3.Connection = Depe
         #     而"读懂没有"仍然只有人知道，所以「已读/已整理」**不自动**，仍旧只能手动拖。
         #  ③ `status_at` **只在翻转的那一刻**盖一次，不能每次滚动都盖：
         #     否则它退化成"最近滚动时间"，看板列内排序与总览那条"停摆"提醒全会失真。
-        if body.status_ is None and row is not None:
+        # ⚠️ **手改不是"在读"的证据**：上面三条一条都不适用于 `progress_by="user"`
+        #    （填一个数字不等于此刻在读、更不等于"动手改的这一下发生在阅读中"），
+        #    否则「最近阅读」会变成一个"最近改过进度"的时间戳，它存在的意义就没了。
+        if not by_user and body.status_ is None and row is not None:
             sets.append("last_read_at=?")
             args.append(utcnow())
             if row["status"] == "unread" and row["progress_mode"] == "auto":
@@ -222,7 +236,14 @@ def patch_paper(paper_id: int, body: PaperPatch, conn: sqlite3.Connection = Depe
         #    回退没有任何含义；要往回改就手动把状态设为「在读」。
         #    ⚠️ 只跳过 `progress` 的写入 —— 上面的 `last_read_at` 与状态翻转照常生效
         #    （往下读还是翻回来，都是在读这篇）。
-        if body.status_ is None and row and row["progress_mode"] == "auto" \
+        # ⚠️ 这条跳过**只针对滚动上报**：手改（`by_user`）是宿主 2026-09-19 点单的那件事
+        #    本身（"手动修改进度"），跳过就等于功能没做。宿主当日选 **B**：手改**不锁**
+        #    （`progress_mode` 仍是 `auto`）—— 它只是"把这个数字修正一下"，滚动继续按
+        #    "只增不减"累计；代价是改小之后继续往下滚会被再抬上去，宿主已知情并接受。
+        if by_user:
+            sets.append("progress=?")
+            args.append(body.progress)
+        elif body.status_ is None and row and row["progress_mode"] == "auto" \
                 and body.progress <= int(row["progress"] or 0):
             pass
         else:

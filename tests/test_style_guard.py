@@ -492,3 +492,68 @@ def test_table_renders_from_the_server_and_pairs_one_grid_per_language() -> None
         "表格样式没有对准服务端吐的 `table.datatable` —— 表格会变成浏览器默认样式")
     assert ".booktbl" not in naked and ".b-any" not in naked, (
         "旧的「一格两行」样式（`.booktbl` / `.b-any`）复活了 —— 那是被宿主否掉的版式")
+
+
+# ── ㊺ 手动修改进度：三个入口/护栏不变量（2026-09-19）────────────────────
+def test_scroll_reporting_never_claims_to_be_a_user_edit():
+    """**滚动上报不许带 `progress_by`** —— 这是 ⑰「只增不减」还活着的唯一理由。
+
+    后端用 `progress_by` 区分"滚到过哪里"（只增不减、写 `last_read_at`、可翻「待读→在读」）
+    与"我说它是多少"（手改，无条件生效、**不**写阅读痕迹）。两者发的是同一个 `progress` 值，
+    所以护栏全在**调用方声明**上：滚动那条路径一旦顺手带上 `progress_by:"user"`，
+    ⑰ 就静默失效 —— 从文末滚回顶部会把进度从 100% 拽回 3%，而且看起来像"进度条坏了"。
+    """
+    tsx = (WEB / "pages" / "Reader.tsx").read_text(encoding="utf-8")
+    scroll = tsx[tsx.index("const onScroll = useCallback"):]
+    scroll = scroll[: scroll.index("}, [pid, reload, readonly])")]
+    assert "progress_by" not in scroll, (
+        "滚动上报带上了 progress_by —— ⑰ 的「只增不减」会静默失效（回退成了正常写入）")
+    assert "api.updatePaper(pid, { progress: pct } as never)" in scroll, \
+        "滚动上报的调用形状变了：确认它仍然是不声明来源的那一支"
+
+
+def test_manual_edit_declares_itself_and_is_reachable_in_both_entries():
+    """手改必须显式声明 `progress_by:"user"`，且**两个入口都接同一个函数**（宿主选 C）。
+
+    宿主 2026-09-19：「还需要支持手动修改进度」，入口选 C = 阅读器工具栏就地编辑
+    + 「编辑文献信息」抽屉。两个入口如果各写一份 PATCH，行为会分叉
+    （一个能改小、另一个被 409 挡住之类），所以钉住"同一处声明 + 两处调用"。
+    """
+    reader = (WEB / "pages" / "Reader.tsx").read_text(encoding="utf-8")
+    assert "progress_by: 'user'" in reader, "手改没有声明 progress_by —— 后端会当成滚动上报"
+    assert "function saveProgress(" in reader and "function openProgEdit(" in reader, \
+        "手改的两个函数（保存/打开编辑器）不见了"
+
+    drawer = (WEB / "pages" / "PaperMetaDrawer.tsx").read_text(encoding="utf-8")
+    assert "progress_by: 'user' as const" in drawer, "抽屉入口没声明 progress_by"
+    assert "nextProgress !== (paper.progress ?? 0)" in drawer, (
+        "抽屉无差别地发 progress 了 —— 改个标签也会写一次进度（而那是一次可改小的手改）")
+
+
+def test_readonly_share_page_shows_progress_as_plain_text():
+    """只读分享态只显示文本，**不出现输入框**（⑩：分享页没有写入权）。
+
+    ⚠️ 这条不是"多写一个分支"：`progEdit` 是本地 state，只读态下点开编辑器照样能打字，
+    只是保存会被后端 403 —— 于是分享页上会出现"改了但没生效"的假象。
+    """
+    tsx = (WEB / "pages" / "Reader.tsx").read_text(encoding="utf-8")
+    start = tsx.index('id="progLbl"')
+    block = tsx[start - 200: start + 1600]
+    assert "readonly ? (" in block, "进度那一段没有先判 readonly"
+    head = block[: block.index(") : progEdit !== null ? (")]
+    assert "prog-input" not in head, "只读分支里出现了输入框 —— 分享页会看到一个改不动的编辑器"
+    assert "进度 {paper?.progress ?? 0}%" in head, "只读分支不是那行纯文本"
+
+
+def test_progress_editor_css_is_a_plain_class():
+    """`.prog-edit` 必须只用类选择器：写成 `button.prog-edit` 会 (0,1,1) 盖住 `.meta` (0,1,0)。
+
+    与文件开头那条按钮事故同型 —— 这里是"按钮看起来仍是那行灰字"的唯一保障，
+    被盖住的表现是**那个按钮突然有了边框和底色**（工具栏里多出一个突兀的小方块）。
+    """
+    css = CSS.read_text(encoding="utf-8")
+    offenders = [s for s in _rule_selectors(css) if re.fullmatch(r"(button|a|input)\s*\.prog-edit", s)]
+    assert not offenders, f".prog-edit 被元素限定了：{offenders}"
+    naked = re.sub(r"/\*.*?\*/", "", css, flags=re.S)
+    assert ".prog-edit" in naked and "appearance: none" in naked, \
+        "`.prog-edit` 的「拆掉按钮默认外观」那段不见了（会显示成带边框的小方块）"

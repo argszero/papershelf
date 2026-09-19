@@ -428,6 +428,22 @@ select.input { width: auto; }
 }
 .icon-btn:hover:not(:disabled) { color: var(--fg); border-color: color-mix(in oklch, var(--fg) 30%, var(--border)); }
 .icon-btn svg { width: 16px; height: 16px; }
+/* ㊺ 工具栏「进度 N%」：本来是一行只读文本（`.meta`），宿主 2026-09-19 要求可就地手改
+   → 包成一个按钮（`button` 默认有边框/底色，这里全部拆掉，**看起来仍是那行字**）。
+   注意 `.prog-edit` 是 `button` 元素，绝不能写成 `button.prog-edit`：那样特异性 (0,1,1)
+   会盖不住 `.meta` 的 (0,1,0) —— 本仓库按钮变体踩过同型事故（见 tests/test_style_guard.py）。 */
+.prog-edit {
+  appearance: none; background: transparent; border: 0; padding: 0; font: inherit;
+  color: var(--muted); font-family: var(--font-mono); font-size: 12px;
+  cursor: pointer; display: inline-flex; align-items: center; gap: 4px; white-space: nowrap;
+}
+.prog-edit:hover { color: var(--fg); text-decoration: underline dotted; }
+/* 就地编辑时的输入框：**窄**，别把工具栏挤变形（工具栏自身 `overflow-x: auto`，
+   挤出去只能横向滚动，等于看不见）。 */
+.prog-input {
+  width: 52px; padding: 2px 6px; font-size: 12px; font-family: var(--font-mono);
+  text-align: right;
+}
 .reader-body { flex: 1; min-height: 0; display: grid; grid-template-columns: minmax(0, 1fr) 300px; }
 .reader-body.no-rail { grid-template-columns: minmax(0, 1fr); }
 

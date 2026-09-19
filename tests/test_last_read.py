@@ -165,6 +165,72 @@ def test_only_scrolling_writes_last_read_at(client, settings, make_user):
     assert _row(settings, pid)["last_read_at"] == stamp, "只有滚动上报能刷新「最近阅读」"
 
 
+# ── 手动修改进度（㊺，2026-09-19，宿主选 B）──────────────────────────────
+#
+# 宿主：「还需要支持手动修改进度」。后端一直支持写 `progress`，缺的是**语义**：
+# 同一个字段有**两种含义** —— "滚到过哪里"（自动累计）与"我说它是多少"（手改），
+# 而它们发的 JSON 长得一模一样（`{"progress": 30}`），**靠值分不清**。
+# 于是新增 `progress_by`：`"user"` = 手改，缺省 = 滚动上报。猜错的后果不是报错，
+# 而是**把 ⑰ 那条"只增不减"的护栏拆掉**（它挡的是"进度条自己往回退"）。宿主选 **B**：
+# 手改**不锁**（`progress_mode` 仍是 `auto`），它只是把数字修正一下。
+def _user_edit(client, pid: int, value: int):
+    return client.patch(f"/api/papers/{pid}", json={"progress": value, "progress_by": "user"})
+
+
+def test_user_edit_can_go_backwards(client, settings, make_user):
+    """手改能往下改 —— 这就是这个功能的全部意义（滚动上报仍然不许回退）。"""
+    pid = _start(settings, make_user, client)
+    client.patch(f"/api/papers/{pid}", json={"progress": 80})
+    assert _user_edit(client, pid, 30).json()["progress"] == 30
+    assert client.patch(f"/api/papers/{pid}", json={"progress": 5}).json()["progress"] == 30, \
+        "同一条护栏要按「谁在报数」分流：滚动照旧只增不减"
+
+
+def test_user_edit_is_not_evidence_of_reading(client, settings, make_user):
+    """填一个数字 **不等于** 正在读：不翻状态、不盖 `status_at`、不写 `last_read_at`。
+
+    否则「最近阅读」会退化成"最近改过进度的时间戳"，它存在的意义就没了。
+    """
+    pid = _start(settings, make_user, client)
+    _set(settings, pid, status_at=OLD)
+    r = _user_edit(client, pid, 50).json()
+    assert r["progress"] == 50
+    assert r["status"] == "unread", "手改不是「在读」的证据"
+    assert r["status_at"] == OLD, "更不该盖「进入该状态的时刻」"
+    assert r["last_read_at"] is None, "「最近阅读」只有滚动上报能写"
+
+
+def test_user_edit_keeps_auto_so_scroll_still_accumulates(client, settings, make_user):
+    """方案 **B** 的代价，明确写进测试：改小之后继续往下滚会被抬回去（宿主已知情）。"""
+    pid = _start(settings, make_user, client)
+    assert _user_edit(client, pid, 20).json()["progress_mode"] == "auto", "B = 手改不锁"
+    assert client.patch(f"/api/papers/{pid}", json={"progress": 60}).json()["progress"] == 60
+    assert _user_edit(client, pid, 10).json()["progress"] == 10
+    assert client.patch(f"/api/papers/{pid}", json={"progress": 60}).json()["progress"] == 60, \
+        "代价：一滚动就被拉回原值（选 B 时就接受了）"
+
+
+def test_user_edit_is_allowed_after_manual_lock(client, settings, make_user):
+    """已标「已读」时，**手改**不被 409 挡（手改是人的明确指令），但滚动上报照旧被挡。"""
+    pid = _start(settings, make_user, client)
+    client.patch(f"/api/papers/{pid}", json={"status_": "read"})
+    r = _user_edit(client, pid, 30)
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["progress"] == 30
+    assert body["progress_mode"] == "manual", "手改不解除「手动优先」，只是它自己也算手动"
+    assert client.patch(f"/api/papers/{pid}", json={"progress": 50}).status_code == 409
+
+
+def test_progress_by_rejects_unknown_values(client, settings, make_user):
+    """取值必须显式可验：拼错的 `progress_by` 若被静默当成滚动，功能会"看着像没生效"。"""
+    pid = _start(settings, make_user, client)
+    assert client.patch(f"/api/papers/{pid}",
+                        json={"progress": 10, "progress_by": "scroll"}).status_code == 200
+    assert client.patch(f"/api/papers/{pid}",
+                        json={"progress": 10, "progress_by": "banana"}).status_code == 400
+
+
 # ── 迁移 ────────────────────────────────────────────────────────────────
 def test_migration_backfills_only_rows_with_reading_evidence(settings, make_user, client):
     """存量行迁移：**有证据的才回填**，没证据的一律留 NULL。

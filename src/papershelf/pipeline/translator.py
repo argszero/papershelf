@@ -21,7 +21,41 @@ import httpx
 
 from .markup import render_block
 from .model import Block, grid_shape, table_text
+from .parse import _looks_like_continuation
 from .validate import expects_chinese, extract_blocks, validate
+
+# ── 跨块接缝（㊻，2026-09-19，宿主选 C）─────────────────────────────────
+#
+# 宿主：「翻译时需要参考前后的block，尤其是跨页时。前面的block的半句翻译应该和后面block
+# 的半句翻译很好的承接起来」（附截图：p3 页首孤零零一个「工艺。」）。
+#
+# 病灶有三处，**不是"没给上下文"**（上下文早就给了）：
+#   ① 上下文取的是**裸相邻**块 —— 跨页处 `ordered[first-1]` 正是**页眉**
+#      （`Journal of Intelligent Manufacturing (2024) 35:1407–1437 1409`），全库实测 24 次；
+#   ② 窗口只有各 1 块；跨页那一对中间还隔着一个页眉块，等于什么都没给；
+#   ③ **模型没有理由认为这两块是一句话**：那例两半本来就在同一个切片里，模型看得见两半，
+#      仍然把前半句译完整、后半句译成孤零零的「工艺。」—— 提示词里没有这一条。
+# 于是三层一起改：跳过页边带/装饰取**最近的正文邻块**、窗口放宽到 `CTX_NEIGHBORS` 块、
+# 把接缝**显式写进 prompt**（`【跨块接缝】`）并在系统提示词里加一条硬要求。
+CTX_NEIGHBORS = 2          # 上下文窗口：前后各取几个**正文**块（宿主选 C 时说的"2~3 块"）
+
+# 页边带/装饰/公式：**不参与**接缝判据，也不当上下文（它们是"页面家具"不是"话"）。
+# ⚠️ 判据必须与解析端一致：页眉/页脚在产物里不是独立块类型，而是**带 `payload["band"]` 的
+#    `p` 块**（㊶ 定的）—— 只看 `type` 会把页眉当成正文，正是宿主那例的成因。
+_FURNITURE_TYPES = frozenset({"deco", "eq"})
+# 只有这几类块之间才谈得上"同一句被切开"：标题/表格/图注/文献条目都是**结构单元**，
+# 它们跟前后文不构成半句话（把它们也算进来 = 拿"标题大写起"当反例淹掉真信号）。
+_PROSE_TYPES = frozenset({"p", "abstract", "meta"})
+
+# 半句对的**下限**：前半至少 6 词、后半至少 3 词（实测切出来的分界，见 `seam_pairs`）。
+# 解析端的判据挂在几何上（同一页的左右栏接缝 + 页边带过滤），所以那里的假阳性长什么样
+# 由几何决定；翻译端只有文本与顺序 —— 于是**标注/表头/作者行/页码**全会冒充"半句"
+# （实测 4 篇：`MICRESS`、`Unsupervised`、`B T. Herzog`、`Journal of Manufacturing Processes`、
+# `123` …）。它们共同的特征是"**不是话**"：词数极少。
+# ⚠️ 阈值不能定在"字母数"上：真接缝的后半可能就是四个词（`transformative impact on WAAM.`）。
+_MIN_SEAM_WORDS = (6, 3)
+_MIN_WORDS_FIRST, _MIN_WORDS_SECOND = _MIN_SEAM_WORDS
+
 
 # 管线模块自己持 logger（不继承调用方）：`server/logging_setup.py` 给 root 挂 handler，
 # 所以 CLI 与容器里都直接可见；线程级 handler（`paper_log`）会把它们抄进单篇日志。
@@ -43,6 +77,14 @@ SYSTEM_PROMPT = """你是学术论文翻译专家，服务于中文科研人员�
 5. 参考文献条目**只译文献标题**：作者名、期刊/会议名、卷期页、年份、DOI/URL
    一律保留原文（读者要靠它们检索）。中文栏里一条文献看起来仍是原条目，只有标题成了中文。
 6. 专有名词（模型名、方法名、数据集名）按术语表处理；术语表未覆盖且学界惯用英文的可保留英文。
+7. **跨块接缝必须接上**（仅当提示里给了【跨块接缝】清单时）：清单里的相邻块本是**同一句话**
+   被切开（分栏或跨页的排版所致，中间可能夹着页眉/页脚块）。清单里给了这句话的**完整原文**，
+   请**先把这句完整译成一句通顺的中文**，再按原文的断点把它切成两半：
+   - **前半块只放断点之前的译文**，结尾**不要加句号**（这话还没说完）；
+   - **后半块从断点之后开始**，不要重复前半块已有的内容、不要另起一句；
+   - 两半**拼起来**必须与那句完整原文一一对应（不增不减、不断错位）。
+   两块**仍然是两块**：`data-b` 与块数一律不变，**不要合并成一块**。
+   ⚠️ 提示里没给接缝清单时，本条不适用（按普通分块翻译即可）。
 
 ⚠️ 结构要求（最高优先级，违反即视为失败）：
 - 输入的 HTML 片段中每个元素带 `data-b="b-XXXX"` 属性，**必须原样保留**。
@@ -287,22 +329,133 @@ class Translator:
         ]
         return "术语表（必须遵守）：\n" + "\n".join(lines) + "\n\n"
 
-    def _user_prompt(self, blocks: list[Block], ctx_before: Block | None, ctx_after: Block | None) -> str:
+    # ── 跨块接缝（㊻）─────────────────────────────────────────────────────
+    @staticmethod
+    def _is_furniture(b: Block) -> bool:
+        """页面家具：页眉/页脚（`payload["band"]`，㊶）/ 装饰图 / 独立公式。
+
+        它们**能出现在两块正文之间**（跨页时必然如此），但不是"话" ——
+        接缝判据与上下文选取都要跳过它们。
+        """
+        return bool(b.payload.get("band")) or b.type in _FURNITURE_TYPES
+
+    @classmethod
+    def seam_pairs(cls, ordered: list[Block]) -> list[tuple[Block, Block]]:
+        """`ordered` 里疑似「同一句被切开」的**相邻正文对**（跳过页面家具）。
+
+        判据是**单一来源**：`parse._looks_like_continuation`（前块没结句 + 后块小写起），
+        解析阶段的栏间接缝、①c 的复量提醒、这里的翻译提示全都读它 —— 三处各写一遍，
+        迟早一个说"像"、另一个说"不像"。
+
+        ⚠️ 翻译侧必须**再补一条**解析侧没有的判据：**两块都得真是"话"**。
+        解析侧的判据挂在几何条件上（必须在同一页的左右栏接缝上、且不在页边带里），
+        孤零零一个 `123`/`MICRESS` 落不到那条缝上；而翻译侧只看文本与顺序 —— 实测 4 篇里
+        **标注、表头、作者行、页码**都在冒充"半句"：
+        `MICRESS`、`Unsupervised`、`B T. Herzog`、`Journal of Manufacturing Processes`、`123`…
+        （paper 2 实测 13 处里 3 处、paper 1 实测 10 处里 5 处是这种）。用**词数**挡：
+        真半句是句子（≥6 词），这些标签都是 1–4 个词。
+        """
+        flow = [b for b in ordered if not cls._is_furniture(b)]
+        out: list[tuple[Block, Block]] = []
+        for a, b in zip(flow, flow[1:]):
+            if a.type not in _PROSE_TYPES or b.type not in _PROSE_TYPES:
+                continue
+            if len((a.en or "").split()) < _MIN_WORDS_FIRST \
+                    or len((b.en or "").split()) < _MIN_WORDS_SECOND:
+                continue
+            if _looks_like_continuation(a.en, b.en):
+                out.append((a, b))
+        return out
+
+    @classmethod
+    def _ctx_before(cls, ordered: list[Block], idx: int, n: int = CTX_NEIGHBORS) -> list[Block]:
+        """切片首块**之前**最近的 `n` 个正文块（由远到近返回）。
+
+        ⚠️ 必须跳过页面家具：原先取 `ordered[idx-1]` 是**裸相邻** —— 跨页处那个"上文"
+        恰好是**页眉**（宿主那例的成因，全库实测 24 次）。给模型一段期刊页眉，
+        它对"上一句说到哪"仍然一无所知。
+        """
+        out: list[Block] = []
+        i = idx - 1
+        while i >= 0 and len(out) < n:
+            if not cls._is_furniture(ordered[i]):
+                out.append(ordered[i])
+            i -= 1
+        return list(reversed(out))
+
+    @classmethod
+    def _ctx_after(cls, ordered: list[Block], idx: int, n: int = CTX_NEIGHBORS) -> list[Block]:
+        """切片末块**之后**最近的 `n` 个正文块（由近到远）。"""
+        out: list[Block] = []
+        i = idx + 1
+        while i < len(ordered) and len(out) < n:
+            if not cls._is_furniture(ordered[i]):
+                out.append(ordered[i])
+            i += 1
+        return out
+
+    @staticmethod
+    def _seam_note(blocks: list[Block], seams: list[tuple[Block, Block]]) -> str:
+        """把与本次翻译范围有关的接缝写成一段**显式**提示（没有则空串）。
+
+        ⚠️ **必须给出这句的完整原文**（两块拼起来那一句）：两半本来就在同一个切片里，
+        模型看得见两半，照样把前半句译完整、后半句译成孤零零一个「工艺。」
+        —— 实测的差别不在"看得见看不见"，而在**有没有人告诉它这两块是一句话**。
+        给完整原文 + "先整句译出、再按断点切开"这条动作指令，实测 6/6 干净承接
+        （只写"不得补成完整句"的版本 3 次里仍有 1 次退回译断）。
+
+        只有一块在范围内时说法不同：后半要"接着写"、前半要"不许补成完整句"
+        （另一半可能是人工修订过、或免中文的块，不要去动它）。
+        """
+        ids = {b.id for b in blocks}
+        rows: list[str] = []
+        for a, b in seams:
+            a_in, b_in = a.id in ids, b.id in ids
+            if not (a_in or b_in):
+                continue
+            whole = f"{a.en.strip()} {b.en.strip()}"
+            where = f"断点在「…{a.en.strip()[-40:]}」与「{b.en.strip()[:40]}…」之间。"
+            if a_in and b_in:
+                rows.append(f"- {a.id} → {b.id}：这两块本是同一句话，完整原文是：\n"
+                            f"  {whole}\n  {where}")
+            elif b_in:
+                rows.append(f"- {a.id} → {b.id}：**{b.id} 是上文那句话的后半**，"
+                            f"这句话的完整原文是：\n  {whole}\n  {where}"
+                            f"——{b.id} 的中文要从断点之后开始，不要另起一句、"
+                            f"不要重复上文已译的内容。")
+            else:
+                rows.append(f"- {a.id} → {b.id}：**{a.id} 的话没有说完**"
+                            f"（下半句不在本次翻译范围内）。完整原文是：\n  {whole}\n  {where}"
+                            f"——{a.id} 只放断点之前的译文，不得补成完整句。")
+        if not rows:
+            return ""
+        return (
+            "【跨块接缝（同一句话被排版切成了两块）】\n" + "\n".join(rows) + "\n"
+            "⚠️ 两块**仍然是两块**（`data-b` 与块数不变、不要合并）；"
+            "先把整句译好，再按上面给的断点切开。\n\n"
+        )
+
+    def _user_prompt(self, blocks: list[Block], ctx_before: list[Block] | None = None,
+                     ctx_after: list[Block] | None = None,
+                     seams: list[tuple[Block, Block]] | None = None) -> str:
         # ⚠️ typeset=False：prompt 与输出都必须是 **LaTeX 源码**，译文才能继承同一份公式
         #    （渲染成 MathML 后模型输出的"标记保真"就无从校验，见 validate.latex_problems）。
         parts = [self._glossary_text()]
-        if ctx_before is not None:
+        if ctx_before:
             parts.append(
                 "【上文（仅供理解，**不要翻译**）】\n"
-                + render_block(ctx_before, lang="en", marker=False, typeset=False)
+                + "\n".join(render_block(c, lang="en", marker=False, typeset=False)
+                          for c in ctx_before)
                 + "\n\n"
             )
+        parts.append(self._seam_note(blocks, seams or []))
         parts.append("【需要翻译的片段】\n"
                      + "\n".join(render_block(b, lang="en", typeset=False) for b in blocks) + "\n")
-        if ctx_after is not None:
+        if ctx_after:
             parts.append(
                 "\n【下文（仅供理解，**不要翻译**）】\n"
-                + render_block(ctx_after, lang="en", marker=False, typeset=False)
+                + "\n".join(render_block(c, lang="en", marker=False, typeset=False)
+                          for c in ctx_after)
                 + "\n"
             )
         parts.append("\n请输出上述【需要翻译的片段】的中文 HTML 片段，保持所有 data-b 属性不变。")
@@ -340,18 +493,47 @@ class Translator:
 
     # ── 分块 ──────────────────────────────────────────────────────────────
     @staticmethod
-    def chunk(blocks: list[Block], max_blocks: int = 12, max_chars: int = 6000) -> list[list[Block]]:
-        """按块边界切片：块不跨切片（决策④ 的必要条件）。"""
+    def chunk(blocks: list[Block], max_blocks: int = 12, max_chars: int = 6000,
+              keep_together: set[tuple[str, str]] | None = None) -> list[list[Block]]:
+        """按块边界切片：块不跨切片（决策④ 的必要条件）。
+
+        `keep_together` = **不得被切在中间**的块对（㊻ 的跨块接缝）：
+        实测 4 篇里各有 **1–6 对**接缝恰好落在切片边界上 —— 那样两半分处两个请求，
+        谁都看不见另一半，"承接"根本无从谈起。切片尺寸本来就是软上限
+        （`max_blocks`/`max_chars`），为接缝多带一块完全划算。
+
+        ⚠️ 判据要**跨过页面家具**看：跨页的接缝中间夹着页眉块（`b-0026` → 页眉 → `b-0028`），
+        只看"当前切片最后一块"会漏 —— 切点落在**页眉与后半句之间**同样是切开接缝。
+        所以要记住"哪一对还没凑齐"（`open_pair`）：第一半进了本切片，就一直不许在
+        它的后半到来之前切片（家具块夹在中间也不许）。
+        """
+        # ⚠️ 用**有序二元组**（`("b-0026", "b-0028")`）而不是 `frozenset`：
+        #    "谁在前"正是这里要的信息，集合会把方向丢掉。
+        pairs = keep_together or set()
+        firsts = {a for a, _ in pairs}
         chunks: list[list[Block]] = []
         cur: list[Block] = []
         size = 0
+        open_pair: str | None = None      # 本切片里"还没等到后半"的那个块 id
+
         for b in blocks:
             n = len(b.en) + (len(b.payload.get("caption") or "") if b.type == "figure" else 0)
-            if cur and (len(cur) >= max_blocks or size + n > max_chars):
+            cut = cur and (len(cur) >= max_blocks or size + n > max_chars)
+            if cut and open_pair is not None:
+                cut = False               # 这一对是同一句话的两半：宁可让本切片超一点
+            if cut:
                 chunks.append(cur)
-                cur, size = [], 0
+                cur, size, open_pair = [], 0, None
             cur.append(b)
             size += n
+            if not Translator._is_furniture(b):
+                if open_pair is not None and (open_pair, b.id) in pairs:
+                    open_pair = None                       # 后半到齐
+                # 后半**同时**可能是下一对的**前半**（`b-0012→b-0013→b-0014` 这种连号接缝
+                # 实测就有）：只在"凑齐了"分支里清空、不再查 `firsts`，会把 `b-0013→b-0014`
+                # 整个漏掉 —— 切片又切在这句话中间，而这正是本函数唯一的活。
+                if b.id in firsts:
+                    open_pair = b.id
         if cur:
             chunks.append(cur)
         return chunks
@@ -382,6 +564,18 @@ class Translator:
                 and (only is None or b.id in only)]
         # 注意：上下文仍取自**完整** ordered，只有待翻集合被收窄（断点续跑不影响上下文质量）
 
+        # ㊻ 跨块接缝：先在**完整**序列上算一次（收窄只影响送谁去翻，不影响"谁跟谁是一句话"），
+        # 再按 id 取出"两半都在待翻集合里"的那些交给 `chunk()` —— 切片不得切在接缝上。
+        seams = self.seam_pairs(ordered)
+        seam_ids = {b.id for b in todo}
+        # 有序二元组（谁在前是要紧信息，见 `chunk`）；只保留"两半都在待翻集合里"的那些。
+        keep = {(a.id, b.id) for a, b in seams if a.id in seam_ids and b.id in seam_ids}
+        if seams:
+            head = "、".join(f"{a.id}→{b.id}" for a, b in seams[:4])
+            log(f"  · 跨块接缝：{len(seams)} 处疑似「同一句被切开」"
+                f"（其中 {len(keep)} 处两半都在本次范围内）：{head}"
+                + (" …" if len(seams) > 4 else ""))
+
         # 表格 / 参考文献条目与正文走**三条通道**（见模块里 `TABLE_SYSTEM`、`REFS_SYSTEM`
         # 的说明）：混在一起送会让模型把 `<td>` 的边界当成排版噪声、
         # 把文献条目的作者名也一并译掉。
@@ -398,7 +592,7 @@ class Translator:
                 all_texts[b.id] = zh
 
         index = {b.id: i for i, b in enumerate(ordered)}
-        chunks = self.chunk(todo, max_blocks, max_chars)
+        chunks = self.chunk(todo, max_blocks, max_chars, keep_together=keep)
         # 「进度」必须能回答"还剩多少"：只打「切片 3」看不出是 3/45 还是 3/4
         # （生产汇报「一直显示转换中」时，日志里连总数都没有，无从判断是否在进行）。
         log(
@@ -408,11 +602,13 @@ class Translator:
         )
         for ci, chunk in enumerate(chunks, start=1):
             first, last = index[chunk[0].id], index[chunk[-1].id]
-            before = ordered[first - 1] if first > 0 else None
-            after = ordered[last + 1] if last + 1 < len(ordered) else None
+            # ㊻ 上下文 = 前后各 `CTX_NEIGHBORS` 个**正文**块（跳过页边带/装饰/公式）；
+            #    接缝 = 与本次范围有关的那几条（清单里会写清"哪两块是一句话"）。
+            before = self._ctx_before(ordered, first)
+            after = self._ctx_after(ordered, last)
             log(f"  · 切片 {ci}/{len(chunks)}：{len(chunk)} 块（{sum(len(b.en) for b in chunk)} 字符）")
             try:
-                out = self._chat(self._user_prompt(chunk, before, after))
+                out = self._chat(self._user_prompt(chunk, before, after, seams))
             except Exception as exc:  # 网络/接口异常 → 记录并跳过，交由后续重译
                 log(f"    ! 切片 {ci} 调用失败，已跳过（{len(chunk)} 块将在校验后定点重译）：{exc}")
                 continue
@@ -434,9 +630,12 @@ class Translator:
                     continue
                 i = index[bid]
                 try:
+                    # ㊻ 定点重译同样带上接缝与正文上下文 —— 首轮译断的那一半，
+                    #    重译时若又拿不到"上下两块是一句话"这个事实，只会把同样的错再犯一次
+                    #    （而且它是**唯一**能改好那半句的机会：校验只看"有没有中文"）。
                     out = self._chat(
-                        self._user_prompt([b], ordered[i - 1] if i else None,
-                                          ordered[i + 1] if i + 1 < len(ordered) else None)
+                        self._user_prompt([b], self._ctx_before(ordered, i),
+                                          self._ctx_after(ordered, i), seams)
                     )
                     _, txt = extract_blocks(out)
                     if b.id in txt:

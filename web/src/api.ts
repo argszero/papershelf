@@ -77,7 +77,11 @@ export const api = {
     const doc = await request<PaperDoc>(`/api/papers/${id}/doc`)
     return doc
   },
-  updatePaper: (id: number, body: Partial<Paper> & { status_?: string }) =>
+  /** `progress_by` 是**必填的语义声明**（㊺）：`"user"` = 用户手改，可改小、可越过「已读」锁；
+   *  缺省 = 阅读器滚动上报，走 ⑰ 的"只增不减"。
+   *  ⚠️ 两者发的是同一个 `progress` 值，靠值分不清（手改 80→30 与从文末滚回顶部一模一样），
+   *  所以**谁调用谁负责声明**：滚动那条路径不许带这个参数，手改必须带 `"user"`。 */
+  updatePaper: (id: number, body: Partial<Paper> & { status_?: string; progress_by?: 'user' | 'scroll' }) =>
     request<Paper>(`/api/papers/${id}`, patch(body)),
   deletePaper: (id: number) => request<void>(`/api/papers/${id}`, { method: 'DELETE' }),
   uploadPapers: (planId: number, files: File[], tags = '') => {
