@@ -171,6 +171,10 @@ def test_rebuild_merges_fragments_and_keeps_body_ids(seeded):
     got = rebuild_paper_refs(seeded, 1, translator=tr, log=lambda *a: None)
     assert got["ok"] and got["changed"]
     assert got["refs"] == 6 and got["entries"] == 4        # 6 碎片 → 4 条
+    # ⚠️ `refs` 是**动手之前**的碎片数、`refs_left` 是**修完之后**还剩的碎片数 —— 两个数
+    #    都要报，但语义不同。2026-09-19 生产日志把前者印成「余下未切出的碎片」，
+    #    309 看着像"等于没修"（真实剩余 14），这条断言就是钉住那个口径的。
+    assert got["refs_left"] == 2                            # 页眉 + APA，原样留着
 
     doc = _blocks(seeded)
     # 正文块 id 与内容**逐字未变**（批注坐标的前提）

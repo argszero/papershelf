@@ -218,7 +218,7 @@ def _run_refs_fix(conn: sqlite3.Connection, paper_id: int, t0: float) -> None:
     else:
         log.info("paper=%s 重建参考文献完成：%s 条条目（余下未切出的碎片 %s 个）/ %d tokens / "
                  "批注搬家 %s 条（落空 %s 条）/ 用时 %.1fs",
-                 paper_id, result.get("entries"), result.get("refs"), tokens,
+                 paper_id, result.get("entries"), result.get("refs_left"), tokens,
                  result.get("anchors_moved"), result.get("anchors_dropped"),
                  time.monotonic() - t0)
     _set_state(conn, paper_id, "done", None, tokens=tokens)

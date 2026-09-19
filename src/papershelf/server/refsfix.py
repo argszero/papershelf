@@ -72,7 +72,7 @@ def rebuild_paper_refs(
     if before["refs"] == 0:
         return {"ok": True, "changed": False, "reason": "文末材料段没有可合并的碎片",
                 **before, "entries": before["ref"], "tokens": 0,
-                "anchors_moved": 0, "anchors_dropped": 0}
+                "refs_left": 0, "anchors_moved": 0, "anchors_dropped": 0}
 
     # ⚠️ `from_index=0`：不依赖 `meta["refs_start"]`（旧产物未必有），
     #    非 `refs` 块一律原样透传 ⇒ 与"只处理文末段"等价，且对解析期没识别出
@@ -81,7 +81,7 @@ def rebuild_paper_refs(
     if [b.id for b in blocks] == [b.id for b in doc.blocks]:
         return {"ok": True, "changed": False, "reason": "已经修过（没有可再合并的碎片）",
                 **before, "entries": before["ref"], "tokens": 0,
-                "anchors_moved": 0, "anchors_dropped": 0}
+                "refs_left": before["refs"], "anchors_moved": 0, "anchors_dropped": 0}
 
     after = _count(blocks)
     new_ids = [b.id for b in blocks if b.id not in {x.id for x in doc.blocks}]
@@ -117,8 +117,12 @@ def rebuild_paper_refs(
         moved, dropped = _move_anchors(conn, paper_id, moves, by_id, log=log)
         write_doc(conn, paper_id, doc)
     log(f"  · 批注搬家：{moved} 条已随碎片搬到新条目，{dropped} 条落空（已记日志）")
+    # ⚠️ `**before` 里的 `refs` 是**动手之前**的碎片数；日志要的是"还剩几个没切出来"
+    #    ⇒ 另给一个 `refs_left`。2026-09-19 在生产日志里实测到过这条口径错误：
+    #    它把 309（修之前）印成「余下未切出的碎片」，而真实剩余是 14 —— 这种错会让人
+    #    以为"修了等于没修"，比不打印更坏。
     return {"ok": True, "changed": True, **before, "entries": after["ref"], "tokens": tokens,
-            "anchors_moved": moved, "anchors_dropped": dropped}
+            "refs_left": after["refs"], "anchors_moved": moved, "anchors_dropped": dropped}
 
 
 def _count(blocks: list[Block]) -> dict[str, int]:
