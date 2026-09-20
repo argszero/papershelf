@@ -2759,3 +2759,132 @@ DB 与 `.env` 事前备份：`/tmp/papershelf.db.bak.20260919-213003`、`/tmp/.e
   （APA 无编号体例，仍切不出）、paper3 **9/124**（未点「重建参考文献」）、paper4 177/6；
   `table` → 2/8/2/4；`deco` → 0/1/0/38；`needs_review` → 31/29/8/20（其中 paper3 有 3 块**无中文**）；
   批注 → notes 11/0/0/7 + highlights 229/17/0/181。
+
+---
+
+## ㊹ 修订三：**APA（作者-年份）判据 = 第三条编号风格**（解析 v15，2026-09-20）
+
+宿主 2026-09-20 授权：「**你上生产就行**」+「**生产操作也可做，前提是笔记/高亮不丢不乱**」。
+本节记录 ㊹ 修订 留下的那条边界（「paper 2 是 APA 无编号体例、仍 0 条，待宿主拍板」）的落地。
+
+### 一、病灶：判据只有"编号"这一种形状
+
+`_ref_entry_starts` 的两条判据（`[N]` 式 / `N.` 式）都要求**条目编号**；APA 体例
+（`Zhao, C., Fezzaa, K., … (2017). Title. Journal, 7(1), 3602.`）**没有编号** ⇒
+`len(best) < 2` → `split_ref_entries` 返回 `None` → 182 个碎片**原样返回**（留在免中文的 `refs`，
+既无译文也无重译入口）。这与 ㊹ 修订 的病灶是**同一个位置**（`_ref_entry_starts`），
+只是缺的是**第三种形状**而不是起点偏移。
+
+### 二、修法：第三条判据 `_author_year_starts(stream)`，且**只在旧判据完全失效时才启用**
+
+```python
+best = _numbered_starts(stream)          # `[N]` 式
+if len(best) < 2: best = _dotted_starts(stream)   # `N.` 式
+if len(best) < 2: best = _author_year_starts(stream)   # v15 新增：作者-年份
+```
+
+**"只在失效时才走"是这次的低风险设计**：编号体例永远优先，所以**对已有 4 篇（含 288/120/177 条）
+的切法零改动面**（有测试钉住：编号体例在场时 `_author_year_starts` 不得被采用）。
+
+作者-年份锚点 = `\((?:(?:19|20)\d{2}[a-z]?|n\.\s?d\.)\)\.`（年份括号 + 紧跟的句点），
+起点要**从锚点往回走完整个作者串**，字符串形状必须认这些（都是实测撞出来的）：
+
+| 形状 | 例子 | 处理 |
+|---|---|---|
+| 小写介词 | `de Oliveira` / `du Plessis` / `t Veld` | 白名单小写词（2–4 字母 + 白名单 1–3 字母） |
+| 多词姓 | `Mamat Ibrahim` | `NAME` 允许 1–2 个词 |
+| 带音调词首 | `& Özel, T.` | `[A-Z\u00c0-\u024f]` |
+| 后缀 | `Conway, J. C., Jr.` | `INIT` 允许 `, Jr|Sr|III|II|IV` |
+| 无年份 | `(n.d.).` | 锚点里带 `n\.\s?d\.` |
+
+- 末尾必须「**姓 + 逗号 + 首字母**」—— 否则会**往回吞**上一条的尾巴（这条挡的就是"看起来很对
+  但多吃一个词"的失败模式）。
+- **认不出作者串的锚点跳过而不中断**（`continue`，不是 `break`）：机器作者如
+  `ASTM International (2021).` 不满足形状 ⇒ 那个锚点不用，那段文字并进**上一条**，
+  **一个字不丢**（宁可少切一条，不可多切一段假条目）。
+
+`PARSE_VERSION` **14 → 15**。
+
+### 三、实测（离线零 token，生产真实碎片）
+
+| 篇 | 修前 | 修后 |
+|---|---|---|
+| paper 2（APA，182 碎片） | 0 条 | **163 条** |
+
+- **逐字守恒**：拼回去按非空白字符逐字相同（`守恒 True`、每 run `异常条目 0`）；
+  163 条**条条从作者串起头**（不是从某个词的中间起）。
+- 测试：`tests/test_refs.py` **+8 项**（+106 行）；**全量离线 516 passed**（原 508）；
+  **8 处变异检验全部转红**（删 v15 分支 / 去介词白名单 `de` / 词首只留 ASCII / 去 `Jr·Sr` /
+  多词姓只许一词 / 去年份锚点 / …）。
+- ⚠️ 一处**已知小瑕、未处理**：`_join_ref_fragments` 在 URL 断行处把 `…dl.pdf` 接成 `…dl. pdf`
+  （插 1 个空格，flat 7629 vs joined 7630）。这是"**只动空白**"这条不变量的**必然结果**，不是 bug。
+
+### 四、生产：v15 部署 + 两篇定点重建
+
+- commit：`02c0fbe`（记忆）→ **`6708ed6`**（v15 代码）；CI `35480550066` **六 job 全绿**；
+  生产 `revision=6708ed6239c08693ae9122f61b0ae3fa5ffecd15` / healthy / 公网 health 200；
+  DB 备份 `/tmp/papershelf.db.bak.20260920-0915`。
+- **走「重建参考文献」（㊹ 修订二）而不是「重新提取」** —— 后者会 `DELETE notes/highlights`。
+  | 篇 | ref 前 → 后 | tokens | 待校对 |
+  |---|---|---|---|
+  | paper 3 | 9 → **120** | 134,252 | 2 |
+  | paper 2 | 0 → **163** | 202,730 | 0 |
+- **笔记/高亮保全（每次重建前后实测，逐字段比对）**：
+  `notes 19→19 | 全字段一致 True`、`highlights 433→433 | 全字段一致 True`
+  （分篇 notes `{1:11, 4:7, 2:1}`、hl `{1:229, 4:181, 2:23}`）。**这是本会话唯一的不变量。**
+
+重建后全库终态：
+
+| paper | blocks | ref | `refs` 残留 | 有中文的 ref | 待校对 |
+|---|---|---|---|---|---|
+| 1 | 811 | 288 | 14 | 288 | 0 |
+| 2 | 428 | 163 | 9 | 163 | 0 |
+| 3 | 429 | 120 | 7 | 120 | 2 |
+| 4 | 435 | 177 | 6 | 177 | 0 |
+
+### 五、生产真浏览器验收（宿主已登录标签页，真实鼠标事件）
+
+- **reader/2（paper 2）**：`ref` 块 **172**（163 `ref` + 9 `refs` 碎片）、`.ref-item` **335**
+  （163×2 栏 + 9×1 栏）⇒ 中文栏**163/163 都含 CJK**、英文栏 **0/163**（作者/期刊/DOI 保原文，㊹ 决策 B）。
+- **reader/3（paper 3）**：`ref` 块 127、中文栏 **120/120 含 CJK**、零 exception、零横向溢出。
+- **三模式逐列量测**（paper 2，368 个 `.blk-p`）：dual `en 368/368 + zh 345/345` ·
+  仅中文 `en 0/368 + zh 368/368` · 仅原文 `en 368/368 + zh 0` ⇒ 还原 dual，`localStorage` = `dual`。
+- **参考文献可划**：在 `b-0951` 的中文标题上**真实鼠标拖选** 6 个字 → `.mark-bar` 出现（含「加笔记」）
+  → `Esc` 收起。**只拖不写** ⇒ 生产库 `notes 19 / highlights 433` **逐字段一致**。
+- 全程**零 console error**、**零横向溢出**；验收新开的临时标签页已 `Target.closeTarget` 关掉，
+  宿主原有两页（reader/2 + 一个导出页）原样保留，标题上的马标也未被留下。
+
+### 六、一条**被证伪的疑似缺陷**（值得写下来，因为判据很容易选错）
+
+上轮收尾时看到 reader/2 里 `b-1111`、`b-1112` "前后同为英文"，怀疑"标题在条目头部/中部 ⇒ 没译"。
+**证伪**：两条的 `zh` 字段与中文栏 DOM 里**都有中文标题**
+（`… (2017). 利用高速X射线成像与衍射对激光粉末床熔融过程进行实时监测. Scientific Reports, …`）——
+看着"全是英文"是因为 **㊹ 决策 B 只译标题，作者/期刊/DOI 本来就保原文**，
+条目起头那段（作者串）**永远**是英文。
+**教训：按"这一段看起来是英文"判"没译"会被决策本身骗到；判据要落在"中文栏里有没有 CJK"。**
+
+⚠️ **另一条判据陷阱（本轮新踩）**：阅读器 DOM 里的 `.ref-item` **没有 `data-pt` / `data-b`**
+—— `repo.public_block` 调 `render_block(..., marker=False)`，这两个戳只挂在**校验/导出**那条路径
+（`marker=True`）。**按 DOM 找 `data-pt` 会得出"㊹ 的豁免没生效"的错误结论**（实测 `[data-pt]` 计数 0）。
+
+### 七、⚠️ 本轮新增的边界（未处理，留给宿主）
+
+**跨页家具会把一条条目切成两半，尾巴留在 `refs` 碎片里（未译）**：
+
+`_merge_ref_run` 按 `band`（页眉/页码）flush run，而"条目尾巴"那一段里**没有起点锚点**
+（起点在上一段）⇒ `split_ref_entries` 返回 `None` ⇒**原样返回**。表现 = 一条文献被拆成两段、
+尾巴排在页眉之后（文字**一个字没丢**，只是被切开且尾巴没有中文）。实测生产 4 篇共 **6 条**：
+
+| 篇 | 碎片 | 前一条 `ref` 被截断处 | 尾巴 |
+|---|---|---|---|
+| 2 | b-0896 | `…Spatially resolved acoustic spectroscopy for selective` | `laser melting. Journal of Materials Processing Technology, 236, 93–102. …` |
+| 2 | b-0913 | `…artificial intelligence. In M. Meboldt` | `& C. Klahn (Eds.), Industrializing additive manufacturing—…` |
+| 2 | b-0776 | `…for laser metal deposition-based` | `defect recognition in additive manufacturing. CIRP Annals, 68(1), 451–454. …` |
+| 2 | b-0827 | （同上型） | `Additive Manufacturing, 13, 135–142. …` |
+| 1 | b-0820 | `…numerical simulation and` | `experimental verification. Appl Phys A … 2018;124. …` |
+| 4 | b-0381 | `…sensor sensitivity with` | `explainable machine learning. J Mater Process Technol 321. …` |
+
+- 修法需要「**跨家具续接**」（"上一条以未收尾的形态结束 + 下一段首片无起点" ⇒ 续上去），
+  但这与 ㊹ 的「`band` 不参与合并」有张力（处理不好会把页眉吞进条目），**未做**。
+- 与此相对，`refs` 里**真正的页面家具**（页码 `75/76`、页眉 `Journal of Manufacturing Processes 160 (2026) 50–81`）
+  保留是**有意的**（v10 页眉照译 + ㊹ 的 `band` 跳过），不是残留 bug。
