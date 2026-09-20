@@ -161,6 +161,112 @@ def test_split_refuses_a_single_overlong_entry():
     assert split_ref_entries(stream) is None
 
 
+# ── 2b. 无编号体例（作者-年份 / APA）：v15 ─────────────────────────────────
+# 生产 paper 2 实测：**182 个碎片、0 个候选**（`_RE_REF_BRACKET`/`_RE_REF_NUM` 都要求条目带编号），
+# 整段文献一直是免中文的碎片 —— 读者看不到任何译文（与 ㊹ 修订前的"只翻译了两条"同类）。
+_S_APA = (
+    "Ahlawat, S., Choudhary, A., Nayyar, A., Singh, S., & Yoon, B. (2020). Improved handwritten "
+    "digit recognition using convolutional neural networks (CNN). Sensors, 20 (12), 3344. "
+    "https://www.mdpi.com/ 1424-8220/20/12/3344 "
+    "Aminzadeh, M., & Kurfess, T. R. (2019). Online quality inspection using Bayesian "
+    "classification in powder-bed additive manufacturing. Journal of Intelligent Manufacturing, "
+    "30 (6), 2505–2523. https://doi.org/10. 1007/s10845-018-1412-0 "
+    "de Oliveira, U., Ocelík, V., & De Hosson, J. T. M. (2006). Residual stress analysis in "
+    "Co-based laser clad layers. Materials & Design, 27 (10), 947–956."
+)
+
+
+def test_author_year_entries_are_split_without_any_numbering():
+    """**没有条目编号**也能切：判据是"年份括号 + 它前面的作者串"。"""
+    got = split_ref_entries(_S_APA)
+    assert got is not None, "无编号体例一个候选都取不到 ⇒ 整段免中文（生产 paper 2 的病灶）"
+    leading, texts = got
+    assert leading == ""
+    assert len(texts) == 3, texts
+    assert texts[0].startswith("Ahlawat, S., Choudhary, A.")
+    assert texts[1].startswith("Aminzadeh, M., & Kurfess, T. R.")
+    # 作者串不许被截掉：`Oliveira` 前的小写介词 `de` 也在条目**里面**
+    assert texts[2].startswith("de Oliveira, U., Ocelík, V., & De Hosson, J. T. M. (2006).")
+
+
+def test_author_year_split_keeps_every_character():
+    """切分**只做切分**：前导 + 各条目拼回去必须等于原流（一个字符都不能丢）。"""
+    starts = _ref_entry_starts(_S_APA)
+    raw = _S_APA[:starts[0]] + "".join(
+        _S_APA[a:b] for a, b in zip(starts, list(starts[1:]) + [len(_S_APA)]))
+    assert raw == _S_APA
+    leading, texts = split_ref_entries(_S_APA)
+    assert _flat("".join(([leading] if leading else []) + texts)) == _flat(_S_APA)
+
+
+def test_author_year_judge_handles_accents_suffixes_and_multiword_surnames():
+    """三个真形状各钉一条（都是在生产 163 个锚点上实测栽过的）：
+    `& Özel, T. (2020).`（带音标的词首）、`Conway, J. C., Jr. (1994).`（后缀）、
+    `…, & Mamat Ibrahim, F. (2014).`（多词姓）。"""
+    stream = ("Yang, L., Lo, L., Ding, S., & Özel, T. (2020). Monitoring of laser metal "
+              "deposition. Journal of Manufacturing Processes, 50, 561–573. "
+              "Canumalla, S., Pangborn, R. N., Tittmann, B. R., & Conway, J. C., Jr. (1994). "
+              "Acoustic emission for in situ monitoring. Materials Evaluation, 52 (8). "
+              "Ghoni, R., Dollah, M., Sulaiman, A., & Mamat Ibrahim, F. (2014). Defect "
+              "characterization. Procedia Engineering, 69, 1–6.")
+    got = split_ref_entries(stream)
+    assert got is not None and len(got[1]) == 3, got
+    assert got[1][0].startswith("Yang, L.,")
+    assert got[1][1].startswith("Canumalla, S.,")          # `Jr.` 后缀没把作者串截断
+    assert got[1][2].startswith("Ghoni, R.,")              # 多词姓 `Mamat Ibrahim` 整条都在
+
+
+def test_author_year_judge_handles_an_entry_without_a_year():
+    """APA 的 `(n.d.).`（无年份）也是一条条目的头 —— 判据里带了这一支。"""
+    stream = ("Smith, J. (n.d.). A study without a year. Journal of Tests, 1, 1–9. "
+              "Jones, A. (2020). Another study. Journal of Tests, 2, 2–9.")
+    got = split_ref_entries(stream)
+    assert got is not None and len(got[1]) == 2, got
+    assert got[1][0].startswith("Smith, J. (n.d.).")
+
+
+def test_author_year_judge_only_runs_when_numbering_fails():
+    """**编号体例优先**：条目正文里也有 `(2019)` 这种引用，无编号判据要是抢着跑，
+    成段的条目会被年份切碎。"""
+    stream = ("[1] Alpha study of things (see also Smith, J. (2019) for details). J Test 1:1. "
+              "[2] Beta study of other things. J Test 2:2.")
+    got = split_ref_entries(stream)
+    assert got is not None and len(got[1]) == 2, got
+    assert got[1][0].startswith("[1] Alpha") and got[1][1].startswith("[2] Beta")
+
+
+def test_author_year_judge_needs_at_least_two_entries():
+    """一个锚点不算"参考文献段"（正文里一句 `…, Smith, J. (2019).` 不该被切成条目）。"""
+    assert _ref_entry_starts("Smith, J. (2019). A lone sentence in the middle of a paragraph.") == []
+    assert split_ref_entries("Smith, J. (2019). A lone sentence in the middle of a paragraph.") is None
+
+
+def test_author_year_judge_skips_an_anchor_it_cannot_attribute():
+    """认不出作者串的锚点**跳过而不中断**（机器作者 `ASTM International (2021).` 这种）：
+    那一条会并进上一条的块里（文字一个字不丢），不许因此把其余几十条一起丢掉。"""
+    stream = ("Smith, J. (2019). A study of things. Journal of Tests, 1 (1), 1–9. "
+              "ASTM International (2021). Standard guide for tests. ASTM, West Conshohocken. "
+              "Jones, A. (2020). Another study. Journal of Tests, 2 (2), 10–19. "
+              "Brown, B. (2021). A third study. Journal of Tests, 3 (3), 20–29.")
+    got = split_ref_entries(stream)
+    assert got is not None
+    leading, texts = got
+    assert len(texts) == 3, texts                            # 3 条（ASTM 那条并进了前一条）
+    assert any("ASTM International (2021)." in t for t in texts)   # 但一个字都没丢
+    assert _flat("".join(([leading] if leading else []) + texts)) == _flat(stream)
+
+
+def test_author_year_fragments_merge_into_ref_blocks():
+    """端到端（合并入口）：APA 碎片 → `ref` 块，文字守恒、尚无译文。"""
+    mid = _S_APA.index("Aminzadeh")
+    frags = [_frag(_S_APA[:mid], page=26), _frag(_S_APA[mid:], page=27)]
+    out = _merge_ref_run(frags)
+    assert [b.type for b in out] == ["ref", "ref", "ref"], out
+    assert out[0].en.startswith("Ahlawat, S.,")
+    assert _flat("".join(b.en for b in out)) == _flat(_S_APA)
+    assert all(b.zh == "" for b in out)                       # 译文由翻译层补（只译标题）
+
+
 # ── 3. 合并入口：碎片 → 整条；切不出来就原样 ───────────────────────────────
 def test_merge_turns_fragments_into_ref_entries():
     frags = [

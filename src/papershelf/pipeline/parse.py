@@ -94,7 +94,12 @@ log = logging.getLogger("papershelf.pipeline.parse")
 #         连号的起点钉死在 1，而页眉/页脚（`payload["band"]`）会把参考文献流截成好几段
 #         ⇒ **只有含 `[1]`/`[2]` 的第一段合并成功**，其余 286 条（每片都带着连号 `[N]`）
 #         一段都切不出来。改为取**最长的那一串连号**（起点不限），见 `_ref_entry_starts`。
-PARSE_VERSION = 14
+#   v15 → **无编号（作者-年份 / APA 系）体例的参考文献也切得出条目**：v13/v14 的判据都
+#         要求条目带编号（`[12]` / `12. `），而 APA 系的条目头是 `…, & Yoon, B. (2020).`
+#         ——一个候选都取不到（生产 paper 2 实测 182 个碎片 → 0 条，读者看不到任何译文）。
+#         新增 `_author_year_starts`（年份括号锚点 + 作者串往回认），**只在编号判据完全
+#         失效时**才走；见 `_ref_entry_starts` 与 `_RE_REF_AUTHOR`。
+PARSE_VERSION = 15
 
 # 页面上下边缘（比例），落在其中的短文本块视为页眉/页脚候选
 EDGE_TOP, EDGE_BOTTOM = 0.075, 0.925
@@ -226,6 +231,30 @@ MIN_REFS_RUN = 8            # 文末连续命中该数目的块才算参考文�
 # （`2053- 1591` 不许从中间切出一个 `1591.`）。
 _RE_REF_BRACKET = re.compile(r"\[(\d{1,3})\]\s+")
 _RE_REF_NUM = re.compile(r"(?<![\w.,])(\d{1,3})\.\s+(?=[A-Z\u00c0-\u024f\"“'‘])")
+
+# ── 参考文献条目起点（v15：**无编号**体例 = 作者-年份，见 `_author_year_starts`）──
+# 上面两条判据都要求"条目带编号"（`[12]` / `12. `）。APA 系体例根本没有编号：
+# `Ahlawat, S., Choudhary, A., …, & Yoon, B. (2020). Improved handwritten …`
+# ⇒ 生产 paper 2 实测 **182 个碎片、一个候选都取不到**，整段文献一直是免中文的碎片，
+# 界面表现与 ㊹ 修订前的论文一（"只翻译了两条"）是同一类：**读者看不到译文**。
+# 判据 = **年份括号锚点 + 它前面的作者串**：`(2020).` 往前那串「姓, 首字母.」就是条目头。
+_RE_REF_YEAR = re.compile(r"\((?:(?:19|20)\d{2}[a-z]?|n\.\s?d\.)\)\.")
+# 姓氏：允许**小写介词**（`de Oliveira` / `van der Berg`）与**多词姓**（`Sahed Yazdi`）；
+# 词首字母允许带音标（`Özel` / `Monzón` / `Brandão`）—— 用 ASCII 的 `[A-Z]` 会把
+# `& Özel, T. (2020).` 整条认废（实测：163 个锚点里就栽在它和 `Monzón` 上）。
+_REF_NAME_PART = (r"(?:(?:[A-Z][a-z]{1,3}|"
+                  r"(?:de|del|della|den|der|des|di|do|dos|du|da|das|la|las|le|les|lo|los|"
+                  r"van|von|ten|ter|el|dal|op|t))\s+)")
+_REF_NAME = (r"(?:" + _REF_NAME_PART + r")*"
+             r"(?:[A-Z\u00c0-\u024f][^\W\d_'\u2019\-]*\s+){0,2}"
+             r"[A-Z\u00c0-\u024f][^\W\d_'\u2019\-]*(?:[-'\u2019][^\W\d_]+)*")
+_REF_INITIALS = r"(?:[A-Z]\.\s*){1,3}(?:,\s*(?:Jr|Sr|III|II|IV)\.)?"
+# 作者之间的分隔：`, ` / `, & ` / ` & ` / ` and `。**末尾必须是"姓 + 逗号 + 首字母"**，
+# 这条要求就是防止往回吞上一条的尾巴（上一条以 `Claypool.` 这种词收尾时吞不进来）。
+_REF_SEP = r"(?:\s*,\s*(?:&\s*)?|\s*&\s*|\s+and\s+|\s+)"
+_RE_REF_AUTHOR = re.compile(
+    r"(?:" + _REF_NAME + r",\s*" + _REF_INITIALS + _REF_SEP + r")*"
+    + _REF_NAME + r",\s*" + _REF_INITIALS + r"\s*$")
 # 合并出的单条条目**上限**：超过它说明编号判据中途失效（后面的条目全被吞进最后一条），
 # 宁可放弃合并也不产出一块两千字的"条目"。
 _REF_MAX_ENTRY = 2000
@@ -1142,6 +1171,10 @@ def _ref_entry_starts(stream: str) -> list[int]:
     （实测：段内 bracket 候选 53/56/62/51/52/12 个，`_ref_entry_starts` 一律回 0）
     —— 界面表现正是"只翻译了两条，剩下的既没翻译也没法重译"（`refs` 免中文）。
     改法：候选照旧按形状取，但要找的是**最长的那一串连号**，起点在哪儿都行。
+
+    ③ **无编号体例**（v15）：上面两条都要求条目带编号，而 APA 系体例没有编号
+    （`…, & Yoon, B. (2020). Title…`）—— 生产 paper 2 实测 182 个碎片、候选 0 个。
+    这一类交给 `_author_year_starts`（年份括号 + 作者串），**只在①②完全失效时**才试。
     """
     best: list[int] = []
     for pattern in (_RE_REF_BRACKET, _RE_REF_NUM):
@@ -1149,7 +1182,28 @@ def _ref_entry_starts(stream: str) -> list[int]:
         starts = _longest_consecutive_run(cands)
         if len(starts) > len(best):
             best = starts
+    if len(best) < 2:                    # 编号体例一个都认不出 → 试"作者-年份"（v15，APA）
+        best = _author_year_starts(stream)
     return best if len(best) >= 2 else []
+
+
+def _author_year_starts(stream: str) -> list[int]:
+    """**无编号**体例（APA/作者-年份）的条目起点 —— `(YYYY).` 锚点 + 它前面的作者串。
+
+    ⚠️ 这是第三条判据，**只在编号判据完全失效时才走**（见 `_ref_entry_starts`）：
+    编号体例的条目正文里也常出现 `(2019)` 这种引用，放开跑会把成段的文字当条目切碎。
+
+    认不出作者串的锚点**跳过而不中断**（与 `_longest_consecutive_run` 同一个取向）：
+    那一条会和**上一条**并成一块（块里的文字一个字不丢），总好过为它丢掉其余几十条。
+    """
+    starts: list[int] = []
+    for m in _RE_REF_YEAR.finditer(stream):
+        pre = stream[:m.start()]
+        ma = _RE_REF_AUTHOR.search(pre)
+        if ma is None or pre[ma.end():].strip():
+            continue
+        starts.append(ma.start())
+    return starts
 
 
 def _longest_consecutive_run(cands: list[tuple[int, int]]) -> list[int]:
