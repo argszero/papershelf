@@ -961,7 +961,7 @@ DB 与 `.env` 事前已备份（`/tmp/*.bak.20260917-154522`）。
 - Session ID: `s_260910_1634_1ef06219`
 - Session directory: `/Users/argszero/scm/github.com/argszero/papershelf/.emrg/sessions/s_260910_1634_1ef06219/`
 - **Current history** (may be compacted): `/Users/argszero/scm/github.com/argszero/papershelf/.emrg/sessions/s_260910_1634_1ef06219/history.jsonl`
-- **Daily full history** (never compacted): `/Users/argszero/scm/github.com/argszero/papershelf/.emrg/sessions/s_260910_1634_1ef06219/history_260919.jsonl`
+- **Daily full history** (never compacted): `/Users/argszero/scm/github.com/argszero/papershelf/.emrg/sessions/s_260910_1634_1ef06219/history_260920.jsonl`
 - Daily files are named `history_YYMMDD.jsonl`
 - LLM raw log: `/Users/argszero/scm/github.com/argszero/papershelf/.emrg/sessions/s_260910_1634_1ef06219/llm.jsonl` (rotated at 50MB, up to 2 backups)
 

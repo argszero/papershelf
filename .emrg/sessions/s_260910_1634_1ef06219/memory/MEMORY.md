@@ -8,7 +8,7 @@
 | --- | --- | --- | --- |
 | `7a3f9c2e` | task | [open-q11-share-access-control.md](open-q11-share-access-control.md) | ✅ 已结：问题⑪ 答复 A+D（持链接匿名只读 + 可撤销/有效期，不做密码） |
 | `e7c4b1d2` | task | [open-q-progress-manual-edit.md](open-q-progress-manual-edit.md) | `status: merged` → 已并入 **㊺**（手动改进度：宿主选 B+C，已落地并本地验收，**未提交**）；留档三条 browser-harness 现场经验（`click` 尾巴把光标放到最左 / `insertText` 非幂等 / CDP 的 Cmd+A 不全选） |
-| `f2a91c47` | task | `status: merged` → 已并入项目记忆 `design-decisions.md` **㊻**（翻译跨块承接，宿主选 C，**已落地并本地验收，未提交未上生产**）；留档摸底期的原始判断（含我自己第一个错结论「跨页 0」的更正）|
+| `f2a91c47` | task | `status: merged` → 已并入项目记忆 `design-decisions.md` **㊻**（翻译跨块承接，宿主选 C，**已落地 + 已上生产 `dc33f1d`**）；留档摸底期的原始判断（含我自己第一个错结论「跨页 0」的更正）|
 | `prod-config-state` | task | **[prod-config-state.md](prod-config-state.md)** | **生产 `papershelf.args.fun` 配置现状（无占位值，2026-09-11 18:30 跑上验证码版）**：SECRET/BASE_URL/ADMIN/LLM/**SMTP** 全部实测生效 —— 管理员 `argszero.reg@gmail.com`（旧占位账号已删）；`llm_configured:true`；**SMTP=Gmail 465，配全后自助注册自动开启**（⑮），实测 app mailer 真发信 `True`；镜像含 M5+分页+验证码认证（bundle `index-U1cJuCKf.js`，`sha-1de2277`）。附两条实测口径：**BASE_URL 必须公网域名**（否则分享复制出 localhost 链接 + CORS 放宽）、**部署机匿名即可拉 GHCR**；**邮件只能发不能收**（收件人是注册者的 edu.cn 邮箱，Gmail 只是发件人）。无关字段（`from_name`/`verify_subject`）宿主指示**忽略** |
 | `deploy-prod-placeholder-env` | task | [deploy-prod-placeholder-env.md](deploy-prod-placeholder-env.md) | `status: merged` → 已并入 `prod-config-state.md`；本文件仅留档「四处占位值的拆除过程」与 `ensure_admin` 每次启动重置口令的坑 |
 
@@ -558,7 +558,7 @@ DB 与 `.env` 事前已备份（`/tmp/*.bak.20260917-154522`）。
   ③日志口径（`refs` vs `refs_left`，`31c8c69` 已修）。
 - **未做**：paper 2（APA 体例）仍 0 条 —— 要覆盖得新加形状判据，待宿主拍板。
 
-### 最近一轮（2026-09-19 晚）㊺ 手动改进度 + ㊻ 翻译跨块承接 —— **都已本地完工，未提交未上生产**
+### 最近一轮（2026-09-19 晚 → 2026-09-20 上午）㊺ 手动改进度 + ㊻ 翻译跨块承接 —— **已上生产并验收**
 
 宿主对两条线都选 **C**（㊺ 的入口 C = 工具栏 + 抽屉双入口；㊻ 的方案 C = A + 加宽上下文窗口）。
 
@@ -577,5 +577,13 @@ DB 与 `.env` 事前已备份（`/tmp/*.bak.20260917-154522`）。
     告诉它"先整句译出、再按断点切开"才有用（散文式要求 → 可执行指令）。
   ② **写记忆时别在 Python 里用双引号转义中文引号**（脚本连炸两次 SyntaxError）——
      改记忆文件用 `pathlib` + 单引号字符串，或直接 heredoc 追加。
-- **待宿主一句话**：㊺ + ㊻ 一起推 + 上生产？（存量译文要吃 ㊻ 的修复**不需要重新提取**，
-  但译文得重翻 —— 定点重翻入口已有，是否回填由宿主定。）
+- **已上生产（2026-09-19 21:3x，宿主「是的」）**：`3a97be3`（代码+测试+docs+前端）+ `dc33f1d`（记忆）
+  → CI `35445917918` 六 job 全绿 → `revision=dc33f1d` / healthy / 公网 200 /
+  bundle `index-0jO-MLvR.js`+`index-B92NFYDf.css`（与本地 `cmp` 逐字节一致）/ 日志零 error；
+  备份 `/tmp/{papershelf.db,.env}.bak.20260919-213003`。**容器内直调自证**（零 token）：
+  `CTX_NEIGHBORS=2`/`_MIN_SEAM_WORDS=(6,3)`/跨页眉接缝 `b-0026→b-0028` 认出且三块留在同一片/提示词含整句原文。
+  **真浏览器**：㊺ 工具栏 Esc 取消（库零变化）+ 抽屉改 3→8（`progress=8`，`status_at`/`last_read_at`/
+  `notes 18`/`highlights 427` 全未变）→ 还原回 3；三模式 `378/182 · 0/378 · 378/0`、零 console error、零横向溢出。
+  ⚠️ 宿主那个生产标签页又是**化石**（旧 bundle `index-DLx3KrxJ.js`）→ 硬刷才见新界面。
+  ⚠️ 页面上看不到 ㊻ 的变化是**预期**（动的是翻译阶段，旧译文不会自己变）。
+- **待宿主一句话**：存量译文要不要按 ㊻ 回填（**不必**重新提取，定点重翻即可）？

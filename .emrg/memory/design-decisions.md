@@ -2699,3 +2699,40 @@ v11 解析**的 —— 而它**就是宿主报的那篇**（同 PDF：第 5 页�
 - 存量文献要吃修复**不需要**「重新提取」（解析器一个字节没动、`PARSE_VERSION` 不变）——
   但**译文要重跑**才会变（`reextract` 会 `DELETE notes/highlights`！）。
   ⚠️ 定点重翻（`only=…`）的入口已有（块级修订 / `cli translate`），**存量要不要回填由宿主定**。
+
+### 六、上线与生产验收（2026-09-19 21:3x，宿主「是的」= 推 + 上生产）
+
+`3a97be3`（代码 + 测试 + docs + 前端，㊻ 与 ㊺ 一并）+ `dc33f1d`（记忆）→ CI run **35445917918 六 job 全绿**
+（test 56s / build amd64 42s / build arm64 38s / merge 24s / smoke 18s / verify 13s）→
+生产 `docker compose pull app && up -d app`：**这次零 `Retrying`**（21:32→21:34，约 2 分钟）。
+`revision=dc33f1d` / **healthy** / 公网 health 200（`llm_configured:true`）/
+bundle `index-0jO-MLvR.js` + `index-B92NFYDf.css`（`cmp` 与本地构建产物**逐字节一致**）/ 日志零 error。
+DB 与 `.env` 事前备份：`/tmp/papershelf.db.bak.20260919-213003`、`/tmp/.env.bak.20260919-213003`
+（部署前 revision 为 `6ec00943`）。备份手法：`docker cp papershelf:/data/papershelf.db …`（容器内**没有** `wget`）。
+
+**容器内直调自证**（零 token、零数据改动）：`PARSE_VERSION=14`（㊻ 未动解析器，与上轮相同）/
+`CTX_NEIGHBORS=2` / `_MIN_SEAM_WORDS=(6,3)` / `seam_pairs`·`_seam_note`·`_ctx_before` 三件俱全 /
+规则 7 含动作指令；现造「正文 → `band=top` 页眉 → 正文」→ `seam_pairs` 回
+`[('b-0026','b-0028')]`、`chunk(max_blocks=1, keep_together)` 把**三块**留在同一片、
+提示词里含那句完整原文、`_ctx_before` 跳过页眉；`papers.py` 里 `progress_by` 在位。
+
+**真浏览器验收（生产 paper 2，宿主已登录标签页 + 真实鼠标/键盘事件）**
+- ⚠️ 宿主那个生产标签页是**化石**（bundle 还是上一版 `index-DLx3KrxJ.js`、工具栏只有 `SPAN:进度 73%`）
+  ⇒ 硬刷后出现 `index-0jO-MLvR.js` + `BUTTON.meta.prog-edit|进度 3%`（**又一次印证"改前端必须硬刷"**）。
+- **㊺ 工具栏**：真实鼠标点「进度 3%」→ 输入框出现且 `value=3`、`selectionStart/End=0/1`（**全选**）；
+  真实 `Esc` → 回到「进度 3%」、`input` 消失、**库零变化**（`progress 3 / status_at / last_read_at / notes 18 / highlights 427` 全部未动）。
+- **㊺ 抽屉**：按内容（`T. Herzog` 那行，**不是按行号** —— 库按 `updated_at DESC` 排）点「编辑」→
+  真实鼠标点进度框 + 真实退格清空 + 真实按键打 `8` → 「保存」→ 列表变「在读 8%」；
+  查库 `progress=8`、**`status_at` 与 `last_read_at` 一个字未变**、`notes/highlights` 未变 ✅
+  ⇒ **手改不留阅读痕迹**这条语义在生产上真的成立。
+- **还原**：同样路径改回 `3`，查库回到起点（`progress=3` / `status_at=2026-09-19T07:12:21` /
+  `last_read_at=2026-09-19T13:39:57` / `notes 18` / `highlights 427`）。
+  ⚠️ 诚实边界：**`updated_at` 被这两次 PATCH 推到 `2026-09-20T00:49`**（任何 PATCH 都会），
+  但 paper 2 本来就是最近更新那一篇 ⇒ **文献库行序未变**，无可见痕迹。
+- **三模式回归**（paper 2，438 块）：中英对照 `en 378 / zh 182`、仅中文 `en 0 / zh 378`、
+  仅原文 `en 378 / zh 0`，还原后一致；**控制台零 error**、**零横向溢出**。
+- 验收期间新开的两页已 `Target.closeTarget` 关掉，宿主的两个标签页原样保留。
+
+⚠️ **页面上看不到 ㊻ 的变化是预期**：这次动的是**翻译阶段**，生产 4 篇的译文是旧的
+（要看得重翻）。**存量要不要回填由宿主定** —— 定点重翻入口已有，且**不必**走「重新提取」
+（后者会 `DELETE notes/highlights`，㊹ 修订二 的教训）。
