@@ -198,7 +198,7 @@ shares(
 | `h1`–`h4` | `{level}` | 标题（`h2.sec` / `h3.sub` / `h4`） |
 | `p` | — | 段落 |
 | `abstract` | — | 摘要框 |
-| `figure` | `{src, caption, wide}` | `<figure><img><figcaption>` |
+| `figure` | `{src, caption, page, bbox}` | `<figure><img><figcaption>`；图注文字在 **`en`/`zh` 两栏**（`caption` 是解析记下的原始图注，`en` 为空时渲染回落它）⇒ **图注可「编辑此块」/「重译此块」**（宿主 2026-09-20），但类型不可改（图靠 `src`） |
 | `table` | `{caption, caption_zh, rows, rows_zh}` | 阅读器 `.booktbl`（逐格双语）、**导出/分享** `<table class="datatable">`（服务端 `markup` 渲染）；`rows`/`rows_zh` 是**等宽二维数组**（第一行表头），前端按三模式**逐格**选英/中（中英同形的格子只渲一支，㊴） |
 | `eq` | `{latex, number}` | `<div class="eq">\[…\tag{N}\]</div>` |
 | `meta` | `{authors, affil, journal, doi}` | 页眉信息块 |
@@ -259,6 +259,13 @@ PATCH  /api/docs/{paper_id}/blocks/{block_id}  {en?, zh?, type?, reconciled?}  #
 POST   /api/docs/{paper_id}/blocks            {after?|before?, en?, zh?, type?, level?}  # 插入 → 201
 DELETE /api/docs/{paper_id}/blocks/{block_id} # 删除（回 notes_unanchored / highlights_deleted / quotes）
 POST   /api/docs/{paper_id}/blocks/{block_id}/retranslate  # ⑯ 重译此块
+# ⚠️ 两个按钮的**开放范围不同**（各有一份名单，前后端逐字钉住，见 `tests/test_blockops.py`）：
+#   「编辑此块」= 文字在 `en`/`zh` 里的块 `TEXT_TYPES`（含 **图注 `figure`**，宿主 2026-09-20）；
+#     改图注时 `payload["caption"]` 同步更新（解析/①c 读它）；图注块的**类型不可改**（图靠 payload.src）。
+#   「重译此块」= 可能有中文的块 `RETRANSLATE_TYPES`（正文/标题/摘要/图注/表格/文献条目）；
+#     名单外的 `refs`（文献碎片）/`eq`/`deco` 不该有这个按钮（点下去只会收到一条 400）。
+#   「插入新块」只能用 `NEW_TYPES`（= `TEXT_TYPES` - `figure`）：新块没有 `payload.src`，
+#     跟着图注块变成 `figure` 只会得到"有字没图"的空壳。
 GET    /api/papers/{id}/export?lang=zh|en|dual # 合成单文件 HTML（⑳）
 
 # 笔记

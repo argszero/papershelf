@@ -38,14 +38,22 @@ type Rail = 'notes' | 'outline'
 const FS_MIN = 12
 const FS_MAX = 21
 
-/** 手工能编辑/改类型的块类型 —— **必须与服务端 `blockops.TEXT_TYPES` 一致**
- *  （前端多给一个按钮 = 点下去收到 400）。其余类型（`figure`/`table`/`deco`/`eq`）的内容在
- *  `payload` 里（图片名 / 网格 / LaTeX），不在 `en`/`zh` 里，凭空造一个只会渲染成空白。
+/** 「编辑此块」对哪些类型开放 = **文字在 `en`/`zh` 里**的块 —— **必须与服务端
+ *  `blockops.TEXT_TYPES` 一致**（前端多给一个按钮 = 点下去收到 400）。
+ *  `figure` 在里面：它的文字就是**图注**（两栏就是 `en`/`zh`），图片本体的文件名另在
+ *  `payload.src` —— 与 `table`/`deco`/`eq` 那种"内容全在 payload"的块不是一回事
+ *  （改它们的 `en`/`zh` 改的是看不见的东西，所以不开放）。
  *  `h1` 不在其中：正文不产生 h1 块（解析时 h1 全被收进论文标题，`parse._finalize`），
  *  标题文字改的是元数据，不是块。 */
-const TEXT_TYPES = new Set(['p', 'h2', 'h3', 'h4', 'abstract', 'refs', 'ref'])
-/** 编辑抽屉里可选的块类型（比 `TEXT_TYPES` 少 `refs`/`ref` —— 参考文献的样式是**块类型自带**的，
- *  手改类型只会把一段正文变成参考文献的样子；真要改，改的是内容不是类型）。 */
+const TEXT_TYPES = new Set(['p', 'h2', 'h3', 'h4', 'abstract', 'refs', 'ref', 'figure'])
+/** 「重译此块」对哪些类型开放 = **可能有中文**的块 —— 比 `TEXT_TYPES` 多 `table`/`ref`
+ *  （它们各走自己的翻译通道，译文不只在 `zh` 里，端点会连 `payload` 一起回写），
+ *  少 `refs`（文献碎片整块免中文，给它按钮只会点出一条 400）。
+ *  与服务端 `blockops.RETRANSLATE_TYPES` 一致。 */
+const RETRANSLATE_TYPES = new Set(['p', 'h2', 'h3', 'h4', 'abstract', 'figure', 'table', 'ref'])
+/** 编辑抽屉里可选的块类型（比 `NEW_TYPES` 少 `refs`/`ref` —— 参考文献的样式是**块类型自带**的，
+ *  手改类型只会把一段正文变成参考文献的样子；真要改，改的是内容不是类型）。
+ *  `figure` 不在任何一侧：图之所以是图取决于 `payload.src`，造一个只会得到"有字没图"的空壳。 */
 const TYPE_OPTIONS: Array<{ v: string; label: string }> = [
   { v: '', label: '（不改类型）' },
   { v: 'p', label: '正文段落' },
@@ -863,6 +871,10 @@ export function ReaderPage() {
   }
 
   const title = paper?.title || String(meta.title_zh || meta.title_en || `文献 #${pid}`)
+  /** 抽屉里正在编辑的那一块（插入时没有）—— **图注块**要换个说法，且类型不可改。 */
+  const editingBlock = editing && !editing.isNew
+    ? blocks.find((x) => x.id === editing.id) : undefined
+  const editingFigure = editingBlock?.type === 'figure'
 
   return (
     <>
@@ -990,7 +1002,8 @@ export function ReaderPage() {
                         {b.needs_review && <span className="chip warn">待校对</span>}
                         {/* 三个原语（宿主 2026-09-20）：插入 / 编辑 / 删除。
                             「插入」对**任何**块都开放（图、表旁边也常要补一句）；
-                            「编辑」只对文字块开放（`payload` 类块的文字不在 en/zh 里）。 */}
+                            「编辑」只对文字块开放（`payload` 类块的文字不在 en/zh 里）；
+                            「重译」按"可能有中文"判（含图注 / 表格 / 文献条目）。 */}
                         <button className="bt-ins" title="在这一块前面插入一个新块"
                                 onClick={() => openInsert(b, 'before')}>↑ 上方插入</button>
                         <button className="bt-ins" title="在这一块后面插入一个新块（拆分的一半）"
@@ -999,8 +1012,11 @@ export function ReaderPage() {
                           <button title="改这一块的原文/译文/类型（拆分 = 插入 + 把字剪走）"
                                   onClick={() => openEdit(b)}>编辑此块</button>
                         )}
-                        {TEXT_TYPES.has(b.type) && (
-                          <button onClick={() => void retranslate(b)}>重译此块</button>
+                        {RETRANSLATE_TYPES.has(b.type) && (
+                          <button title={b.type === 'figure' ? '重新翻译这一块的图注'
+                                 : b.type === 'table' ? '重新翻译这张表（连格子里一起）'
+                                 : '重新翻译这一块'}
+                                  onClick={() => void retranslate(b)}>重译此块</button>
                         )}
                         <button onClick={() => { setRail('notes'); setSelBlock(b.id); setTarget(null) }}>加笔记</button>
                         <button className="bt-del" title="删除这一块（合并的一半）"
@@ -1126,7 +1142,7 @@ export function ReaderPage() {
               <strong style={{ flex: 1 }}>
                 {editing.isNew
                   ? `插入新块 · 在 ${editing.id} 的${editing.side === 'before' ? '上方' : '下方'}`
-                  : `编辑块 · ${editing.id}`}
+                  : editingFigure ? `编辑图注 · ${editing.id}` : `编辑块 · ${editing.id}`}
               </strong>
               <button className="ghost" onClick={() => setEditing(null)}>取消</button>
             </header>
@@ -1138,15 +1154,21 @@ export function ReaderPage() {
                   两栏各按自己的坐标系重锚批注，<b>前后未动的块一条都不受影响</b>。
                 </p>
               )}
+              {editingFigure && (
+                <p className="meta" style={{ margin: 0, lineHeight: 1.75 }}>
+                  这是<b>图注</b>块 —— 图片本体不在文字里（渲染端按 <code>payload.src</code> 出图），
+                  这里改的就是图注那两栏。改原文会连带更新解析记下的原始图注；中文留空则该栏回落英文。
+                </p>
+              )}
               <div>
-                <label>原文（英文）{editing.isNew && ' · 留空则是一段待补的空块'}</label>
+                <label>{editingFigure ? '图注 · 原文（英文）' : '原文（英文）'}{editing.isNew && ' · 留空则是一段待补的空块'}</label>
                 <textarea className="textarea" rows={7} value={editing.en}
-                          placeholder="粘贴/输入这一段原文…"
+                          placeholder={editingFigure ? '图注原文（如 Fig. 3 …）…' : '粘贴/输入这一段原文…'}
                           onChange={(e) => setEditing({ ...editing, en: e.target.value })} />
               </div>
               <div>
                 <label>
-                  中文译文
+                  {editingFigure ? '图注 · 中文译文' : '中文译文'}
                   {!editing.isNew && '（保存后标记为「人工修订」，重跑不会被覆盖）'}
                   {editing.isNew && '（留空会标「待校对」，可随后「重译此块」）'}
                 </label>
@@ -1154,17 +1176,21 @@ export function ReaderPage() {
                           placeholder="中文…"
                           onChange={(e) => setEditing({ ...editing, zh: e.target.value })} />
               </div>
-              <div>
-                <label>块类型</label>
-                <select className="input" value={editType} aria-label="块类型"
-                        onChange={(e) => setEditType(e.target.value)}>
-                  {editing.isNew
-                    ? [{ v: '', label: '（跟随相邻块的类型）' }, ...TYPE_OPTIONS.slice(1)].map((o) => (
-                        <option key={o.v} value={o.v}>{o.label}</option>))
-                    : TYPE_OPTIONS.map((o) => (
-                        <option key={o.v} value={o.v}>{o.label}</option>))}
-                </select>
-              </div>
+              {/* 图注块**不给类型选择**：图之所以是图取决于 `payload.src`，改成正文会让图从页面上
+                  消失（库里还在、只是没人渲染它了）。服务端也会拒（`blockops.edit_block`）。 */}
+              {!editingFigure && (
+                <div>
+                  <label>块类型</label>
+                  <select className="input" value={editType} aria-label="块类型"
+                          onChange={(e) => setEditType(e.target.value)}>
+                    {editing.isNew
+                      ? [{ v: '', label: '（跟随相邻块的类型）' }, ...TYPE_OPTIONS.slice(1)].map((o) => (
+                          <option key={o.v} value={o.v}>{o.label}</option>))
+                      : TYPE_OPTIONS.map((o) => (
+                          <option key={o.v} value={o.v}>{o.label}</option>))}
+                  </select>
+                </div>
+              )}
               {!editing.isNew && (
                 <p className="meta" style={{ margin: 0, lineHeight: 1.7 }}>
                   改了原文而没改译文 ⇒ 会如实挂「待校对」（老译文与新原文已对不上）。

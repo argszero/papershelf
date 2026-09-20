@@ -158,7 +158,12 @@ def retranslate_block(paper_id: int, block_id: str,
                       conn: sqlite3.Connection = Depends(get_conn),
                       user: dict[str, Any] = Depends(current_user),
                       settings: Settings = Depends(get_settings)) -> dict[str, Any]:
-    """只重译这一块（决策⑯ 的「重译此块」）。上下文取前后各一块。"""
+    """只重译这一块（决策⑯ 的「重译此块」）。上下文取前后各一块。
+
+    能重译的是"**可能有中文**"的块（`blockops.RETRANSLATE_TYPES`）：正文/标题/摘要、
+    **图注**（宿主 2026-09-20）、表格、文献条目。表格与文献条目各走自己的通道（㊴/㊹），
+    译文不只在 `zh` 里 —— 所以下面要把 `payload` 里那几项一起回写。
+    """
     paper = require_paper(conn, paper_id, user)
     rows = conn.execute("SELECT * FROM blocks WHERE paper_id=? ORDER BY ord",
                         (paper_id,)).fetchall()
@@ -177,11 +182,23 @@ def retranslate_block(paper_id: int, block_id: str,
     idx = [i for i, b in enumerate(ordered) if b.id == block_id][0]
     target_block = ordered[idx]
 
-    if not settings.llm_base_url or not settings.llm_api_key:
-        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "服务端未配置 LLM")
+    # ⚠️ **这是本轮真机验收抓到的真缺陷**（不是新写的代码，是原来就有的）：
+    # `translate_blocks` 会跳过 `zh_source == "human"` 的块（⑯：**重跑**不得覆盖人工修订），
+    # 而"重译此块"恰恰是**用户明说"用机器译文覆盖这一块"**。两者撞在一起时：
+    # todo 为空 → 返回的是那一块的**旧中文** → 端点以为"译好了" → 把旧 `zh` 原样写回，
+    # 还顺手把 `zh_source` 从 `human` 降级成 `mt` —— 表现是
+    # **「点了重译没变化，『已人工修订』标记却消失了」**（既没重译，又丢了来源）。
+    # 所以：给**这一份副本**摘掉来源戳，让翻译器真的去翻它。
+    target_block.zh_source = "none"
+
+    # ⚠️ 顺序要紧：**"这一块本来就没有可译的文字"是一个与 LLM 无关的事实**，
+    #    放在"服务端未配置 LLM"之前答 —— 否则运维没配 Key 时，用户点一个
+    #    永远不可能成功的按钮会收到"未配置 LLM"，去查配置查半天（真因是按钮不该有）。
     if not expects_chinese(target_block.en, block_type=target_block.type):
         raise HTTPException(status.HTTP_400_BAD_REQUEST,
-                            "该块按规则保持原文（公式/参考文献），无需翻译")
+                            "这一块没有需要翻译的文字（公式/装饰图/参考文献碎片保持原文）")
+    if not settings.llm_base_url or not settings.llm_api_key:
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "服务端未配置 LLM")
 
     cfg = LLMConfig(base_url=settings.llm_base_url, api_key=settings.llm_api_key,
                     model=settings.llm_model)

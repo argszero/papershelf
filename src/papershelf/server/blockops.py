@@ -45,10 +45,30 @@ from .repo import load_doc, write_doc
 
 log = logging.getLogger("papershelf.blockops")
 
-# 手工能插入 / 改类型的块类型。其余类型（`figure` / `table` / `deco` / `eq`）的**内容不在
-# `en`/`zh` 里**，而在 `payload`（图片文件名、网格、LaTeX 源码）—— 凭空造一个只会渲染成空白，
-# 所以这里不接受（要改这类块请走 ①c 那套工具或重新提取）。
-TEXT_TYPES = ("p", "h2", "h3", "h4", "abstract", "refs", "ref")
+# ── 两个名单（宿主 2026-09-20：「图片说明的 block，也应该支持『编辑此块』和『重译此块』」）──
+#
+# 这两个名单必须分开，因为它们回答的是**两个不同的问题**：
+#
+# `TEXT_TYPES`：「这一块的文字在 `en`/`zh` 里吗？」⇒ 在 ⇒ 「编辑此块」开放。
+#   图注块（`figure`）**在里面**：它的文字就是图注，正是 `en`/`zh` 两栏（图片本体另在
+#   `payload["src"]`，与 `deco`/`table`/`eq` 那种"内容全在 payload"的块不是一回事）。
+#   其余类型（`table`/`deco`/`eq`）的文字在 `payload`（网格 / 无字 / LaTeX 源码）——
+#   拿 `en`/`zh` 去改它们改的是**看不见的东西**，所以不开放。
+#   `h1` 不在其中：正文不产生 h1 块（`parse._finalize` 把 h1 收进论文标题，标题改元数据）。
+TEXT_TYPES = ("p", "h2", "h3", "h4", "abstract", "refs", "ref", "figure")
+
+# `NEW_TYPES`：**手工新建块或改类型**时可选的名字 ⇒ `figure` 不在其中。
+#   一个块是不是图，取决于 `payload["src"]` 有没有图片（渲染端按它出 `<img>`）——
+#   凭一个下拉框造出 `figure` 只会得到"有图注、没图"的空壳；反过来把正文改成图注
+#   则会让图**从页面上消失**（图还在库里，只是没人渲染它了）。所以类型在两侧都不许跨。
+NEW_TYPES = ("p", "h2", "h3", "h4", "abstract", "refs", "ref")
+
+# 「重译此块」对哪些类型开放：**可能有中文**的块（`validate.expects_chinese` 可能为真，
+# 具体还取决于文字本身）。名单外的是 `refs`（文献碎片，整块免中文 —— 给它按钮只会
+# 点出一条 400）、`deco`（无字）、`eq`（公式）、`meta`/`h1`（正文不产生）。
+# 表格与文献条目在名单里：它们各走自己的翻译通道（决策㊴/㊹），端点会连
+# `payload` 里的网格 / 标题一起回写。
+RETRANSLATE_TYPES = ("p", "h2", "h3", "h4", "abstract", "figure", "table", "ref")
 
 _ID_RE = re.compile(r"^b-(\d+)$")
 
@@ -180,6 +200,10 @@ def edit_block(conn: sqlite3.Connection, paper_id: int, block_id: str, *,
       自己改），但挂上「待校对」（`needs_review`）—— 这是**如实**标记，而不是悄悄留一段对不上的中文。
     - **两栏各按自己的坐标系重新锚定**（`en` 的变化只动 `lang='en'` 的批注，`zh` 的变化只动
       `lang='zh'` 的）：中英没有字级对应，按比例换算就是猜（㉛ 的同一条理由）。
+    - **图注块（`figure`）照样能编辑**（宿主 2026-09-20：「图片说明的 block，也应该支持
+      『编辑此块』和『重译此块』」）—— 它的文字就是 `en`/`zh` 两栏的图注。改原文时
+      `payload["caption"]` 一起跟着改（那是解析/①c 读的原始记录，不写会分叉）；但**类型不许改**
+      （图之所以是图，取决于 `payload["src"]`）。
     """
     row = conn.execute("SELECT * FROM blocks WHERE paper_id=? AND id=?",
                        (paper_id, block_id)).fetchone()
@@ -187,13 +211,27 @@ def edit_block(conn: sqlite3.Connection, paper_id: int, block_id: str, *,
         return {"ok": False, "code": "not_found", "reason": "块不存在"}
     if en is None and zh is None and type is None:
         return {"ok": False, "code": "bad_args", "reason": "没有要修改的内容"}
-    if type is not None and type not in TEXT_TYPES:
-        return {"ok": False, "code": "bad_args", "reason": f"类型只能是 {'/'.join(TEXT_TYPES)}"}
+    if type is not None and type not in NEW_TYPES:
+        return {"ok": False, "code": "bad_args", "reason": f"类型只能是 {'/'.join(NEW_TYPES)}"}
+    if type is not None and (row["type"] or "") == "figure":
+        # 图注块的类型不能改：它是图**因为它有 `payload["src"]`**，不是因为名字叫 figure。
+        # 允许改成 `p` 的后果是图**从页面上消失**（图还在库里，只是没有渲染分支认它了）——
+        # 一种"保存成功但内容没了"的静默损失，与批注那三条不变量同一个取向：宁可拒绝。
+        return {"ok": False, "code": "bad_args",
+                "reason": "图注块的类型不能改（图片由 payload.src 决定）；要改文字直接改图注"}
 
     old_en, old_zh = row["en"] or "", row["zh"] or ""
     new_en = old_en if en is None else en
     new_zh = old_zh if zh is None else zh
     payload = load_json(row["payload"], {})
+
+    if new_en != old_en and (row["type"] or "") == "figure":
+        # ⚠️ 图注的**原文有两个记录位**，手改必须一起写，否则会分叉：
+        #   · `en` = 渲染与翻译判定读的那一份（`markup.render_block`、`expects_chinese`）；
+        #   · `payload["caption"]` = 解析时的原始记录，**①c 校对 agent 读它**
+        #     （`proofread` 里 `b.payload.get("caption")`），`zh` 为空时渲染也回落它。
+        # 只改 `en` 的表现是"中文栏还显示改之前那句英文图注"（回落取的是旧 caption）。
+        payload["caption"] = new_en
 
     # ⚠️ `sets` 与 `args` **必须同序构建**：先把 payload 的所有增删定下来，再按
     #    `SET a=?, b=?` 的字面顺序填参数。分开写（先攒 sets 再 append args）会在
@@ -266,8 +304,8 @@ def insert_block(conn: sqlite3.Connection, paper_id: int, *,
     doc = load_doc(conn, paper_id)
     if doc is None:
         return {"ok": False, "code": "no_doc", "reason": "该文献没有产物（转换尚未完成）"}
-    if type is not None and type not in TEXT_TYPES:
-        return {"ok": False, "code": "bad_args", "reason": f"类型只能是 {'/'.join(TEXT_TYPES)}"}
+    if type is not None and type not in NEW_TYPES:
+        return {"ok": False, "code": "bad_args", "reason": f"类型只能是 {'/'.join(NEW_TYPES)}"}
     idx = None
     for key, value, delta in (("after", after, 1), ("before", before, 0)):
         if value is None:
@@ -280,7 +318,9 @@ def insert_block(conn: sqlite3.Connection, paper_id: int, *,
         return {"ok": False, "code": "bad_args", "reason": "必须指定 after 或 before（在哪一块的前/后插入）"}
 
     ref = doc.blocks[idx - 1] if idx > 0 else doc.blocks[idx]
-    typ = type or (ref.type if ref.type in TEXT_TYPES else "p")
+    # ⚠️ 用 `NEW_TYPES`（不是 `TEXT_TYPES`）：在图注块旁边插入时**不能**跟着它变成 `figure`
+    # —— 新块没有 `payload["src"]`，只会渲染成"有字没图"的空壳（见上面两个名单的说明）。
+    typ = type or (ref.type if ref.type in NEW_TYPES else "p")
     level_ = ref.level if level is None else level
     if not typ.startswith("h"):
         level_ = 0

@@ -27,7 +27,10 @@ from pathlib import Path
 import pytest
 
 from papershelf.pipeline.model import Block, Doc
+from papershelf.pipeline.translator import Translator
 from papershelf.server.blockops import (
+    NEW_TYPES,
+    RETRANSLATE_TYPES,
     TEXT_TYPES,
     delete_block,
     edit_block,
@@ -422,23 +425,251 @@ def test_endpoints_refuse_other_peoples_papers(client, owned, make_user):
 
 
 def test_text_types_matches_the_frontend_contract():
-    """服务端的名单本身：`figure`/`table`/`deco`/`eq` 的内容在 `payload` 里，
-    凭空造一个只会渲染成空白；`h1` 不在其中（正文不产生 h1 块，标题改的是元数据）。"""
-    assert set(TEXT_TYPES) == {"p", "h2", "h3", "h4", "abstract", "refs", "ref"}
-    for t in ("figure", "table", "deco", "eq", "h1"):
-        assert t not in TEXT_TYPES
+    """服务端的两个名单：**可编辑**（文字在 `en`/`zh` 里）与**可新建**（能凭一个下拉框造出来）。
+
+    - `figure` 只在**可编辑**那一侧（宿主 2026-09-20：「图片说明的 block，也应该支持
+      『编辑此块』和『重译此块』」）—— 图注文字就是 `en`/`zh`；但**不能新建**
+      （新块没有 `payload.src`，只会得到"有字没图"的空壳），也不能把正文改成它。
+    - `table`/`deco`/`eq` 的文字在 `payload`（网格 / 无字 / LaTeX 源码）—— 改 `en`/`zh`
+      改的是看不见的东西，两侧都不接受；`h1` 同理（正文不产生 h1 块，标题改的是元数据）。
+    """
+    assert set(TEXT_TYPES) == {"p", "h2", "h3", "h4", "abstract", "refs", "ref", "figure"}
+    assert set(NEW_TYPES) == {"p", "h2", "h3", "h4", "abstract", "refs", "ref"}
+    for t in ("table", "deco", "eq", "h1"):
+        assert t not in TEXT_TYPES and t not in NEW_TYPES
+    assert "figure" in TEXT_TYPES and "figure" not in NEW_TYPES
+
+
+def test_retranslate_types_are_exactly_the_ones_that_can_carry_chinese():
+    """「重译此块」的名单要**由"这一块可能有中文吗"决定**，不能凭手感挑。
+
+    判据落在 `validate.expects_chinese` 上（翻译器与校验器共用的那一个），
+    所以这条护栏问的是行为而不是常量：名单里每个类型都得能"要出中文"，名单外的一个都不能。
+    反例正是 `refs`（文献碎片，整块免中文）—— 它原来在名单里，按钮点下去只会收到一条 400。
+    """
+    from papershelf.pipeline.validate import NO_ZH_TYPES, expects_chinese
+
+    prose = "This section reviews the machine learning methods used in additive manufacturing."
+    for t in RETRANSLATE_TYPES:
+        assert expects_chinese(prose, block_type=t), f"{t} 在名单里却要不出中文"
+        assert t not in NO_ZH_TYPES
+    for t in ("refs", "eq", "deco", "meta", "h1"):
+        assert t not in RETRANSLATE_TYPES, f"{t} 不该有「重译此块」按钮"
+    # 表格与文献条目在名单里（它们各走自己的翻译通道，端点会把 payload 一起回写）
+    assert {"table", "ref", "figure"} <= set(RETRANSLATE_TYPES)
 
 
 def test_frontend_type_list_is_the_same_as_the_server():
-    """**跨边界护栏**：前端 `Reader.tsx` 的 `TEXT_TYPES` 必须与服务端逐字一致。
+    """**跨边界护栏**：前端 `Reader.tsx` 的 `TEXT_TYPES` / `RETRANSLATE_TYPES`
+    必须与服务端逐字一致。
 
     两边是各写一份的常量（前端在浏览器里，后端在 Python 里），漂开的表现是
     "工具条上多了一个按钮，点下去收到 400"—— 本地不点就发现不了。
-    这条护栏直接读前端源码里的那个字面量（不跑浏览器），漂了就红。
+    这条护栏直接读前端源码里的那两个字面量（不跑浏览器），漂了就红。
     """
     src = (Path(__file__).resolve().parents[1]
            / "web" / "src" / "pages" / "Reader.tsx").read_text(encoding="utf-8")
-    m = re.search(r"const TEXT_TYPES = new Set\(\[([^\]]*)\]\)", src)
-    assert m, "前端找不到 TEXT_TYPES 常量（改名了？这条护栏要跟着改）"
-    front = {t.strip().strip("'\"") for t in m.group(1).split(",") if t.strip()}
-    assert front == set(TEXT_TYPES), f"前端 {sorted(front)} ≠ 服务端 {sorted(TEXT_TYPES)}"
+
+    def literal(name: str) -> set[str]:
+        m = re.search(rf"const {name} = new Set\(\[([^\]]*)\]\)", src)
+        assert m, f"前端找不到 {name} 常量（改名了？这条护栏要跟着改）"
+        return {t.strip().strip("'\"") for t in m.group(1).split(",") if t.strip()}
+
+    assert literal("TEXT_TYPES") == set(TEXT_TYPES), \
+        f"前端 {sorted(literal('TEXT_TYPES'))} ≠ 服务端 {sorted(TEXT_TYPES)}"
+    assert literal("RETRANSLATE_TYPES") == set(RETRANSLATE_TYPES), \
+        f"前端 {sorted(literal('RETRANSLATE_TYPES'))} ≠ 服务端 {sorted(RETRANSLATE_TYPES)}"
+
+
+# ── 图注块（`figure`）：宿主 2026-09-20「图片说明的 block，也应该支持编辑/重译」───
+#
+# 图注块的特殊之处：**文字（图注）在 `en`/`zh` 里，图在 `payload["src"]` 里**。
+# 所以「编辑图注」是正经的文本编辑，而「改类型」必须挡住 —— 图之所以是图，靠的是
+# `payload.src`，把类型改成 `p` 会让图**从页面上消失**（库里还在，没人渲染它了）。
+
+CAP_EN = "Fig. 1 Overview of the three common types of process equipment."
+CAP_ZH = "图1 AM 中三类常见工艺设备的概览。"
+
+
+def _caption_figure(settings, *, payload_extra: dict | None = None) -> None:
+    """把种子里的 b-0004 换成**真图注块**（有 `src`、有图注文字）—— 原来那块是空壳。"""
+    from papershelf.server.db import connect, dump_json
+
+    payload = {"page": 2, "src": "assets/p2_img2.png", "caption": CAP_EN,
+               "needs_review": True, **(payload_extra or {})}
+    conn = connect(settings)
+    conn.execute("UPDATE blocks SET en=?, payload=? WHERE paper_id=1 AND id='b-0004'",
+                 (CAP_EN, dump_json(payload)))
+    conn.commit()
+
+
+def test_editing_a_figure_caption_keeps_the_parsed_record_in_sync(client, settings, owned):
+    """改图注：`en`/`zh` 照常，且 **`payload["caption"]` 一起跟着改**。
+
+    那两处是同一个事实的两个记录位（`en` 是渲染/翻译判定读的，`payload.caption` 是解析
+    记下的原始图注、①c 读它），不一起写就会分叉 —— 表现是"中文栏还显示改之前那句英文图注"。
+    """
+    from papershelf.server.db import connect, load_json
+
+    pid = owned["pid"]
+    _caption_figure(settings)
+    conn = connect(settings)
+    new_en = "Fig. 1 (revised) Overview of the three types of process equipment."
+    r = client.patch(f"/api/docs/{pid}/blocks/b-0004",
+                     json={"en": new_en, "zh": CAP_ZH})
+    assert r.status_code == 200, r.text
+    got = r.json()
+    assert got["id"] == "b-0004" and got["zh"] == CAP_ZH and got["zh_source"] == "human"
+    assert CAP_ZH in got["zh_html"] and "figcaption" in got["zh_html"]
+    assert got["payload"]["caption"] == new_en          # ⚠️ 这一条是整条用例的重点
+    row = conn.execute("SELECT en, zh, zh_source, payload FROM blocks WHERE id='b-0004'"
+                       ).fetchone()
+    assert row["en"] == new_en and row["zh_source"] == "human"
+    assert load_json(row["payload"], {})["caption"] == new_en
+
+
+def test_figure_type_cannot_be_changed_or_created(client, settings, owned):
+    """图注块的类型**两侧都锁死**：不能把图改成正文，也不能用下拉框造一个新 figure。
+
+    改 type 的后果是"保存成功、图没了"—— 一种没报错、没日志的静默损失，所以宁可拒绝。
+    """
+    pid = owned["pid"]
+    _caption_figure(settings)
+    r = client.patch(f"/api/docs/{pid}/blocks/b-0004", json={"type": "p"})
+    assert r.status_code == 400
+    assert "图注" in r.json()["detail"]
+    assert client.post(f"/api/docs/{pid}/blocks",
+                       json={"after": "b-0004", "en": "x", "type": "figure"}).status_code == 400
+
+
+def test_insert_next_to_a_figure_falls_back_to_a_paragraph(client, settings, owned):
+    """在图注块旁边插新块 ⇒ 类型**回落 `p`**（跟着它变成 figure 只会得到"有字没图"的空壳）。"""
+    pid = owned["pid"]
+    _caption_figure(settings)
+    new_id = client.post(f"/api/docs/{pid}/blocks",
+                         json={"after": "b-0004", "en": "Added.", "zh": "补一句。"}).json()["id"]
+    doc = client.get(f"/api/papers/{pid}/doc").json()
+    types = {b["id"]: b["type"] for b in doc["blocks"]}
+    assert types[new_id] == "p"
+    assert {b["id"]: b["type"] for b in doc["blocks"]}["b-0004"] == "figure"   # 参照块不变
+
+
+# ── 端点：重译图注 / 表格（把翻译器换成按剧本回话的替身，通道与护栏都是真的）────
+class _Scripted(Translator):
+    """按剧本回一段 HTML / JSON 的假 LLM（`_chat` 是唯一被换掉的那一层）。
+
+    ⚠️ 剧本写在**类属性**上：`Translator` 实例是**每个请求现造**的
+    （端点里 `Translator(cfg, glossary)`），测试拿不到那个对象，写进实例只会白写。
+    """
+
+    reply = ""
+
+    def _chat(self, user: str, system: str | None = None) -> str:
+        return self.reply
+
+
+@pytest.fixture()
+def scripted_llm(monkeypatch):
+    """给端点接上一个可控的 LLM（同时把 LLM 配置塞进 Settings，否则端点先 503）。"""
+    from papershelf.server.config import get_settings
+    from papershelf.server.routers import blocks as router
+
+    monkeypatch.setattr(router, "Translator", _Scripted)
+    monkeypatch.setenv("PAPERSHELF_LLM_BASE_URL", "http://llm.test/v1")
+    monkeypatch.setenv("PAPERSHELF_LLM_API_KEY", "k")
+    get_settings(refresh=True)
+
+    def reply(text: str) -> None:
+        _Scripted.reply = text
+
+    yield reply
+    _Scripted.reply = ""
+
+
+def test_retranslate_a_figure_caption(client, settings, owned, scripted_llm):
+    """图注块走**正文那条 HTML 往返通道**（送 `<figcaption>`、要 `<figcaption>`）。
+
+    回写后：`zh` 是新译文、`zh_source='mt'`（机器译的，不是人工）、
+    并且顺手撤掉种子里的「待校对」（重译成功即"确认无误"）。
+    """
+    from papershelf.server.db import connect, load_json
+
+    pid = owned["pid"]
+    _caption_figure(settings)
+    conn = connect(settings)
+    scripted_llm(f'<figure data-b="b-0004"><figcaption>{CAP_ZH}</figcaption></figure>')
+    r = client.post(f"/api/docs/{pid}/blocks/b-0004/retranslate")
+    assert r.status_code == 200, r.text
+    got = r.json()
+    assert got["zh"] == CAP_ZH and got["zh_source"] == "mt"
+    assert got["needs_review"] is False                 # 「待校对」被撤掉
+    assert CAP_ZH in got["zh_html"] and got["payload"]["caption"] == CAP_EN   # 原文没被译回去
+    assert load_json(conn.execute("SELECT payload FROM blocks WHERE id='b-0004'"
+                                 ).fetchone()["payload"], {}).get("needs_review") is None
+
+
+def test_retranslate_a_fragment_is_refused_with_a_readable_reason(client, settings, owned):
+    """`refs` 碎片（整块免中文）**不该**有按钮 —— 万一被调，也得给一句看得懂的话。"""
+    from papershelf.server.db import connect
+
+    pid = owned["pid"]
+    conn = connect(settings)
+    conn.execute("UPDATE blocks SET type='refs' WHERE paper_id=1 AND id='b-0004'")
+    conn.commit()
+    r = client.post(f"/api/docs/{pid}/blocks/b-0004/retranslate")
+    assert r.status_code == 400
+    assert "没有需要翻译的文字" in r.json()["detail"]
+
+
+def test_retranslate_a_table_writes_the_grid_back(client, settings, owned, scripted_llm):
+    """表格的译文**不只在 `zh` 里**：渲染用的是 `payload.rows_zh`（决策㊴）。
+
+    端点必须把翻译器写在**内存副本**上的网格一起回写，否则表现是"重译了、中文照旧是英文"。
+    图注/表格这两条都是"译文有第二个落点"，所以放在同一个文件里钉。
+    """
+    from papershelf.pipeline.model import table_text
+    from papershelf.server.db import connect, dump_json, load_json
+
+    pid = owned["pid"]
+    conn = connect(settings)
+    rows = [["ML category", "ML model"], ["Supervised", "Naive Bayes (BN)"]]
+    caption = "Table 1. Classifiers."
+    conn.execute("UPDATE blocks SET type='table', en=?, payload=?"
+                 " WHERE paper_id=1 AND id='b-0004'",
+                 (table_text(rows, caption),
+                  dump_json({"page": 2, "rows": rows, "caption": caption})))
+    conn.commit()
+    scripted_llm('{"caption_zh": "表1. 分类器。", "rows_zh": '
+                 '[["机器学习类别", "机器学习模型"], ["监督学习", "朴素贝叶斯（BN）"]]}')
+    r = client.post(f"/api/docs/{pid}/blocks/b-0004/retranslate")
+    assert r.status_code == 200, r.text
+    got = r.json()
+    assert got["payload"]["rows_zh"][1] == ["监督学习", "朴素贝叶斯（BN）"]
+    assert got["payload"]["caption_zh"] == "表1. 分类器。"
+    assert "监督学习" in got["zh"]
+    assert load_json(conn.execute("SELECT payload FROM blocks WHERE id='b-0004'"
+                                 ).fetchone()["payload"], {})["caption_zh"] == "表1. 分类器。"
+
+
+def test_retranslate_overwrites_a_human_caption(client, settings, owned, scripted_llm):
+    """**「重译此块」必须真的重译，哪怕这一块是人工修订过的**（本轮真机验收抓到的真缺陷）。
+
+    病灶：`translate_blocks` 跳过 `zh_source == "human"` 的块（⑯ 保护人工修订不被**重跑**覆盖），
+    而"重译此块"是用户**明说"用机器译文覆盖这一块"**——两者撞在一起时原来会：
+    todo 为空 → 返回那一块的**旧中文** → 端点把旧 `zh` 原样写回、并把 `zh_source` 从
+    `human` 降级成 `mt`（**表现**：点了重译界面纹丝不动，「已人工修订」标记却没了）。
+    """
+    from papershelf.server.db import connect
+
+    pid = owned["pid"]
+    _caption_figure(settings)
+    conn = connect(settings)
+    conn.execute("UPDATE blocks SET zh=?, zh_source='human' WHERE paper_id=1 AND id='b-0004'",
+                 ("人工写的图注。",))
+    conn.commit()
+    scripted_llm(f'<figure data-b="b-0004"><figcaption>{CAP_ZH}</figcaption></figure>')
+    r = client.post(f"/api/docs/{pid}/blocks/b-0004/retranslate")
+    assert r.status_code == 200, r.text
+    got = r.json()
+    assert got["zh"] == CAP_ZH and got["zh_source"] == "mt"      # 真的换成了机器译文
+    assert "人工写的图注" not in got["zh"]
