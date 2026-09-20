@@ -693,6 +693,11 @@ math { font-size: 1.02em; max-width: 100%; }
 .block-tools button { font-size: 12px; padding: 2px 8px; border: 1px solid var(--border);
   border-radius: 6px; background: var(--surface); color: var(--muted); }
 .block-tools button:hover { color: var(--accent); border-color: var(--accent); }
+/* 手工块编辑的三个原语（宿主 2026-09-20）：插入 / 编辑 / 删除。
+   「删除」是**破坏性的**（这一段正文会从产物里消失）⇒ 单独给 danger 色：
+   与「编辑」穿同一身灰底白框时，误点的代价不对称（改错了能改回来，删错了不能）。 */
+.block-tools .bt-del { color: var(--danger); }
+.block-tools .bt-del:hover { color: var(--danger); border-color: color-mix(in oklch, var(--danger) 45%, var(--border)); }
 
 /* ── 进度看板 ───────────────────────────────────────────────────────── */
 .board { display: grid; grid-template-columns: repeat(4, 1fr); gap: 16px; align-items: start; }

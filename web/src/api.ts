@@ -6,8 +6,8 @@
  */
 
 import type {
-  AdminUser, AuthConfig, Block, CodeSent, CurrentUser, GlossaryEntry, HlColor, Lang, Mark, Note,
-  Paper, PaperDoc, Plan, Share, ShareMeta,
+  AdminUser, AuthConfig, Block, BlockEditResult, CodeSent, CurrentUser, GlossaryEntry, HlColor,
+  Lang, Mark, Note, Paper, PaperDoc, Plan, Share, ShareMeta,
 } from './types'
 
 export class ApiError extends Error {
@@ -112,9 +112,26 @@ export const api = {
    *  重拉整篇太大（900 块的文档几百 KB），所以只重拉这一块。 */
   block: (paperId: number, blockId: string) =>
     request<Block>(`/api/docs/${paperId}/blocks/${blockId}`),
-  // 两个端点都回**完整块**（含服务端重渲染的 en_html/zh_html）→ 前端整块替换
-  editBlock: (paperId: number, blockId: string, zh: string, reconciled = true) =>
-    request<Block>(`/api/docs/${paperId}/blocks/${blockId}`, patch({ zh, reconciled })),
+  // 三个端点都回**完整块**（含服务端重渲染的 en_html/zh_html）→ 前端整块替换。
+  // 宿主 2026-09-20：手工修订的三个**原语** —— 插入 / 编辑 / 删除。
+  // 拆分 = 「在它后面插入一块」+「把切出去的字从原块删掉（编辑）」；合并 = 「把下一块接进
+  // 上一块（编辑）」+「删掉下一块」。程序不提供 split/merge 两个动作，也就不猜"这两段
+  // 其实是一句话"。批注只跟着**被改的那一块**走（见 `server/blockops.py`）。
+  // `en`/`type` 可缺省（字段不动）；只改原文时会如实挂「待校对」（老译文与新原文对不上了）。
+  editBlock: (paperId: number, blockId: string,
+              body: { zh?: string; en?: string; type?: string; reconciled?: boolean }) =>
+    request<BlockEditResult>(`/api/docs/${paperId}/blocks/${blockId}`, patch(body)),
+  /** 插入新块。`after`/`before` 二选一；新块取「现有最大号 + 1」⇒ 已有块 id 一个不变，
+   *  钉在它们上面的笔记/划痕天然不受影响。 */
+  insertBlock: (paperId: number, body: {
+    after?: string; before?: string; en?: string; zh?: string; type?: string; level?: number
+  }) => request<Block>(`/api/docs/${paperId}/blocks`, json(body)),
+  /** 删块。返回一份账（`notes_unanchored` / `highlights_deleted` / `quotes`）——
+   *  该块的**笔记内容不删**，只转成「文献级笔记」，所以要把这件事告诉用户。 */
+  deleteBlock: (paperId: number, blockId: string) =>
+    request<{ ok: boolean; id: string; notes_unanchored: number; highlights_deleted: number;
+              quotes: string[] }>(
+      `/api/docs/${paperId}/blocks/${blockId}`, { method: 'DELETE' }),
   retranslateBlock: (paperId: number, blockId: string) =>
     request<Block>(`/api/docs/${paperId}/blocks/${blockId}/retranslate`, { method: 'POST' }),
 

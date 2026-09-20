@@ -47,6 +47,18 @@ export interface Block {
   zh_html?: string
 }
 
+/** 编辑块的返回 = 完整块 + 一份**批注账**（`blockops` 的三条不变量之一：
+ *  静默丢批注是这个功能最坏的失败模式，所以后果必须当场说出来）。
+ *
+ *  `anchors_moved` = 跟随文字平移的批注数；`anchors_dropped` = 文字被删掉、
+ *  批注也随之作废的（`kind='highlight'` 是真消失，`kind='note'` 内容保留、
+ *  只转成「文献级笔记」）；`zh_stale` = 只改了原文，老译文已对不上（已挂「待校对」）。 */
+export interface BlockEditResult extends Block {
+  anchors_moved?: number
+  anchors_dropped?: Array<{ kind?: 'highlight' | 'note'; id?: number; quote?: string }>
+  zh_stale?: boolean
+}
+
 export interface PaperDoc {
   paper_id: number
   meta: Record<string, string>

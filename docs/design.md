@@ -250,7 +250,14 @@ POST   /api/plans/{id}/papers/arxiv          {ref}   # ⑱
 GET    /api/plans/{id}/papers                # 列表（筛选/排序）
 PATCH  /api/papers/{id}                      # status/tags/元数据
 GET    /api/papers/{id}/doc                  # 块级 JSON（阅读器取数，⑳）
-PATCH  /api/docs/{paper_id}/blocks/{block_id}  {zh}   # ⑯ 编辑译文
+# ⑯ 块级修订 = 三个**原语**（宿主 2026-09-20）：插入 / 编辑 / 删除。
+#   拆分 = 「在某块后面插一块」+「把切出去的字从原块剪掉」（编辑）；合并 = 「把下一块的字
+#   接进上一块」（编辑）+「删掉空掉的那一块」。程序**不提供** split/merge 两个动作，
+#   也就不猜"这两段其实是一句话"。批注只跟着**被改的那一块**走（`server/blockops.py`）；
+#   已有块 id 永不重编号（新块取现有最大号 + 1）⇒ 相邻块的笔记/划痕天然不动。
+PATCH  /api/docs/{paper_id}/blocks/{block_id}  {en?, zh?, type?, reconciled?}  # 编辑（回完整块 + 批注账）
+POST   /api/docs/{paper_id}/blocks            {after?|before?, en?, zh?, type?, level?}  # 插入 → 201
+DELETE /api/docs/{paper_id}/blocks/{block_id} # 删除（回 notes_unanchored / highlights_deleted / quotes）
 POST   /api/docs/{paper_id}/blocks/{block_id}/retranslate  # ⑯ 重译此块
 GET    /api/papers/{id}/export?lang=zh|en|dual # 合成单文件 HTML（⑳）
 
@@ -651,7 +658,7 @@ const S       = { get: p => activePlan().status[p.id], set: (id, v) => { activeP
 │  <块 b-0013>          │  <块 b-0013>                     │
 │  …                    │  …            ← 按 data-b 对齐滚动 │
 │                       │                                  │
-│  悬停/点击块：重译此块 · 编辑译文 · 加笔记（⑯）              │
+│  选中块：插入 · 编辑 · 删除 · 重译 · 加笔记（⑯ 三个原语）  │
 └───────────────────────┴──────────────────────────────────┘
 右侧栏：笔记 / 大纲
 ```

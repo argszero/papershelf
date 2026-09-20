@@ -38,6 +38,23 @@ type Rail = 'notes' | 'outline'
 const FS_MIN = 12
 const FS_MAX = 21
 
+/** 手工能编辑/改类型的块类型 —— **必须与服务端 `blockops.TEXT_TYPES` 一致**
+ *  （前端多给一个按钮 = 点下去收到 400）。其余类型（`figure`/`table`/`deco`/`eq`）的内容在
+ *  `payload` 里（图片名 / 网格 / LaTeX），不在 `en`/`zh` 里，凭空造一个只会渲染成空白。
+ *  `h1` 不在其中：正文不产生 h1 块（解析时 h1 全被收进论文标题，`parse._finalize`），
+ *  标题文字改的是元数据，不是块。 */
+const TEXT_TYPES = new Set(['p', 'h2', 'h3', 'h4', 'abstract', 'refs', 'ref'])
+/** 编辑抽屉里可选的块类型（比 `TEXT_TYPES` 少 `refs`/`ref` —— 参考文献的样式是**块类型自带**的，
+ *  手改类型只会把一段正文变成参考文献的样子；真要改，改的是内容不是类型）。 */
+const TYPE_OPTIONS: Array<{ v: string; label: string }> = [
+  { v: '', label: '（不改类型）' },
+  { v: 'p', label: '正文段落' },
+  { v: 'h2', label: '标题 2' },
+  { v: 'h3', label: '标题 3' },
+  { v: 'h4', label: '标题 4' },
+  { v: 'abstract', label: '摘要' },
+]
+
 /** `doc.blocks` 缺失时的稳定空数组 —— 字面量 `[]` 每次都换新引用，
  * 会让下面两个 `useMemo` 每帧都重算（oxlint 的 exhaustive-deps 警告即此）。 */
 const EMPTY_BLOCKS: Block[] = []
@@ -288,7 +305,13 @@ export function ReaderPage() {
   const [focusNote, setFocusNote] = useState(0)
   /** 正在闪烁的**块**（点笔记跳转到整块时的落点提示）。划痕那一侧不走状态，见 `gotoNote`。 */
   const [flashBlock, setFlashBlock] = useState<string>('')
-  const [editing, setEditing] = useState<{ id: string; text: string } | null>(null)
+  /** 编辑/插入抽屉。`isNew` ⇒ 走插入（`side` 决定落在参照块的上方还是下方）；
+   *  `id` 是**参照块**的 id —— 编辑时也是"被编辑的那一块"。 */
+  const [editing, setEditing] = useState<{
+    id: string; en: string; zh: string; isNew?: boolean; side?: 'before' | 'after'
+  } | null>(null)
+  /** 编辑/插入时选的块类型（`editType`）。空串 = 不动（编辑时）或跟随参照块（插入时）。 */
+  const [editType, setEditType] = useState('')
   const [mode, setMode] = useState<Mode>(() => readPref<Mode>('mode', 'dual'))
   const [rail, setRail] = useState<Rail>(() => readPref<Rail>('rail', 'notes'))
   const [fs, setFs] = useState<number>(() => readPref<number>('fs', 14.5))
@@ -427,16 +450,99 @@ export function ReaderPage() {
     marks: marks.length,
   }), [blocks, marks])
 
+  /** 打开「编辑此块」（宿主三个原语之二：老 block 的**编辑**）。
+   *  两栏都给出来 —— 编辑器里 `en`/`zh` 各按自己的坐标系重锚批注（见 `blockops.edit_block`）。 */
+  function openEdit(b: Block) {
+    setEditType('')
+    setEditing({ id: b.id, en: b.en || '', zh: b.zh || '' })
+  }
+
+  /** 打开「插入新块」（三个原语之一）。`side` 决定落点在参照块的**前**还是**后**。
+   *  拆分 = 这里插入 + 把要挪走的字从原块剪到新块（两个原语自己组合）；
+   *  合并 = 把下一块的字接进上一块 + 删掉它。程序不提供"拆分/合并"两个动作。 */
+  function openInsert(b: Block, side: 'before' | 'after') {
+    setEditType('')
+    setEditing({ id: b.id, en: '', zh: '', isNew: true, side })
+  }
+
   async function saveBlock() {
     if (!editing) return
-    const { id, text } = editing
+    const { id, en, zh, isNew, side } = editing
     try {
-      const fresh = await api.editBlock(pid, id, text, true)
+      if (isNew) {
+        const body = { en, zh, type: editType || undefined }
+        const fresh = await api.insertBlock(pid, side === 'before' ? { before: id, ...body }
+                                                                    : { after: id, ...body })
+        // 插入会改后续块的 `ord`（阅读顺序）—— 整篇重拉最稳（rare op），
+        // 也顺带把新块带上屏幕。**已有块 id 一个不变** ⇒ 邻居的批注天然不受影响。
+        flash(zh.trim() ? `已插入新块 ${fresh.id}` : `已插入新块 ${fresh.id}（还没有中文，可「重译此块」）`)
+        setEditing(null)
+        setSelBlock(fresh.id)
+        await load()
+        return
+      }
+      // ⚠️ **只发真正变了的字段**：`edit_block` 见到 `zh` 就会把 `zh_source` 置 `human`
+      //    （⑯ 的正确语义），照原样把两栏都发过去 ⇒ "打开抽屉再点保存"这一下会把整块的
+      //    译文永久标成"人工修订"、重跑再也不覆盖它。用户没改的字不该被他的一次误触接管。
+      const orig = blocks.find((x) => x.id === id)
+      const body: { en?: string; zh?: string; type?: string; reconciled: boolean } = { reconciled: true }
+      if (!orig || en !== (orig.en || '')) body.en = en
+      if (!orig || zh !== (orig.zh || '')) body.zh = zh
+      if (editType) body.type = editType
+      if (body.en === undefined && body.zh === undefined && !body.type) {
+        setEditing(null)
+        flash('没有改动')
+        return
+      }
+      const fresh = await api.editBlock(pid, id, body)
       // 整块替换（不是就地改文本）：后端重渲染了 zh_html（含重切后的划痕），公式/排版才跟着变
       setDoc((d) => d && ({ ...d, blocks: d.blocks.map((b) => (b.id === id ? fresh : b)) }))
       setEditing(null)
-      flash('译文已保存（标记为人工修订，重跑不会被覆盖）')
+      setNotes(share ? await share.loadNotes(pid).catch(() => notes) : await api.notes(pid).catch(() => notes))
+      flash(editReport(fresh.anchors_moved, fresh.anchors_dropped, fresh.zh_stale))
     } catch (e) { setError(e instanceof Error ? e.message : '保存失败') }
+  }
+
+  /** 保存后如实报出批注的后果 —— **静默丢批注是这里最坏的失败模式**（`blockops` 的三条
+   *  不变量就是为它写的）：删掉的划痕/失去落点的笔记必须在界面上当场说出来。
+   *
+   *  两种"没了"要分开说：划痕（只有坐标）是**真的消失**；笔记（有内容）**只在内容里留着**，
+   *  锚点被清空成「文献级笔记」。混成一句"2 处批注随之移除"会让用户以为笔记也没了。 */
+  function editReport(moved?: number, dropped?: Array<{ kind?: string }>, zhStale?: boolean): string {
+    const gone = dropped ?? []
+    const hls = gone.filter((d) => d.kind !== 'note').length
+    const ns = gone.length - hls
+    const parts = ['已保存（标记为人工修订，重跑不会被覆盖）']
+    if (moved) parts.push(`本块 ${moved} 处批注已随文字移动`)
+    if (hls) parts.push(`${hls} 处划痕的文字已被删除，随之移除`)
+    if (ns) parts.push(`${ns} 条笔记失去落点，已转为「文献级笔记」（内容保留）`)
+    if (zhStale) parts.push('译文与新原文已不一致，已标「待校对」')
+    return parts.join('·')
+  }
+
+  /** 删除本块（宿主 2026-09-20 的第三个原语；合并 = 把下一块接进上一块 + 删掉它）。
+   *  该块的**笔记内容不删**（转成「文献级笔记」，锚点清空）—— 所以确认框里必须说清。
+   *
+   * ⚠️ 确认框里**必须把这一块的原文抄出来**（`clip(b.en, 60)`）：按钮挂在"当前选中的那一块"
+   * 上，而长文档里选中项会随着点别处而移动 —— 2026-09-20 真机验收时就因为"以为选中的还是刚
+   * 插入的那一块"、对确认框点了确定，误删了一个正文块（原文那一行正是唯一的告警）。
+   * `window.confirm` 是**纯文本**：这里不能写 `**加粗**`（会照原样显示星号）。 */
+  async function removeBlock(b: Block) {
+    const ok = window.confirm(
+      `删除这一块？\n\n原文：${clip(b.en || '(空)', 60)}\n\n` +
+      '· 正文里这一段会消失（这就是「合并/撤销拆分」的那一半）；\n' +
+      '· 这一块上的笔记内容会保留（转成「文献级笔记」，不再指到原文位置）；\n' +
+      '· 这一块上的划痕会随之移除。')
+    if (!ok) return
+    try {
+      const res = await api.deleteBlock(pid, b.id)
+      setSelBlock('')
+      await load()
+      const parts = ['已删除此块']
+      if (res.notes_unanchored) parts.push(`${res.notes_unanchored} 条笔记已转为「文献级笔记」（内容保留）`)
+      if (res.highlights_deleted) parts.push(`${res.highlights_deleted} 道划痕随之移除`)
+      flash(parts.join('·'))
+    } catch (e) { flash(e instanceof Error ? e.message : '删除失败') }
   }
 
   async function retranslate(b: Block) {
@@ -878,13 +984,27 @@ export function ReaderPage() {
                     <DocBlock b={b} mode={mode} assets={assetDims}
                               selected={selBlock === b.id} flash={flashBlock === b.id}
                               onPick={setSelBlock} />
-                    {!readonly && showTools && selBlock === b.id && !b.no_zh && (
+                    {!readonly && showTools && selBlock === b.id && (
                       <div className="block-tools" style={{ opacity: 1 }}>
                         {b.zh_source === 'human' && <span className="chip ok">已人工修订</span>}
                         {b.needs_review && <span className="chip warn">待校对</span>}
-                        <button onClick={() => setEditing({ id: b.id, text: b.zh })}>编辑译文</button>
-                        <button onClick={() => void retranslate(b)}>重译此块</button>
+                        {/* 三个原语（宿主 2026-09-20）：插入 / 编辑 / 删除。
+                            「插入」对**任何**块都开放（图、表旁边也常要补一句）；
+                            「编辑」只对文字块开放（`payload` 类块的文字不在 en/zh 里）。 */}
+                        <button className="bt-ins" title="在这一块前面插入一个新块"
+                                onClick={() => openInsert(b, 'before')}>↑ 上方插入</button>
+                        <button className="bt-ins" title="在这一块后面插入一个新块（拆分的一半）"
+                                onClick={() => openInsert(b, 'after')}>↓ 下方插入</button>
+                        {TEXT_TYPES.has(b.type) && (
+                          <button title="改这一块的原文/译文/类型（拆分 = 插入 + 把字剪走）"
+                                  onClick={() => openEdit(b)}>编辑此块</button>
+                        )}
+                        {TEXT_TYPES.has(b.type) && (
+                          <button onClick={() => void retranslate(b)}>重译此块</button>
+                        )}
                         <button onClick={() => { setRail('notes'); setSelBlock(b.id); setTarget(null) }}>加笔记</button>
+                        <button className="bt-del" title="删除这一块（合并的一半）"
+                                onClick={() => void removeBlock(b)}>删除此块</button>
                       </div>
                     )}
                   </div>
@@ -1003,23 +1123,59 @@ export function ReaderPage() {
           <div className="drawer-mask" onClick={() => setEditing(null)} />
           <aside className="drawer">
             <header>
-              <strong style={{ flex: 1 }}>编辑译文 · {editing.id}</strong>
+              <strong style={{ flex: 1 }}>
+                {editing.isNew
+                  ? `插入新块 · 在 ${editing.id} 的${editing.side === 'before' ? '上方' : '下方'}`
+                  : `编辑块 · ${editing.id}`}
+              </strong>
               <button className="ghost" onClick={() => setEditing(null)}>取消</button>
             </header>
             <div className="body stack">
+              {editing.isNew && (
+                <p className="meta" style={{ margin: 0, lineHeight: 1.75 }}>
+                  拆分 = 在这里插入一块，再把要挪走的文字从原块<b>剪</b>过来（原块用「编辑此块」改）。
+                  合并 = 把下一块的字接到这一块末尾，再用「删除此块」收掉空的那块。
+                  两栏各按自己的坐标系重锚批注，<b>前后未动的块一条都不受影响</b>。
+                </p>
+              )}
               <div>
-                <label>英文原文</label>
-                <div style={{ fontSize: 13.5, background: 'var(--bg)', border: '1px solid var(--border)',
-                              borderRadius: 8, padding: '10px 12px', maxHeight: 220, overflow: 'auto' }}>
-                  {blocks.find((x) => x.id === editing.id)?.en}
-                </div>
+                <label>原文（英文）{editing.isNew && ' · 留空则是一段待补的空块'}</label>
+                <textarea className="textarea" rows={7} value={editing.en}
+                          placeholder="粘贴/输入这一段原文…"
+                          onChange={(e) => setEditing({ ...editing, en: e.target.value })} />
               </div>
               <div>
-                <label>中文译文（保存后标记为「人工修订」，重跑不会被覆盖）</label>
-                <textarea className="textarea" rows={10} value={editing.text}
-                          onChange={(e) => setEditing({ ...editing, text: e.target.value })} />
+                <label>
+                  中文译文
+                  {!editing.isNew && '（保存后标记为「人工修订」，重跑不会被覆盖）'}
+                  {editing.isNew && '（留空会标「待校对」，可随后「重译此块」）'}
+                </label>
+                <textarea className="textarea" rows={7} value={editing.zh}
+                          placeholder="中文…"
+                          onChange={(e) => setEditing({ ...editing, zh: e.target.value })} />
               </div>
-              <button className="btn btn-primary" onClick={() => void saveBlock()}>保存</button>
+              <div>
+                <label>块类型</label>
+                <select className="input" value={editType} aria-label="块类型"
+                        onChange={(e) => setEditType(e.target.value)}>
+                  {editing.isNew
+                    ? [{ v: '', label: '（跟随相邻块的类型）' }, ...TYPE_OPTIONS.slice(1)].map((o) => (
+                        <option key={o.v} value={o.v}>{o.label}</option>))
+                    : TYPE_OPTIONS.map((o) => (
+                        <option key={o.v} value={o.v}>{o.label}</option>))}
+                </select>
+              </div>
+              {!editing.isNew && (
+                <p className="meta" style={{ margin: 0, lineHeight: 1.7 }}>
+                  改了原文而没改译文 ⇒ 会如实挂「待校对」（老译文与新原文已对不上）。
+                  只有**这一块**的批注会被重新锚定：写进被删掉那段文字里的划痕随之移除，
+                  那里的笔记转为「文献级笔记」（内容保留）；前后块一个不动。
+                </p>
+              )}
+              <button className="btn btn-primary" disabled={!editing.en.trim() && !editing.zh.trim()}
+                      onClick={() => void saveBlock()}>
+                {editing.isNew ? '插入' : '保存'}
+              </button>
             </div>
           </aside>
         </>
