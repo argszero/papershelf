@@ -3179,3 +3179,30 @@ if len(best) < 2: best = _author_year_starts(stream)   # v15 新增：作者-年
 - 公式（MathML 树）与图片仍不可划（本来就没有"裸文本"）；
 - **不做反向修复**：新解析认为不是注区的块，即使库里带着 `note` 戳也不动它（没有对应的存量病灶）；
 - 页眉页脚（`band`）**不算**注区：它们走 ㊶ 的另一条路（页边带 + 横线），两条判据互不重叠。
+
+### 九、上线与生产实测（2026-09-21，宿主「继续」= 授权上生产 + 跑存量修复）
+
+CI `35552014622` 六 job 全绿 → `docker compose pull app`（**零 Retrying**，约 3 分钟）→ `up -d app`：
+`revision=3a3a065` / healthy / 公网 health 200 / bundle **`index-gma3e8bm.js` + `index-DtDadWXq.css`
+（与本地 `npm run build` 逐字节 `cmp` 一致）/ 日志零 error。备份 `/tmp/{papershelf.db,.env}.bak.20260921-104248`。
+
+**容器内直调自证**（零 token）：`PARSE_VERSION=16`、`has rebuild_paper_notes` / `has remap_span_ws` 均 True、
+`markup.CSS` 含 `.pg-note{…pre-line}`。
+
+**生产存量修复（`rebuild-notes`，不是「重新提取」）**：干跑先看清会动哪几块 ——
+paper 1 `b-0011`（第 1 页作者单位，370 字 → 3 行、em 0.8）、paper 2 `b-0649`（第 21 页表注，
+583 字 → 6 行、em 0.85、markers `[''] + a–e`），paper 4/5 无需处理。正式跑：**2 篇修复、
+4,492 tokens**（1479 + 3013）、待校对 0。
+**批注逐字段比对（这是整件事的目的）**：`notes 22 → 22`、`highlights 502 → 502`、**逐字段 identical**；
+块数不变 `{1:809, 2:409, 4:435, 5:548}`。
+
+**生产真浏览器**（宿主已登录标签 `reader/2`，硬刷后 bundle 已是新的）：
+`p.pg-note.pg-rule-above` / `font-size 12.325px`（0.85em）/ `pre-line` / 6 行 / 581 字 /
+5 个 `<sup>`（`vertical-align: super`、10.27px）/ `::before` = `1px solid rgb(0,0,0)`（**在块上方**，
+与真 PDF 那条 `y=640.5`、注区首行 `y=648.3` 的几何关系一致）；线上 CSS 五条规则（`.pg-note` /
+`.pg-rule-{above,below}::…` / `span.pg-rule-*`）实测在位；
+三模式 `en 350/350 · zh 332/332 ↔ 仅中文 0/350 · 350/350 ↔ 仅原文 350/350 · 0/0`（注区块在三模式下都可见、5 个 sup 都在）；
+**真实鼠标拖选注区里的 `optical`**（DOM 尺子算的 `i=150`，与库里 `en.index("optical")=150` 相同）
+→ `.mark-bar` 出现（4 支笔 + 加笔记）→ `Esc` 收起（**只拖不写**，验收后 `notes`/`highlights` 仍 identical）；
+零 console error、零横向溢出。paper 1 的 `b-0011` 同样渲染（两栏各 3 行、`<sup>` a/b/c、无横线 —— 原件那里确实没有）；
+导出件（`/api/papers/2/export?lang=dual`）带 `class="pg-note pg-rule-above"`、`<sup>` 10 个、CSS 含 `pre-line`。

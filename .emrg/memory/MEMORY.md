@@ -328,7 +328,7 @@ bundle `index-DLx3KrxJ.js`（与本地同指纹）/ 日志零 error；DB + `.env
 ④**"助手不代签"的边界**：宿主原话就是"想办法在不影响笔记的情况下改一下 References"
 ⇒ 被点单的操作 + 代价写在确认框里 + 干跑与只读取证背书 ⇒ 助手执行合适；`reextract`（百万级、清批注）仍需逐次点头。
 
-### 最近一轮（2026-09-21）㊾ 小字注区（解析 v16）：保行 + 小字 + 上标 + 注上横线 —— **本地已全验，未上生产**
+### 最近一轮（2026-09-21）㊾ 小字注区（解析 v16）：保行 + 小字 + 上标 + 注上横线 —— **已上生产并跑完存量修复**
 
 宿主两张截图（生产 `reader/2` 阅读器 vs PDF 原件）：「这一段提取的不对」「**主要是样式不对**」。
 细节全在 `design-decisions.md` **㊾**；要点：
@@ -350,9 +350,19 @@ bundle `index-DLx3KrxJ.js`（与本地同指纹）/ 日志零 error；DB + `.env
 - **实测**：真解析命中生产 paper 2 `b-0649`（**全篇仅此一处**）；dev 夹具走 `rebuild-notes` 端到端
   （`581 字一段 → 6 行`）；真浏览器 12.325px / pre-line / 6 行 / 5 个 `<sup>` / `::before` 1px 黑线 511px /
   三模式 / 零 console error / 导出件同带；离线 **593 passed**、**变异 13 处全红**。
-- **待做**：`npm run build` 已跑（`index-gma3e8bm.js` + `index-DtDadWXq.css`）→ 提交 → CI → 上生产 →
-  生产跑「重建小字注区」（**别点「重新提取」**）→ 前后 `notes`/`highlights` 逐字段比对。
-  ⚠️ 生产那两篇是 v16 之前解析的 ⇒ **页面上看到变化之前必须先跑 `rebuild-notes`**（≈1.5k tokens/块，全库 2 处）。
+- **已上生产（2026-09-21 10:4x）**：`110db80`（代码）+ `3a3a065`（记忆）→ CI `35552014622` 六 job 全绿 →
+  `docker compose pull app`（**零 Retrying**，≈3 分钟）+ `up -d app` → `revision=3a3a065` / healthy / 公网 200 /
+  bundle `index-gma3e8bm.js`+`index-DtDadWXq.css`（与本地 `cmp` 逐字节一致）/ 日志零 error；
+  DB + `.env` 备份 `/tmp/*.bak.20260921-104248`。容器内直调自证 `PARSE_VERSION=16` / 两个新函数在 / CSS 含 pre-line。
+- **生产存量修复 = `rebuild-notes`**（**不是「重新提取」**）：干跑先看清 —— paper 1 `b-0011`（第 1 页作者单位，
+  370 字 → 3 行、em 0.8）、paper 2 `b-0649`（第 21 页表注，583 字 → 6 行、em 0.85、markers `['']+a–e`），paper 4/5 无需处理；
+  正式跑 **2 篇修复 / 4,492 tokens / 待校对 0**。**`notes 22→22`、`highlights 502→502` 逐字段 identical**、
+  块数不变 `{1:809, 2:409, 4:435, 5:548}`。
+- **生产真浏览器**（宿主已登录标签 reader/2，硬刷）：`pg-note pg-rule-above` / 12.325px / pre-line / 6 行 / 581 字 /
+  5 个 `<sup>` / `::before` 1px 黑线**在块上方**（与真 PDF `y=640.5` 线、`y=648.3` 注区首行的几何一致）；
+  三模式 `350/350 · 332/332 ↔ 0/350 ↔ 350/0`；真实鼠标拖选注区里的 `optical`（DOM `i=150` = 库里
+  `en.index("optical")`）→ `.mark-bar` 出现 → `Esc` 收起（只拖不写，验收后批注仍 identical）；零 console error；
+  paper 1 `b-0011` 同样渲染；导出件带 `pg-note pg-rule-above` + 10 个 `<sup>` + `pre-line`。
 
 _Last updated: 2026-09-21T10:05:00+08:00_
 
