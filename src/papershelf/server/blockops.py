@@ -137,15 +137,57 @@ def remap_span(old: str, new: str, start: int, end: int) -> tuple[int, int] | No
 
 
 # ── 批注的重新锚定（只作用于**这一块**）────────────────────────────────────
-def _remap_block_anchors(conn: sqlite3.Connection, paper_id: int, block_id: str,
-                         lang: str, old: str, new: str) -> dict[str, Any]:
-    """把**这一块这一语言**上的划痕/笔记按 `remap_span` 挪到新文字上。
+def remap_span_ws(old: str, new: str, start: int, end: int) -> tuple[int, int] | None:
+    """**只动空白**的改写专用映射（`" ".join(split)` → 按源行拼，解析 v16 的小字注区）。
+
+    与 `remap_span` 的分工：后者按"最长公共前缀 + 最长公共后缀"切，只适合**一处**剪切/粘贴
+    （把块接起来、从中间剪掉一段）；而小字注区那种**行行都变、处处都变**的改写会让它的
+    公共前缀只剩第一个标记之前那一截 ⇒ 第二行往后全落进"被替换掉的中段" ⇒ 返回 `None`，
+    于是那些划痕会被判为"映射不了"而删掉（明明文字一个字都没少，只是空格换成了换行）。
+
+    判据（调用方**必须**自己先验，这里只负责映射）：两边**去掉空白后逐字相同**
+    ⇒ 非空白字符一一对应，空白只是挪了地方：
+    - 端点落在**被删掉的空白**上 ⇒ 收到最近的那个可见字符上（`"…off-line optical"` 这段
+      划痕在旧文本里从 `optical` 的 `o` 起，映射后不能多带前面那个空格 —— 空白挪了位置，
+      端点也跟着"贴在字上"）；
+    - 一旦发现非空白字符对不上就返回 `None`（不是"只动空白"的改写 ⇒ 绝不猜）。
+    """
+    if start < 0 or end <= start:
+        return None
+    pos = [0] * (len(old) + 1)
+    j = 0
+    for i, ch in enumerate(old):
+        if ch.isspace():
+            pos[i + 1] = pos[i]                    # 空白不推进：它只是被挪走了
+            continue
+        while j < len(new) and new[j].isspace():
+            j += 1
+        if j >= len(new) or new[j] != ch:
+            return None                            # 非空白字符变了 ⇒ 这不是本映射的活
+        j += 1
+        pos[i + 1] = j
+    a, b = pos[start], pos[min(end, len(old))]
+    while a < b and new[a].isspace():              # 两端各收一收（见上面 docstring）
+        a += 1
+    while b > a and new[b - 1].isspace():
+        b -= 1
+    return (a, b) if b > a else None
+
+
+def remap_block_anchors(conn: sqlite3.Connection, paper_id: int, block_id: str,
+                        lang: str, old: str, new: str, *,
+                        mapper: Callable[..., tuple[int, int] | None] = remap_span,
+                        ) -> dict[str, Any]:
+    """把**这一块这一语言**上的划痕/笔记按 `mapper` 挪到新文字上。
 
     调用方负责事务（`tx` 不可重入）。返回一份账：`moved` / `dropped`（每项带被删除的原文）。
     - 划痕映射不了 ⇒ **删除**（它只有坐标，文字没了就没有意义）；
       指向它的笔记 `hl_id` 置 NULL（笔记自己还有一份坐标，不该跟着消失，同 `delete_highlight`）；
     - 笔记映射不了 ⇒ **保留内容**，锚点清空成「文献级笔记」，并把它原本划住的原文写进 `quote`
       （用户据此能找回位置）。整块锚（`start IS NULL`）不需要动 —— 它指的是"这一块"。
+
+    `mapper` 缺省是 `remap_span`（剪切/粘贴式的编辑）；**只动空白**的改写（解析 v16 的
+    小字注区）传 `remap_span_ws` —— 判据换了，但"映射不了怎么办"的三条政策一字不改。
     """
     moved = 0
     dropped: list[dict[str, Any]] = []
@@ -155,7 +197,7 @@ def _remap_block_anchors(conn: sqlite3.Connection, paper_id: int, block_id: str,
         " WHERE paper_id=? AND block_id=? AND lang=?", (paper_id, block_id, lang)
     ).fetchall()
     for r in rows:
-        span = remap_span(old, new, int(r["start"]), int(r["end"]))
+        span = mapper(old, new, int(r["start"]), int(r["end"]))
         if span is None:
             conn.execute("UPDATE notes SET hl_id=NULL WHERE hl_id=?", (r["id"],))
             conn.execute("DELETE FROM highlights WHERE id=?", (r["id"],))
@@ -172,7 +214,7 @@ def _remap_block_anchors(conn: sqlite3.Connection, paper_id: int, block_id: str,
     for r in notes:
         if r["start"] is None or r["end"] is None:
             continue                                   # 整块锚：跟着块走，不用改
-        span = remap_span(old, new, int(r["start"]), int(r["end"]))
+        span = mapper(old, new, int(r["start"]), int(r["end"]))
         if span is None:
             quote = r["quote"] or old[int(r["start"]):int(r["end"])]
             conn.execute(
@@ -257,11 +299,11 @@ def edit_block(conn: sqlite3.Connection, paper_id: int, block_id: str, *,
     dropped: list[dict[str, Any]] = []
     with tx(conn):
         if new_en != old_en:
-            acc = _remap_block_anchors(conn, paper_id, block_id, "en", old_en, new_en)
+            acc = remap_block_anchors(conn, paper_id, block_id, "en", old_en, new_en)
             moved += acc["moved"]
             dropped += acc["dropped"]
         if new_zh != old_zh:
-            acc = _remap_block_anchors(conn, paper_id, block_id, "zh", old_zh, new_zh)
+            acc = remap_block_anchors(conn, paper_id, block_id, "zh", old_zh, new_zh)
             moved += acc["moved"]
             dropped += acc["dropped"]
         conn.execute(f"UPDATE blocks SET {', '.join(sets)} WHERE paper_id=? AND id=?",

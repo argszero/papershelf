@@ -440,5 +440,75 @@ def rebuild_refs(
         conn.close()
 
 
+@app.command("rebuild-notes")
+def rebuild_notes(
+    paper: int = typer.Option(0, "--paper", help="只处理这一篇（文献 id，0 = 全部）"),
+    dry_run: bool = typer.Option(False, "--dry-run", help="只打印会改哪几块，不调模型、不落库"),
+    no_translate: bool = typer.Option(False, "--no-translate", help="只修结构，保留旧译文"),
+) -> None:
+    """**只修小字注区**（解析 v16 的存量出口）—— 块 id 不变，笔记/划痕无损。
+
+    为什么不是「重新提取」：那个出口会清掉**整篇**的 `notes` / `highlights`，
+    而重跑整篇还要重烧百万级 token。本命令只做一件事：回到 PDF 重跑一次解析（CPU、
+    零 token），把**小字注区**（表注/脚注/作者单位）那几块就地补成 v16 的形状
+    （按源行分行、记下字号比、行首上标小标、注上那条页中横线），钉在这些块上的批注
+    按"只动空白"的坐标映射搬家，见 `server/notesfix.py`。
+
+    ⚠️ 必须先停掉正在跑的 `serve`（或确认它没在转换同一篇）：本命令直接改库，
+    而服务的常驻队列会在这之后用旧产物覆盖 —— 改完重启服务即可。
+    """
+    from .server.config import get_settings
+    from .server.db import connect, init_db
+    from .server.notesfix import rebuild_paper_notes
+
+    settings = get_settings(refresh=True)
+    init_db(settings)
+    conn = connect(settings)
+    try:
+        sql = "SELECT id, title FROM papers WHERE conv_state='done' ORDER BY id"
+        args: tuple[Any, ...] = ()
+        if paper:
+            sql = "SELECT id, title FROM papers WHERE id=?"
+            args = (paper,)
+        rows = [dict(r) for r in conn.execute(sql, args).fetchall()]
+        if not rows:
+            typer.echo("没有可处理的文献（conv_state=done）。")
+            raise typer.Exit(0)
+
+        def _log(*a: object) -> None:
+            typer.echo("    " + " ".join(str(x) for x in a))
+
+        tokens = changed = skipped = failed = 0
+        for p in rows:
+            typer.echo(f"· #{p['id']} {p['title'][:34]!r}")
+            got = rebuild_paper_notes(conn, p["id"], translate=not no_translate,
+                                      dry_run=dry_run, log=_log)
+            tokens += int(got.get("tokens") or 0)
+            if not got.get("ok"):
+                failed += 1
+                typer.echo(f"  ✗ {got.get('reason')}")
+                continue
+            if dry_run:
+                typer.echo(f"  ✓ 会改 {got['notes']} 块（干跑：未调模型、未落库）")
+                continue
+            if not got.get("changed"):
+                skipped += 1
+                typer.echo(f"  ✓ 无需处理（{got.get('reason')}）")
+                continue
+            changed += 1
+            typer.echo(f"  ✓ 改 {got['notes']} 块、新译文 {got['translated']} 份"
+                       f"（待校对 {got['needs_review']}）；批注搬家 {got['anchors_moved']} 条"
+                       f"（落空 {got['anchors_dropped']}）")
+        if dry_run:
+            typer.echo("\n（--dry-run：未调用模型、未落库）")
+            raise typer.Exit(0)
+        tail = f"，{failed} 篇失败" if failed else ""
+        typer.echo(f"\n✅ 完成：{changed} 篇修复、{skipped} 篇本来就好{tail}，"
+                   f"合计 {tokens} tokens")
+        typer.echo("⚠️ 译不出的小字注区保留旧译文并标「待校对」，可用块级修订兜底（决策⑯）。")
+    finally:
+        conn.close()
+
+
 if __name__ == "__main__":
     app()

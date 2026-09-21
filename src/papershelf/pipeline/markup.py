@@ -52,6 +52,10 @@ p.ref-item{font-size:13.5px;color:#444;margin:0 0 6px;padding-left:20px;text-ind
 .pg-band{font-size:.84em;color:#6b6b6b;line-height:1.5}
 .pg-band.pg-top{margin-top:0}
 .pg-band.pg-bottom{margin-bottom:0}
+/* 小字注区（v16：表注/脚注/作者单位）：字号按 PDF 原件与正文的比值（`--note-fs`，
+   解析实测，如 8.5/10 = .85em）；`white-space: pre-line` 让块文本里的换行**照抄源行**
+   （解析阶段按行拼接，见 `parse._note_area`）—— 不加这条，6 行注会被浏览器折成一段。 */
+.pg-note{font-size:var(--note-fs,.85em);color:#6b6b6b;line-height:1.45;white-space:pre-line}
 /* 线的**颜色与粗细照抄 PDF**（v11）：解析阶段把原件的 stroke 存进 `payload.rule`
    （`{side,color,width}`），渲染端用两个 CSS 变量接住 —— 内联样式只能作用在元素上，
    而线是伪元素画的，变量可以继承进伪元素。变量缺省时才退回主题色。 */
@@ -132,6 +136,50 @@ def _shade_color(b: Block) -> str:
     return color if isinstance(color, str) and _RE_HEX_COLOR.fullmatch(color) else ""
 
 
+# ── 小字注区（v16：表注 / 脚注 / 作者单位）─────────────────────────────────
+# 解析阶段（`parse._note_area`）认出来的**小字多行注**：
+#   · 文本里**保留着源行的换行**（`"\n"`）—— 渲染端用 `white-space: pre-line` 照抄分行；
+#   · `payload["note"]["em"]` = 这一块的字号 ÷ 正文字号（原件的事实，渲染端照抄）；
+#   · `payload["markers"]` = 每行行首那个**上标小标**（"a"/"b"/…，没有的行是空串）。
+#
+# ⚠️ 换行与行首那个字母**必须原样留在 DOM 文本里**（渲染时只**加标签**、不加删字符）：
+#    `web/src/marks.ts` 的坐标尺子是"按 DOM 文本节点逐字符累加"（㉛），少一个字符，
+#    这一块上的所有划痕就整体平移 —— 所以 `<sup>` 只是把那个**本来就有的**字母包起来。
+_RE_NOTE_MARK = re.compile(r"^[a-zA-Z]$|^\d{1,2}$")
+
+
+def _note_em(b: Block) -> float:
+    """小字注区的字号比（`em`）；不是注区或数值不合格则 0.0。
+
+    值来自 PDF 实测（`parse._note_area`），与线宽/颜色同一条纪律：**校验后再进 CSS**。
+    区间取 (0.5, 0.98]：小字注比正文小，但不至于小到看不见（越界一律当"不是注区"，
+    宁可按正文渲染，也不能把一个 0.05em 的字号写进页面）。
+    """
+    p = b.payload if isinstance(b.payload, dict) else {}
+    note = p.get("note")
+    raw = note.get("em") if isinstance(note, dict) else None
+    try:
+        em = float(raw)
+    except (TypeError, ValueError):
+        return 0.0
+    return em if 0.5 < em <= 0.98 else 0.0
+
+
+def _note_markers(b: Block) -> list[str]:
+    """与注区各**行**平行的行首标记（不是注区则空表）。
+
+    只认单字母 / 1–2 位数字（`_RE_NOTE_MARK`）：这个值会进 HTML，形状不认识的
+    一律当"这行没有标记"（宁可少一个 `<sup>`，也不能把 `payload` 里的任意串写进页面）。
+    """
+    if not _note_em(b):
+        return []
+    p = b.payload if isinstance(b.payload, dict) else {}
+    ms = p.get("markers")
+    if not isinstance(ms, list):
+        return []
+    return [m if isinstance(m, str) and _RE_NOTE_MARK.match(m) else "" for m in ms]
+
+
 def _furn_cls(b: Block) -> str:
     """块的**版面装饰** CSS 类（`pg-band pg-top` / `pg-rule-below` / `deco`…）；没有则空串。
 
@@ -152,6 +200,8 @@ def _furn_cls(b: Block) -> str:
     band = p.get("band")
     if band in ("top", "bottom") and b.type in _BAND_TYPES:
         out.append(f"pg-band pg-{band}")
+    if _note_em(b):
+        out.append("pg-note")
     side = _rule_side(b)
     if side:
         out.append(f"pg-rule-{side}")
@@ -172,6 +222,11 @@ def _furn_style(b: Block) -> str:
     """
     p = b.payload if isinstance(b.payload, dict) else {}
     parts: list[str] = []
+    em = _note_em(b)
+    if em:
+        # 小字注区的字号是**PDF 原件的事实**（解析实测的比值）—— 用 CSS 变量传，
+        # 阅读器那份 styles.css 读同一个变量（两处样式各写一份数值迟早漂开）。
+        parts.append(f"--note-fs:{em:g}em")
     shade = _shade_color(b)
     if shade:
         # 底纹颜色同样是**PDF 原件的值**（`parse._margin_shades`），照抄
@@ -240,7 +295,8 @@ def _clip(marks: list[dict], start: int, end: int) -> list[tuple[int, int, dict]
 
 
 def prose_html(text: str, *, typeset: bool, marks: list[dict] | None = None,
-               anchors: bool = False, base: int = 0) -> str:
+               anchors: bool = False, base: int = 0,
+               sup_at: int | None = None, sup_len: int = 1) -> str:
     """正文段的内部 HTML：可带**划痕**（任意字符区间）与**偏移锚点**。
 
     ⚠️ `anchors` 默认 **False**，只有要交给用户去划线的视图（阅读器/分享页）才开。
@@ -253,6 +309,11 @@ def prose_html(text: str, *, typeset: bool, marks: list[dict] | None = None,
     只有表格用它（决策㊵）：一张表的裸文本是"表注一行 + 每行 ` | ` 相连"（`model.table_text`），
     单元格是这张表里的若干片段 —— 锚点必须吐**全局**偏移，尺子才连得上；
     划痕也按全局坐标进来、在这里裁到本格。`base=0` 时行为与从前逐字节相同。
+
+    `sup_at` / `sup_len`（默认 `None` / 1）与 `base` 同一套坐标：把**那一个字符**包成
+    `<sup>`（小字注区行首的上标小标，v16，见 `parse._note_area`）。放在这里而不是由调用方
+    自己拼，是因为"包在上标里"与"包在划痕里"是两件会**互相嵌套**的事 —— 调用方拼的话，
+    划痕正好从行首那个字母起时就会漏掉它（`_sup_seg` 的注释）。
 
     ## 锚点是干什么的（改动前务必理解）
 
@@ -277,15 +338,19 @@ def prose_html(text: str, *, typeset: bool, marks: list[dict] | None = None,
     if base:
         marks = [{**m, "start": int(m["start"]) - base, "end": int(m["end"]) - base}
                  for m in (marks or [])]
+    # 上标同样按整块坐标进来（`sup_at` 缺省/越界 = 这一片段里没有要包成 `<sup>` 的字符）
+    sup: int | None = None
+    if sup_at is not None and 0 <= sup_at - base < len(text):
+        sup = sup_at - base
     marks = sorted([m for m in (marks or []) if int(m["end"]) > int(m["start"])],
                    key=lambda m: int(m["start"]))
-    if not marks and not anchors:
-        # 既没有划痕、也不要尺子 → 一个 span 都不吐（prompt / 校验 / 导出的常态路径）。
+    if not marks and not anchors and sup is None:
+        # 既没有划痕、也不要尺子、也没有上标 → 一个 span 都不吐
+        # （prompt / 校验 / 导出的常态路径）。
         return _mathy(text, typeset=typeset)
     units = math_units(text)
     if not units:
         return _mathy(text, typeset=typeset)
-
     out: list[str] = []
     last = -1                                         # 上一个锚点的位置（去重，见下）
 
@@ -313,13 +378,33 @@ def prose_html(text: str, *, typeset: bool, marks: list[dict] | None = None,
             pos = a
             for ca, cb, mk in _clip(marks, a, b):
                 if ca > pos:
-                    out.append(_esc(text[pos:ca]))
-                out.append(_wrap(_esc(text[ca:cb]), mk))
+                    out.append(_sup_seg(text[pos:ca], pos, sup, sup_len))
+                out.append(_wrap(_sup_seg(text[ca:cb], ca, sup, sup_len), mk))
                 pos = cb
             if pos < b:
-                out.append(_esc(text[pos:b]))
+                out.append(_sup_seg(text[pos:b], pos, sup, sup_len))
         anchor(b)
     return "".join(out)
+
+
+def _sup_seg(seg: str, start: int, sup: int | None, sup_len: int) -> str:
+    """`seg` 的 HTML 转义；`sup`（本片段坐标，`None` = 没有）那个字符另外包一层 `<sup>`。
+
+    ⚠️ **只加标签、不加删字符**：`_esc(seg)` 与 `_sup_seg(seg, …)` 的可见文本**逐字相同**
+    —— 这是敢在小字注区（v16）里动渲染的唯一理由（`web/src/marks.ts` 的尺子按 DOM 文本
+    节点逐字符累加，少一个字符这块上已有的划痕就整体平移）。
+
+    与划痕的关系：上标是**先于**划痕决定的（`payload["markers"]` 来自解析层），所以这里
+    在片段的**内部**插标签，而不是像以前那样把标记吐在片段外 —— 否则"划痕正好从行首那个
+    `a` 起"时，那个字母会落在 `<mark>` 之外（颜色缺一格），坐标却还是同一套。
+    """
+    if sup is None:
+        return _esc(seg)
+    lo, hi = sup, sup + max(1, sup_len)
+    i, j = max(0, lo - start), min(len(seg), hi - start)
+    if i >= j:
+        return _esc(seg)
+    return f"{_esc(seg[:i])}<sup>{_esc(seg[i:j])}</sup>{_esc(seg[j:])}"
 
 
 def _wrap(inner: str, mark: dict) -> str:
@@ -442,6 +527,36 @@ def render_block(b: Block, *, lang: str, marker: bool = True, typeset: bool = Fa
         """正文段的内部 HTML：划痕 + 偏移锚点（都在公式渲染**之前**按裸文本切好）。"""
         return prose_html(chunk, typeset=typeset, marks=mine, anchors=anchors)
 
+    def note_body(chunk: str) -> str:
+        """**小字注区**的内部 HTML：按源行渲染，行首那个上标小标包成 `<sup>`。
+
+        与 `prose()` 的唯一区别是"分段渲染 + 上标"，所以两者在**没有注戳时完全等价**；
+        `typeset=False`（翻译 prompt / 校验 / LaTeX 化）走的是同一条路径 ——
+        它只是把行首那个字母包一层 `<sup>`，**字符一个不多一个不少**。
+        （翻译回来的中文是 `extract_blocks` 取的**纯文本**，标签本就会被丢掉；
+        渲染时按 `payload["markers"]` 重新包一遍，所以模型不需要"学会写 `<sup>`"。）
+
+        ⚠️ 每条行之间的 `"\\n"` 必须**留在输出里**：块文本本身就是这么存的
+        （`parse._NoteArea.text`），而 `web/src/marks.ts` 的坐标尺子按 DOM 文本节点
+        逐字符累加 —— 少一个换行符，这一块上已有的划痕就整体平移一格。
+        """
+        lines = chunk.split("\n")
+        tpl = _note_markers(b)
+        out: list[str] = []
+        base = 0                                       # 本行在**整块裸文本**里的起点
+        for i, ln in enumerate(lines):
+            mk = tpl[i] if i < len(tpl) else ""
+            # 行首那个小标**留在原文里**，只让渲染器把**这一个字符**包成 `<sup>`
+            # （`sup_at` 那一套 —— 与划痕的嵌套由 `prose_html` 内部处理，见其 docstring）
+            sup_at = base if (mk and ln.startswith(mk)) else None
+            out.append(prose_html(ln, typeset=typeset, marks=mine, anchors=anchors,
+                                  base=base, sup_at=sup_at, sup_len=len(mk)))
+            base += len(ln)
+            if i < len(lines) - 1:
+                out.append("\n")
+                base += 1
+        return "".join(out)
+
     if t in ("h1", "h2", "h3", "h4"):
         tag = {"h1": "h1", "h2": "h2", "h3": "h3", "h4": "h4"}[t]
         cls = "sec" if t == "h2" else ("sub" if t == "h3" else "")
@@ -530,7 +645,8 @@ def render_block(b: Block, *, lang: str, marker: bool = True, typeset: bool = Fa
         num = b.payload.get("number")
         tag = f" \\tag{{{num}}}" if num else ""
         return f"{elem('div', 'eq')}\\[ {_esc(latex)}{tag} \\]</div>"
-    return f"{elem('p')}{prose(text)}</p>"
+    # 正文段（`p` 与其它落不到分支的类型）。小字注区（v16）走**按源行 + 上标**那条路。
+    return f"{elem('p')}{(note_body(text) if _note_em(b) else prose(text))}</p>"
 
 
 def render_fragment(blocks: list[Block], *, lang: str, marker: bool = True,

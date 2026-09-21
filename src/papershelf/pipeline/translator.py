@@ -57,6 +57,19 @@ _MIN_SEAM_WORDS = (6, 3)
 _MIN_WORDS_FIRST, _MIN_WORDS_SECOND = _MIN_SEAM_WORDS
 
 
+def _note_lines(b: Block) -> int:
+    """小字注区（v16）的**源行数**；不是注区则返回 1。
+
+    为什么要一个函数（而不是在两处各写一遍 `count("\\n")+1`）：它是 prompt 规则 8
+    （"一行对一行"）在翻译端的**执行判据**，判据写两份迟早漂开 —— 漂开的后果与
+    `expects_chinese` 那条一样：一处要求、另一处不认，于是"判不合格 → 重译 → 仍不合格"。
+    """
+    p = b.payload if isinstance(b.payload, dict) else {}
+    if not isinstance(p.get("note"), dict):
+        return 1
+    return (b.en or "").count("\n") + 1
+
+
 # 管线模块自己持 logger（不继承调用方）：`server/logging_setup.py` 给 root 挂 handler，
 # 所以 CLI 与容器里都直接可见；线程级 handler（`paper_log`）会把它们抄进单篇日志。
 log = logging.getLogger("papershelf.pipeline.translator")
@@ -85,6 +98,9 @@ SYSTEM_PROMPT = """你是学术论文翻译专家，服务于中文科研人员�
    - 两半**拼起来**必须与那句完整原文一一对应（不增不减、不断错位）。
    两块**仍然是两块**：`data-b` 与块数一律不变，**不要合并成一块**。
    ⚠️ 提示里没给接缝清单时，本条不适用（按普通分块翻译即可）。
+8. **原文里的换行要照抄**（仅当片段里确实有换行时）：小字注/表注这类片段在解析时
+   **按原件的行保留换行** —— 译文必须**行数与行序都相同**（一行对一行），
+   不要把几行并成一段、也不要把一行拆成几行；行首的上标小标（`a` `b` `c`…）原样保留。
 
 ⚠️ 结构要求（最高优先级，违反即视为失败）：
 - 输入的 HTML 片段中每个元素带 `data-b="b-XXXX"` 属性，**必须原样保留**。
@@ -647,7 +663,7 @@ class Translator:
         # 表格的"合格"判据是**形状 + 有没有中文**（`_table_bad`）、参考文献条目是
         # **有没有中文标题**（`_ref_bad`），都与正文的文本判据不同，
         # 所以并进来一起收尾 —— 三处各留一份 needs_review 会导致界面上"待校对"数目对不上。
-        self.needs_review = (self._check(todo, all_texts)
+        self.needs_review = (self._check(todo, all_texts, lines_must_match=False)
                              + [b.id for b in tables if self._table_bad(b)]
                              + [b.id for b in refs if self._ref_bad(b)])
         for bid in self.needs_review:
@@ -776,8 +792,15 @@ class Translator:
         return [b for b in blocks if b.type != "figure" or b.en or b.payload.get("caption")]
 
     @staticmethod
-    def _check(ordered: list[Block], texts: dict[str, str]) -> list[str]:
-        """用与全量校验同一套规则判定单块是否合格。"""
+    def _check(ordered: list[Block], texts: dict[str, str], *,
+               lines_must_match: bool = True) -> list[str]:
+        """用与全量校验同一套规则判定单块是否合格。
+
+        `lines_must_match=False` 只用于**收尾那一次**判定（决定谁挂「待校对」）：
+        小字注区的"行数是否与原文一致"是**结构**要求（prompt 规则 8），
+        重试一次仍不一致时它只会退化成一段普通译文（对照模式两栏形状不对称而已），
+        并不是"译错了" —— 把它算进「待校对」只会让读者看到一堆无意义的黄标。
+        """
         bad: list[str] = []
         for b in ordered:
             if not expects_chinese(b.en, block_type=b.type):
@@ -788,6 +811,11 @@ class Translator:
                 continue
             if len(b.en.strip()) > 40 and not re.search(r"[\u4e00-\u9fff]", t):
                 bad.append(b.id)          # 漏译（仍是英文）
+                continue
+            if lines_must_match and _note_lines(b) > 1 and t.count("\n") + 1 != _note_lines(b):
+                # 小字注区（v16）：译文行数与原文不一致 → 触发**一次**定点重译
+                # （prompt 规则 8 明写了"一行对一行"）。重试仍不一致就接受现状 —— 见 docstring。
+                bad.append(b.id)
                 continue
             # 说明：数字 / 公式编号的偏差不计入重译触发条件——译文合法改写数字的情形存在，
             # 当作失败会导致重试永不收敛（实测烧掉近 2 万 token 仍未通过）。

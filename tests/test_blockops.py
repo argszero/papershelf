@@ -176,6 +176,34 @@ def test_remap_span_clamps_to_the_new_text():
     assert 0 <= got[0] <= got[1] <= len("abXYef")
 
 
+# ── ①b 「只动空白」的映射（`remap_span_ws`，解析 v16 的小字注区用）─────────
+@pytest.mark.parametrize("old,new,s,e,want", [
+    # 空格换成换行：区间整体不动（`remap_span` 在这里会返回很大一片 None —— 那种改写
+    # "处处都变"，最长公共前缀只剩开头一小截）
+    ("one two three", "one\ntwo three", 4, 7, (4, 7)),
+    ("one two three", "one\ntwo three", 0, 3, (0, 3)),
+    # 端点落在**被删掉的空白**上 ⇒ 收到最近的可见字符上（不多带一个空格）
+    # ⚠️ 这里区间是 `" tw"`（含前导空格）⇒ 映射后是 `"tw"`：开头的空格被收掉、末尾没有
+    ("one two", "one\ntwo", 3, 6, (4, 6)),
+    # 行首补了一个空格（`aThese` → `a These`）：这个字母之后的文字整体右移 1
+    ("aThese studies", "a These studies", 1, 13, (2, 14)),
+    ("aThese studies", "a These studies", 0, 1, (0, 1)),
+    # 多行拼一段 → 一段拆多行（正是本工具的活）：每一段都对得上
+    ("x y z", "x\ny\nz", 2, 3, (2, 3)),
+    # 只落在空白上的区间 ⇒ None（它只有坐标，没有可指的字）
+    ("one two", "one\ntwo", 3, 4, None),
+    # 非空白字符变了 ⇒ None（**不是本映射的活**，绝不当成"只动空白"硬映射）
+    ("one two", "one three", 0, 7, None),
+])
+def test_remap_span_ws_maps_whitespace_only_rewrites(old, new, s, e, want):
+    from papershelf.server.blockops import remap_span_ws
+
+    got = remap_span_ws(old, new, s, e)
+    assert got == want
+    if got is not None:
+        assert "".join(new[got[0]:got[1]].split()) == "".join(old[s:e].split())
+
+
 # ── ② 编辑块：本块有据地动、邻居一动不动 ─────────────────────────────────
 def test_edit_zh_only_touches_the_chinese_side(paper):
     """只改中文：英文批注**一个都不动**（两栏是两套坐标系），中文按新文字重锚。"""

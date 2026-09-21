@@ -474,6 +474,11 @@ select.input { width: auto; }
 .pg-band { font-size: calc(var(--doc-fs) - 2.5px); color: var(--muted); line-height: 1.5; }
 .pg-band.pg-top { margin-top: 0; }
 .pg-band.pg-bottom { margin-bottom: 0; }
+/* 小字注区（v16：表注/脚注/作者单位）：字号取自 PDF 原件与正文的比值（服务端
+   `_furn_style` 吐的 `--note-fs`，如 8.5pt/10pt = .85em）；`white-space: pre-line`
+   照抄源行 —— 解析阶段按行拼的块文本（`parse._note_area`），不写这条六行注会折成一段。
+   类名与 `markup.CSS` 里那条必须成对（护栏 `tests/test_page_furniture.py`）。 */
+.pg-note { font-size: var(--note-fs, .85em); color: var(--muted); line-height: 1.45; white-space: pre-line; }
 .pg-rule-below::after, .pg-rule-above::before {
   content: ''; display: block;
   /* v11：**颜色与粗细照抄 PDF**（服务端把原件 stroke 存进 `payload.rule`，

@@ -99,7 +99,13 @@ log = logging.getLogger("papershelf.pipeline.parse")
 #         ——一个候选都取不到（生产 paper 2 实测 182 个碎片 → 0 条，读者看不到任何译文）。
 #         新增 `_author_year_starts`（年份括号锚点 + 作者串往回认），**只在编号判据完全
 #         失效时**才走；见 `_ref_entry_starts` 与 `_RE_REF_AUTHOR`。
-PARSE_VERSION = 15
+#   v16 → **小字注区**（表注 / 脚注 / 作者单位那一块小字，见 `_note_area`）：**保留源行换行**
+#         （原先 `" ".join(text.split())` 把 6 行拼成一段）、盖 `payload["note"]`（字号按
+#         原件与正文的比值，渲染端照抄）与 `payload["markers"]`（行首的上标小标 a/b/c…，
+#         渲染成 `<sup>`）、并照抄**页中**那条注上横线（`_note_rule` —— `_rule_marks` 只看
+#         页顶/页底 14% 的页眉线，注上横线在页面中部 81% 处，从来落不进产物）。
+#         起因：宿主 2026-09-21 截图「这一段提取的不对」「主要是样式不对」。
+PARSE_VERSION = 16
 
 # 页面上下边缘（比例），落在其中的短文本块视为页眉/页脚候选
 EDGE_TOP, EDGE_BOTTOM = 0.075, 0.925
@@ -126,6 +132,22 @@ _RULE_BAND = 0.14           # 只在距页顶/页底这一比例内找页边横�
 _RULE_MAX_THICKNESS = 2.0   # 线的粗细上限（pt）：比这"厚"的是方框/色块，不是规则线
 _RULE_MAX_GAP = 26.0        # 线离那行文字多远之内才算"这行文字的线"（pt）
 _RULE_EDGE_SLACK = 0.06     # 线两端各允许离正文文字列边缘的比例（超过就不是通栏线）
+
+# ── 小字注区（v16：表注 / 脚注 / 作者单位那一小块小字）────────────────────────
+# 宿主 2026-09-21 截图（生产 paper 2 第 21 页那条 a–e 表注）：「这一段提取的不对」。
+# 三处失真全在解析层：①6 行被 `" ".join(text.split())` 拼成一段（换行没了）；
+# ②整块字号 8.5pt（正文 10pt）这个事实没记，渲染端按正文字号出；③注上那条横线没记
+# （`_rule_marks` 只看页顶/页底 14% 的页眉线，这条在页面中部）。
+#
+# 判据（实测 14 份真实 PDF：命中 2 处真值、0 误报 —— 见 v16 的说明）：
+#   **至少 2 行以"上标小标"起头**（行首 span 是单个字母或 1–2 位数字，且比同一行的
+#   主体文字小 `_NOTE_MARK_GAP` pt 以上）**且**整块字号比正文小 `_NOTE_SIZE_GAP` pt。
+#   两条缺一不可：只看出现在行首的小标，会把**展示公式的续行**（`2 e2`、`1 + p3(β5 …)`）
+#   也当成注区（实测 3 处）；只按"字号小于正文"会把所有脚注/页眉都抓进来。
+_NOTE_MARK_RE = re.compile(r"^[a-z]$|^\d{1,2}$")
+_NOTE_MARK_GAP = 0.4        # 行首小标比同一行主体文字小这么多 pt 才算"上标"
+_NOTE_SIZE_GAP = 1.0        # 整块主体字号比正文小这么多 pt 才算"小字"
+_NOTE_MIN_MARKS = 2         # 至少几行以标记起头（一条注通常是 a…b…c…）
 
 # ── 页边矢量图形（v11：出版社/期刊标识）─────────────────────────────────────
 # 「Springer 的马标 + 字标」这类标识在 PDF 里**不是图片，是画出来的矢量填充**：
@@ -770,9 +792,7 @@ def _rule_marks(blocks: list[dict[str, Any]], lines: list[_Line],
     marks: dict[int, dict[str, Any]] = {}
 
     def _spec(ln: _Line, side: str) -> dict[str, Any]:
-        # 至少 1px（PDF 里存在 0.25pt 的细线，折算后四舍五入会归零 —— 归零等于又"没有线"）
-        px = max(1.0, round(ln.width * _PT_TO_PX * 2) / 2)
-        return {"side": side, "color": ln.color, "width": px}
+        return _rule_spec(ln, side)
 
     for ln in lines:
         if ln.x0 > left + slack or ln.x1 < right - slack:
@@ -794,6 +814,158 @@ def _rule_marks(blocks: list[dict[str, Any]], lines: list[_Line],
             if side is not None:
                 marks[id(side)] = _spec(ln, "above")
     return marks
+
+
+def _rule_spec(ln: _Line, side: str) -> dict[str, Any]:
+    """一条线 → `payload["rule"]` 的形状（`{side, color, width}`，`width` 已是 CSS px）。
+
+    ⚠️ 至少 1px（PDF 里存在 0.25pt 的细线，折算后四舍五入会归零 —— 归零等于又"没有线"）。
+    页边横线（`_rule_marks`）与**注上横线**（`_note_rule`，页面中部那条）共用这一份，
+    否则两处会各自算一遍粗细、迟早漂开。
+    """
+    px = max(1.0, round(ln.width * _PT_TO_PX * 2) / 2)
+    return {"side": side, "color": ln.color, "width": px}
+
+
+# ── 小字注区（v16）──────────────────────────────────────────────────────────
+# 见模块头 v16 与文件顶部 `_NOTE_*` 常量处的说明。这里是**判据**部分：
+# 程序只回答"这块是不是小字注区、它有几行、每行行首那个上标小标是什么"，
+# 排版（小字号、换行、上标、那条线）由渲染端照做。
+
+
+@dataclass
+class _NoteLine:
+    """小字注区里的一行。
+
+    `marker` 是**行首那个上标小标**（"a"/"b"/…，没有则空串）；`text` 是这一行的净文本
+    （标记**留在文本里** —— 它是这一行第一个字符，只是渲染时被包进 `<sup>`）。
+    """
+    marker: str
+    text: str
+
+
+@dataclass
+class _NoteArea:
+    """一个**小字注区**（表注 / 脚注 / 作者单位）：若干行 + 每行行首的标记 + 字号比值。
+
+    `em` = 这一块的主体字号 ÷ 正文字号（实测 8.5/10 = 0.85、6.4/8.0 = 0.80），
+    渲染端拿它当 `font-size`（`--note-fs`）—— 字号是**原件的事实**，不让渲染端自己猜
+    （同 `payload["rule"]` 的颜色粗细：判据与数值都只写一份）。
+    """
+    lines: list[_NoteLine]
+    em: float
+
+    @property
+    def text(self) -> str:
+        """块文本：**按源行拼接**（换行符留在文本里，渲染端用 `white-space: pre-line`）。"""
+        return "\n".join(x.text for x in self.lines)
+
+    @property
+    def markers(self) -> list[str]:
+        """与行平行的行首标记（没标记的行是空串）；渲染端据此把行首那个字母包进 `<sup>`。"""
+        return [x.marker for x in self.lines]
+
+
+def _line_texts(block: dict[str, Any]) -> list[tuple[str, str, float, float]]:
+    """块 → 每行的 `(行首 span 文本, 行净文本, 行首字号, 本行主体字号)`。
+
+    ⚠️ 逐**行**取（不是 `_spans` 那样把所有行拉平）：小字注区的判据、换行保留、
+    上标标记都只在行这个粒度上成立 —— 拉平之后"哪一行以 a 起头"就无从知道了。
+    """
+    out: list[tuple[str, str, float, float]] = []
+    for line in block.get("lines", []):
+        spans = [s for s in line.get("spans", []) if s.get("text", "").strip()]
+        if not spans:
+            continue
+        text = clean_text("".join(s.get("text", "") for s in line.get("spans", []))).strip()
+        if not text:
+            continue
+        first = spans[0].get("text", "").strip()
+        try:
+            first_size = float(spans[0].get("size", 0.0))
+            major = max(float(s.get("size", 0.0)) for s in spans)
+        except (TypeError, ValueError):
+            continue
+        out.append((first, text, first_size, major))
+    return out
+
+
+def _main_size(rows: list[tuple[str, str, float, float]]) -> float:
+    """块的主体字号 = 按**字符数加权**的最常见行字号（与 `_body_size` 同一取向）。
+
+    不取 `max`：注区里那几行小标本身就是"最小的字号"，取 max 反而会被偶发的
+    一个大字号 span 抬起来；不取 `min` 同理。按字符数加权最稳 —— 一行注有 100 多个
+    字符，而那个上标只有 1 个。
+    """
+    counts: Counter[float] = Counter()
+    for _first, text, _fs, major in rows:
+        counts[round(major, 1)] += len(text)
+    return counts.most_common(1)[0][0] if counts else 0.0
+
+
+def _note_area(block: dict[str, Any], body_size: float) -> _NoteArea | None:
+    """块是不是**小字注区**（表注 / 脚注 / 作者单位）；是则返回行与字号比值，否则 None。
+
+    判据两条**缺一不可**（实测 14 份真实 PDF：命中 2 处真值、零误报）：
+    ① 至少 `_NOTE_MIN_MARKS` 行以**上标小标**起头（行首 span 是单字母 / 1–2 位数字，
+       且比同一行的主体字号小 `_NOTE_MARK_GAP` pt 以上）；
+    ② 整块主体字号比正文小 `_NOTE_SIZE_GAP` pt 以上。
+
+    只靠 ①：展示公式的续行（`2 e2`）也"以数字起头"，实测 3 处误报；
+    只靠 ②：所有脚注、页眉页脚、图注都会进来。
+    """
+    rows = _line_texts(block)
+    if len(rows) < 2:
+        return None
+    hits = [i for i, (first, _t, fs, major) in enumerate(rows)
+            if _NOTE_MARK_RE.match(first) and fs < major - _NOTE_MARK_GAP]
+    if len(hits) < _NOTE_MIN_MARKS:
+        return None
+    main = _main_size(rows)
+    if main <= 0 or main >= body_size - _NOTE_SIZE_GAP:
+        return None
+    lines: list[_NoteLine] = []
+    for i, (first, text, _fs, _major) in enumerate(rows):
+        marker = first if i in hits and text.startswith(first) else ""
+        if marker and len(text) > len(marker) and not text[len(marker)].isspace():
+            # PDF 里上标小标与后面的字之间**没有空格**（`aThese studies…`：间距是**画**出来的，
+            # 不是字符）—— 补一个空格，读起来才是「a These studies…」。补在**解析期**、
+            # 也就是任何批注产生之前，所以不影响任何坐标系。
+            text = f"{marker} {text[len(marker):]}"
+        lines.append(_NoteLine(marker=marker, text=text))
+    return _NoteArea(lines=lines, em=round(main / body_size, 3))
+
+
+def _note_rule(block: dict[str, Any], lines: list[_Line]) -> dict[str, Any] | None:
+    """小字注区**上方**那条注上横线 → `payload["rule"]`（形状与页边横线完全一致）。
+
+    为什么另开一条判据（宿主 2026-09-21 截图：「上方少了那条横线」）：
+    `_rule_marks` 只在页顶/页底 14%（`_RULE_BAND`）里找**页眉线**，而这条在页面**中部**
+    （实测生产 paper 2：`y=640.5 / 792` = 81%）—— 判据的窗口从来没罩到它，不是"渲染丢了"。
+
+    ⚠️ 只对**已经认出的小字注区**做这件事：不放开 `_RULE_BAND`（放开会把正文里的表格线、
+    图框线一起抓进来 —— 画错线比没有线更像排版事故）。判据：线在块上方
+    `_RULE_MAX_GAP` 之内、且**横跨这一块的宽度**（两端各留 `_RULE_EDGE_SLACK`）。
+    """
+    if not lines:
+        return None
+    x0, x1 = block["bbox"][0], block["bbox"][2]
+    slack = (x1 - x0) * _RULE_EDGE_SLACK
+    best: tuple[float, _Line] | None = None
+    for ln in lines:
+        if ln.x0 > x0 + slack or ln.x1 < x1 - slack:
+            continue                                     # 半截线：不横跨这一块
+        gap = block["bbox"][1] - ln.y1
+        if 0 <= gap <= _RULE_MAX_GAP and (best is None or gap < best[0]):
+            best = (gap, ln)
+    # ⚠️ 是 `"above"`（`::before`）：这条线在注区的**上边**（实测生产 paper 2 第 21 页
+    #    `y=640.5` 线、注区首行 `y=648.3`）—— 它把上方的表格与下方的注分开。
+    #    写成 `"below"`（第一版的笔误）时线会画在注区**下面**，看着像"注下面多了一条线"，
+    #    而不是宿主说的"上方少了那条横线"。判据的 gap 本来就是按"线在块上方"算的
+    #    （`block.bbox[1] - ln.y1`），两侧口径必须一致。
+    #    页边横线（`_rule_marks`）的 `"below"` 是另一回事：那两条判据算的是
+    #    "线在**块**的哪一侧"（页眉线在页眉文字之下），与这里同口径。
+    return _rule_spec(best[1], "above") if best else None
 
 
 def _rect_overlaps(a: Any, b: Any, tol: float = _FIG_TOL) -> bool:
@@ -2177,7 +2349,20 @@ def parse_pdf(
                                band, rule, shade)
                 continue
 
-            blk = _tag_furniture(add("p", " ".join(text.split()), section=section), band, rule, shade)
+            # 小字注区（表注/脚注/作者单位，v16）：**按源行拼**（换行留在文本里）、
+            # 盖注戳（字号比 + 行首上标标记）与它上方那条注上横线。
+            note = _note_area(b, body_size)
+            blk = _tag_furniture(
+                add("p", note.text if note else " ".join(text.split()), section=section),
+                band, rule, shade)
+            if note is not None:
+                blk.payload["note"] = {"em": note.em}
+                blk.payload["markers"] = note.markers
+                # 注上横线：页边横线（`rule`）已经认领过就不动（那一侧的线更权威）
+                if "rule" not in blk.payload:
+                    nrule = _note_rule(b, lines_per_page[page_no - 1])
+                    if nrule:
+                        blk.payload["rule"] = nrule
             # 疑似「栏间被切开的续段」→ 盖戳（**只标记**，"该不该并"交给①c 校对 agent，
             # 见 `_column_spill_seams`）。
             if id(b) in seams:
