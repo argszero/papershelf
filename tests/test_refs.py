@@ -25,7 +25,8 @@ import pytest
 from papershelf.pipeline.markup import render_block
 from papershelf.pipeline.model import Block, Doc, make_block_id
 from papershelf.pipeline.parse import (_join_ref_fragments, _merge_ref_run, _ref_entry_starts,
-                                      merge_ref_entries, split_ref_entries)
+                                      merge_ref_entries, rebuild_ref_entries,
+                                      split_ref_entries)
 from papershelf.pipeline.translator import (LLMConfig, Translator, fold_for_match, ref_zh_text,
                                             title_span)
 from papershelf.pipeline.validate import NO_ZH_TYPES, expects_chinese, validate
@@ -352,8 +353,100 @@ def test_merge_splits_every_run_of_a_multipage_reference_list():
     assert [b.en.split("]")[0] for b in refs] == [f"[{n}" for n in range(1, 13)]
     assert all(b.en.rstrip().endswith(".") for b in refs)  # 每条都完整（带着尾部的卷期页）
     band = [b for b in out if (b.payload or {}).get("band")]
-    assert len(band) == 4 and all(b.type == "refs" for b in band)   # 页眉页脚原地不动
-    assert _flat("".join(b.en for b in out)) == _flat("".join(b.en for b in blocks))
+    assert len(band) == 4 and all(b.type == "refs" for b in band)   # 页眉页脚自己的文字不动
+    # ⚠️ v17 起这些家具块会被放回**本页的边界**（页脚在本页条目之后、页眉在下一页之前），
+    #    所以 out 的整体顺序与输入不同 —— 守恒的是**条目**那部分文字。
+    frags = [b for b in blocks if b.type == "refs" and not (b.payload or {}).get("band")]
+    assert _flat("".join(b.en for b in refs)) == _flat("".join(b.en for b in frags))
+    assert [b.en for b in band] == [b.en for b in blocks if (b.payload or {}).get("band")]
+    pages = [b.payload.get("page") for b in out if b.type in ("ref", "refs")]
+    assert pages == sorted(pages), pages      # 页码不许回退（阅读器按连续同页切 section）
+
+
+def test_an_entry_severed_by_page_furniture_is_rejoined():
+    """**页面家具只挡文字、不切断条目流**（v17）。
+
+    生产实测 6 条条目的形状：一条条目正跨页，上半截在上一页、下半截被页眉隔到了下一段里
+    —— 两段各自都凑不出连号 ⇒ 上半截成了**残缺的 `ref`**、下半截留在免中文的 `refs` 里。
+    文字一个字没丢，但那半条既没有译文、也无法重译（`RETRANSLATE_TYPES` 不含 `refs`）。
+    """
+    head = Block(id="b-0001", type="h2", en="REFERENCES")
+    blocks = [
+        head,
+        _frag("[1] Alpha study of things A. J Test 1:1.", page=8),
+        _frag("[2] Beta study of things B, whose title carries", page=8),
+        _frag("Journal of Test 160 (2026) 50-81", band="top", page=9),      # 页眉
+        _frag("over the page break. J Test 2:2.", page=9),                  # ← [2] 的后半截
+        _frag("[3] Gamma study of things C. J Test 3:3.", page=9),
+        _frag("[4] Delta study of things D. J Test 4:4.", page=9),
+    ]
+    out = merge_ref_entries(blocks, 1)
+    refs = [b for b in out if b.type == "ref"]
+    assert [b.en[:4] for b in refs] == ["[1] ", "[2] ", "[3] ", "[4] "]
+    assert refs[1].en.endswith("J Test 2:2.")                  # 尾巴接回**同一条**
+    assert "carries over the page break" in refs[1].en
+    # 没留下任何碎片（`refs` 只剩页面家具，它本来就该免中文）
+    assert not [b for b in out if b.type == "refs" and not (b.payload or {}).get("band")]
+    # 页眉自己的文字绝不进条目，且它仍是**一个**块、仍带着自己那页的记号
+    assert "Journal of Test" not in " ".join(b.en for b in refs)
+    band = [b for b in out if (b.payload or {}).get("band")]
+    assert [b.en for b in band] == ["Journal of Test 160 (2026) 50-81"]
+    assert (band[0].payload["page"], band[0].payload["band"]) == (9, "top")
+    # 文字守恒：条目文字 == 全部非家具碎片的文字（只动空白）
+    frags = [b for b in blocks if b.type == "refs" and not (b.payload or {}).get("band")]
+    assert _flat("".join(b.en for b in refs)) == _flat("".join(b.en for b in frags))
+    # 页码单调，且页眉落在**本页第一个条目之前**
+    pages = [b.payload.get("page") for b in out if b.type in ("ref", "refs")]
+    assert pages == sorted(pages), pages
+    assert [b.type for b in out[2:5]] == ["ref", "refs", "ref"]
+
+
+def test_a_severed_entry_does_not_guess_at_a_broken_word():
+    """跨页那一下仍然**只动空白**：`man-` + `ufacturing` 照原样接，不许补成 `manufacturing`。"""
+    blocks = [
+        _frag("[1] Alpha study of things. J Test 1:1.", page=8),
+        _frag("[2] Beta study of Metal additive man-", page=8),
+        _frag("Journal of Test 160 (2026) 50-81", band="top", page=9),
+        _frag("ufacturing (MAM) applications. J Test 2:2.", page=9),
+    ]
+    refs = [b for b in merge_ref_entries(blocks, 0) if b.type == "ref"]
+    assert len(refs) == 2, [b.en for b in refs]
+    assert "man-ufacturing" in refs[1].en
+    assert "manufacturing" not in refs[1].en
+
+
+def test_a_run_that_cannot_be_split_is_returned_verbatim_with_its_furniture():
+    """切不出条目就**原样返回** —— 连家具块的位次都不动（宁可不动，也不重排一段修不好的东西）。"""
+    blocks = [
+        Block(id="b-0001", type="h2", en="REFERENCES"),
+        _frag("Some trailing material with no numbering at all. " * 3, page=8),
+        _frag("J Test 160 (2026) 50-81", band="top", page=9),
+        _frag("And more of the same. " * 3, page=9),
+    ]
+    assert [b.en for b in merge_ref_entries(blocks, 1)] == [b.en for b in blocks]
+
+
+def test_rebuild_ref_entries_also_rejoins_a_severed_entry():
+    """存量出口（「重建参考文献」）走同一条合并：家具块 **id 不变**（钉在它上面的批注
+    不用搬家），被合并掉的碎片照旧给出坐标表。"""
+    blocks = [
+        Block(id="b-0001", type="h2", en="REFERENCES"),
+        Block(id="b-0002", type="refs", en="[1] Alpha study of things A. J Test 1:1.",
+              payload={"page": 8}),
+        Block(id="b-0003", type="refs", en="[2] Beta study of things B, whose title carries",
+              payload={"page": 8}),
+        Block(id="b-0004", type="refs", en="Journal of Test 160 (2026) 50-81",
+              payload={"band": "top", "page": 9}),
+        Block(id="b-0005", type="refs", en="over the page break. J Test 2:2.",
+              payload={"page": 9}),
+    ]
+    out, moves = rebuild_ref_entries(blocks, 0)
+    refs = [b for b in out if b.type == "ref"]
+    assert [b.id for b in refs] == ["b-0006", "b-0007"]        # 接着现有最大号发
+    assert refs[1].en.endswith("J Test 2:2.") and "carries over the page break" in refs[1].en
+    assert any(b.id == "b-0004" for b in out)                  # 页眉块 id 不变
+    assert "Journal of Test" not in " ".join(b.en for b in refs)
+    assert set(moves) == {"b-0002", "b-0003", "b-0005"}        # 三个碎片都有坐标表
 
 
 def test_merged_ref_entries_drop_the_stale_seam_stamp():
@@ -478,6 +571,64 @@ def test_parse_merges_every_run_of_a_reference_list_spanning_pages(tmp_path):
     assert "Journal of Test" not in " ".join(b.en for b in refs)
     assert "75" not in " ".join(b.en for b in refs)
     assert any(b.en.strip() == "REFERENCES" for b in doc.blocks)     # 小标题照旧在
+
+
+def _straddling_refs_pdf(path):
+    """合成**两页**：第 1 页末尾是条目 2 的**前半截**，第 2 页页眉之后才接它的后半截。
+
+    这正是生产上那 6 条条目的形状（上半截成了残缺的 `ref`、下半截留在免中文的 `refs`）。
+    ⚠️ 第 1 页那半截的底边必须留在页底带之外（`EDGE_BOTTOM` = 0.925 ⇒ y < 779），
+    否则**它自己**就会被当成页脚盖 `payload["band"]` —— 那是另一件事，会把这个测试测糊。
+    """
+    fitz = pytest.importorskip("fitz")
+    src = fitz.open()
+    pg = src.new_page(width=595, height=842)
+    for k in range(7):
+        pg.insert_textbox(fitz.Rect(51, 60 + k * 45, 549, 100 + k * 45),
+                          f"Body paragraph {k + 1}: machine learning in additive "
+                          "manufacturing is studied here. " * 2, fontsize=10)
+    pg.insert_textbox(fitz.Rect(51, 400, 549, 435), "REFERENCES", fontsize=12)
+    pg.insert_textbox(fitz.Rect(51, 450, 549, 480),
+                      "1. Alpha S, Beta T (2024) Metal additive manufacturing in vehicle parts. "
+                      "Metals 14(2):195.", fontsize=9)
+    pg.insert_textbox(fitz.Rect(51, 490, 549, 560),
+                      "2. Gamma U (2023) A review on laser powder bed fusion of aluminium alloys "
+                      "for aerospace components, with a focus on", fontsize=9)
+    pg2 = src.new_page(width=595, height=842)
+    pg2.insert_textbox(fitz.Rect(51, 25, 549, 45),
+                       "Journal of Test 160 (2026) 50-81", fontsize=9)          # 页眉
+    pg2.insert_textbox(fitz.Rect(51, 80, 549, 130),
+                       "process windows and defect formation. Mater Res Express 11(2):022001.",
+                       fontsize=9)                                             # ← 条目 2 的后半截
+    pg2.insert_textbox(fitz.Rect(51, 150, 549, 200),
+                       "3. Delta V, Epsilon W (2022) Fatigue of additively manufactured "
+                       "Ti-6Al-4V. Prog Mater Sci 115:106706.", fontsize=9)
+    src.save(str(path))
+    src.close()
+
+
+def test_parse_completes_an_entry_that_straddles_a_page_break(tmp_path):
+    """真解析：条目跨页 + 页眉夹在中间 ⇒ 它仍是**一条完整条目**（不是"半条 + 一个碎片"）。
+
+    修前：上半截是残缺的 `ref`，下半截留在免中文的 `refs` 里 —— 文字一个字没丢，
+    但那半条既没有译文、也无法重译。
+    """
+    pdf = tmp_path / "straddling_refs.pdf"
+    _straddling_refs_pdf(pdf)
+    from papershelf.pipeline.parse import parse_pdf
+    doc = parse_pdf(pdf, assets_dir=tmp_path / "assets")
+    refs = [b for b in doc.blocks if b.type == "ref"]
+    assert [b.en.split(".")[0] for b in refs] == ["1", "2", "3"], \
+        [(b.type, b.en[:40]) for b in doc.blocks]
+    assert refs[1].en.startswith("2. Gamma") and refs[1].en.endswith("11(2):022001.")
+    assert "process windows and defect formation" in refs[1].en       # 跨页那半截接上了
+    # 页眉既没被吃进条目，也没留下一个免中文的碎片
+    assert "Journal of Test" not in " ".join(b.en for b in refs)
+    assert [b for b in doc.blocks if b.type == "refs" and not (b.payload or {}).get("band")] == []
+    band = [b for b in doc.blocks if (b.payload or {}).get("band")]
+    assert [b.en for b in band] == ["Journal of Test 160 (2026) 50-81"]
+    pages = [b.payload.get("page") for b in doc.blocks if b.type in ("ref", "refs")]
+    assert pages == sorted(pages), pages
 
 
 # ── 5. 「只译标题」的定位：模型把行末断词拼回去也要对得上 ─────────────────
