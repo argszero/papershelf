@@ -105,7 +105,14 @@ log = logging.getLogger("papershelf.pipeline.parse")
 #         渲染成 `<sup>`）、并照抄**页中**那条注上横线（`_note_rule` —— `_rule_marks` 只看
 #         页顶/页底 14% 的页眉线，注上横线在页面中部 81% 处，从来落不进产物）。
 #         起因：宿主 2026-09-21 截图「这一段提取的不对」「主要是样式不对」。
-PARSE_VERSION = 16
+#   v17 → **参考文献条目跨页面家具续接**（`_merge_ref_tail`）：页眉/页脚（`payload["band"]`）
+#         依旧是**边界**（它们自己的文字绝不进条目），但不再把条目流**切断** —— 一条条目
+#         正好跨页时，上半截留在上一页、下半截被页眉隔到了下一段，两段各自都凑不出连号
+#         ⇒ 上半截成了残缺的 `ref`、下半截留在免中文的 `refs` 里（文字一个字都没丢，
+#         但那半条既没有译文、也无法重译）。合并流改为**跳过**家具块继续走；家具块按
+#         **页码**放回原位（页眉在本页第一个条目之前、页脚在本页最后一个之后，
+#         见 `_place_ref_furniture`）。
+PARSE_VERSION = 17
 
 # 页面上下边缘（比例），落在其中的短文本块视为页眉/页脚候选
 EDGE_TOP, EDGE_BOTTOM = 0.075, 0.925
@@ -1423,9 +1430,14 @@ def merge_ref_entries(blocks: list[Any], from_index: int) -> list[Any]:
 
     - 只有 `refs` 类型、且**没有页眉/页脚戳**（`payload["band"]`）的块参与合并：
       页眉恰好落在参考文献那两页时也会被 3c 打成 `refs`，把它接进来会污染条目。
-    - 连续的碎片算一段；段与段之间隔着别的块（图/表）→ 各段独立合并。
+    - 但页面家具**只挡文字、不切断条目流**（v17）：一条条目正好跨页时，它的两半被页眉/
+      页脚隔着，两段各自都凑不出连号 ⇒ 原先上半截成了残缺的 `ref`、下半截留在免中文的
+      `refs` 里（一个字没丢，但那半条既没有译文、也无法重译）。现在合并流**跳过**家具块
+      继续往下走（它们的文字照旧绝不进条目），条目因此能接完整；被跳过的家具块按**页码**
+      放回原位（见 `_place_ref_furniture`）。
+    - 连续的碎片算一段；段与段之间隔着**别的块**（图/表/标题）→ 各段独立合并。
     - 段里切不出条目（没有编号，或编号判据中途失效）→ **原样返回那一段**，
-      不产出一个两千字的"条目"，也不丢字。
+      不产出一个两千字的"条目"，也不丢字（连家具块的位次都照旧）。
     """
     return _merge_ref_tail(blocks, from_index, None, want_moves=False)[0]
 
@@ -1467,19 +1479,38 @@ def _merge_ref_tail(blocks: list[Any], from_index: int, ids: Any,
     head, tail = blocks[:from_index], blocks[from_index:]
     out: list[Any] = []
     moves: dict[str, list[RefSpan]] = {}
-    run: list[Any] = []
+    run: list[Any] = []          # 参与合并的碎片（`refs`，且没有 `band` 戳）
+    held: list[Any] = []         # 段内被跳过、待放回原位的页面家具（有 `band` 戳）
+    seg: list[Any] = []          # 这一段**原样的**块序列（切不出条目时照它返回）
 
     def flush() -> None:
-        if run:
-            merged, mv = _merge_ref_run_mapped(run, ids)
-            out.extend(merged)
-            for k, v in mv.items():
-                moves.setdefault(k, []).extend(v)
-            run.clear()
+        if not seg:
+            return
+        if not run:                          # 只可能是"家具排在段首"，理论上不会发生
+            out.extend(seg)
+            held.clear()
+            seg.clear()
+            return
+        merged, mv = _merge_ref_run_mapped(run, ids)
+        if any(b.type == "ref" for b in merged):
+            out.extend(_place_ref_furniture(merged, held))
+        else:
+            out.extend(seg)                  # 切不出条目 → 这一段原样（家具的位次也不动）
+        for k, v in mv.items():
+            moves.setdefault(k, []).extend(v)
+        run.clear()
+        held.clear()
+        seg.clear()
 
     for b in tail:
         if b.type == "refs" and not (b.payload or {}).get("band"):
             run.append(b)
+            seg.append(b)
+        elif b.type == "refs" and run:
+            # 页面家具（页眉/页脚）：**不进条目**（它的文字绝不参与合并），
+            # 但也不许把条目流**切断**（v17）—— 一条条目跨页时两半正是被它隔开的。
+            held.append(b)
+            seg.append(b)
         else:
             flush()
             out.append(b)
@@ -1554,6 +1585,42 @@ def _merge_ref_run_mapped(run: list[Any],
         register(a, b, blk.id)
     log.info("  · 参考文献 %d 个碎片块 → %d 条（%s）", len(run), len(texts), first.id)
     return out, moves
+
+
+def _place_ref_furniture(entries: list[Any], furniture: list[Any]) -> list[Any]:
+    """把段内跳过的**页面家具**按页码放回它该在的位次（v17）。
+
+    位置判据只有页码：**页眉在本页第一个条目之前、页脚在本页最后一个条目之后**。
+    条目侧读 `payload["page"]`（`payload_at` 按"起点落在哪个碎片"取值），家具侧读它自己
+    那一页 —— 两串页码都已经是现成的事实，不需要再猜。
+
+    ⚠️ 不能把家具一律堆在段尾：阅读器按**连续同页**切页 section（`payload.page`），
+    页码一旦回退（第 9 页的条目后面跟着第 8 页的页脚）就会凭空多出一个第 8 页的 section。
+
+    家具缺页码、页码不是整数，或 `band` 不是已知的一侧（旧产物 / 手工构造的块）→
+    退到"排在全部条目之后"并保持传入顺序：宁可位置不完美，也不凭猜测插进中间。
+    """
+    if not furniture:
+        return list(entries)
+    out: list[Any] = []
+    i = 0
+    for f in furniture:
+        pay = f.payload or {}
+        page = pay.get("page")
+        stop_at: int | None = None
+        if isinstance(page, int):
+            # 页眉 → 停在"本页第一个条目"之前；页脚 → 跳过本页的条目，停在下页之前
+            stop_at = page if (pay.get("band") or "top") == "top" else page + 1
+        while i < len(entries):
+            ep = (entries[i].payload or {}).get("page")
+            if stop_at is None or not isinstance(ep, int) or ep < stop_at:
+                out.append(entries[i])
+                i += 1
+            else:
+                break
+        out.append(f)
+    out.extend(entries[i:])
+    return out
 
 
 def _desmallcaps(text: str) -> str:
