@@ -37,12 +37,23 @@ services:
       start_period: 10s
       retries: 3
 
-    # 转换（fitz 解析 + LLM 调用）是内存与 CPU 的短期尖峰；
-    # 不设 hard limit，避免在弱机器上把转换直接 OOM 掉，只声明"预期用量"。
+    # 转换（fitz 解析 + LLM 调用）是内存与 CPU 的短期尖峰。
+    #
+    # **必须设硬上限**（2026-10-26 生产事故）：没有上限时，容器内失控的内存增长拖死的是
+    # 宿主机上**所有**服务 —— 实测一台 1888 MB 的机器上 11 个容器连同 SSH 一起失去响应
+    # （TCP 22 可连、sshd 从不 accept），只能控制台重启。有上限时越界的是这一个容器，
+    # 至少还能被重启、还能留下日志。
+    #
+    # 900m 是 2 核 / 2 GB 机器的保守值；内存更大的机器用 PAPERSHELF_MEM_LIMIT 调高。
+    # `memswap_limit` 与 `mem_limit` **同值** = 不许拿 swap 兜底；两者不同值时，
+    # 内核会以为还有 swap 可用，在零 swap 的机器上表现为"越界很久之后才被杀"。
+    mem_limit: ${PAPERSHELF_MEM_LIMIT:-900m}
+    memswap_limit: ${PAPERSHELF_MEM_LIMIT:-900m}
+
     deploy:
       resources:
         reservations:
-          memory: 256M
+          memory: 256M      # 只是"预期用量"的声明，不构成任何限制
 
 volumes:
   papershelf-data:

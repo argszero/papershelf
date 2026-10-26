@@ -44,6 +44,47 @@ def concurrency_semaphore() -> threading.Semaphore:
         return _sem
 
 
+def release_memory() -> bool:
+    """把一次转换攒下的内存**还给操作系统**。返回是否真的调了 `malloc_trim`。
+
+    ## 为什么 `del` / 离开作用域不够
+
+    生产实测（2026-10-26，1888 MB / 2 核 / 零 swap）：连续上传几篇 PDF，容器 RSS 从
+    447 MB 单调涨到 518 MB、历史峰值 670 MB，同机 11 个容器一并失去响应。
+    关键读数是 `VmData 563 MB > VmRSS 492 MB` —— **进程已经 free 掉的内存仍攥在 glibc
+    的 arena 里，从未还给内核**；`smaps_rollup` 的匿名内存 479 MB / 文件映射仅 17 MB
+    同时排除了"PDF 被 mmap 住"与"SQLite 页缓存"两个方向。
+
+    一篇转换要开 PDF、渲染页图、跑 LLM 请求、拼 HTML，峰值远高于稳态。峰值过后如果
+    不归还，下一篇就在更高的起点上再冲一次 —— 连续几篇即撞上悬崖。
+
+    `gc.collect()` 先把循环引用回收掉（不回收的话那些页还不算 free，`trim` 也拿不走），
+    再让 glibc 把 arena 顶部可释放的页交还内核。
+
+    ⚠️ 非 glibc 平台（macOS / musl / Windows）没有这个符号 —— **静默跳过**，返回 False。
+    ⚠️ 本函数**绝不抛异常**：它挂在 `finally` 里，抛出去会把真正的转换错误盖掉。
+    """
+    import gc
+
+    gc.collect()
+    try:
+        import ctypes
+
+        try:
+            libc = ctypes.CDLL("libc.so.6")       # glibc（生产镜像是 Debian slim）
+        except OSError:
+            libc = ctypes.CDLL(None)              # macOS / 其它 libc：符号通常不存在
+        trim = getattr(libc, "malloc_trim", None)
+        if trim is None:
+            log.debug("当前平台没有 malloc_trim，跳过内存归还")
+            return False
+        trim(0)
+        return True
+    except Exception as exc:                       # noqa: BLE001 — 归还失败不该毁掉转换
+        log.debug("malloc_trim 调用失败（不影响转换）：%s", exc)
+        return False
+
+
 def claim_paper(conn: sqlite3.Connection, paper_id: int) -> bool:
     """**认领**：`queued → doing`（原子）。False = 这篇不归我跑（别人先抢到/已跑完）。
 
@@ -180,6 +221,10 @@ def convert_paper(paper_id: int, fingerprint: str | None = None) -> None:
                          paper_id, len(doc.blocks), tokens, time.monotonic() - t0)
     finally:
         conn.close()
+        # 收尾必须**真的把内存还给操作系统**：RSS 只涨不回，连续几篇就把整机拖死
+        # （见 release_memory 的实测读数）。挂在 finally 上 ⇒ 成功、失败、只修文献
+        # 三条路径都会走到；两条 `return` 的早退路径也一样（代价只是几毫秒的 gc）。
+        release_memory()
 
 
 def _run_refs_fix(conn: sqlite3.Connection, paper_id: int, t0: float) -> None:
@@ -386,7 +431,8 @@ def _run(conn: sqlite3.Connection, paper: dict, settings, fingerprint: str | Non
                          max_rounds=settings.proofread_max_rounds,
                          token_budget=settings.proofread_token_budget,
                          retries=settings.proofread_retries,
-                         thinking=settings.proofread_thinking)
+                         thinking=settings.proofread_thinking,
+                         image_cache=settings.proofread_image_cache)
         try:
             stats = pf.proofread_doc(doc, proofread_pdf, skip_pages=done_pages)
             tokens += stats.tokens

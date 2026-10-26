@@ -71,6 +71,21 @@ docker run -d --name papershelf --restart unless-stopped \
 | `PAPERSHELF_EMAIL_DOMAIN_ALLOWLIST` | 注册白名单（逗号分隔的**域名后缀**，含子域） | `edu.cn,ac.cn` |
 | `PAPERSHELF_SMTP_HOST` + `_FROM`（+`_PORT/_USER/_PASS/_TLS`） | **配全 → 开放自助注册（邮件激活）；未配 → 自动关闭注册，改由管理员开号** | 空 |
 | `PAPERSHELF_SHARE_HOURS` | 分享默认有效期（小时，**硬上限 24**，填更大也只按 24 算） | `24` |
+| `PAPERSHELF_MAX_UPLOAD_MB` | 单个 PDF 上传体积上限（超出返回 413） | `256` |
+| `PAPERSHELF_PROOFREAD_IMAGE_CACHE` | ①c 校对时缓存的页图条数（每条约 300–400 KB，只影响本地渲染次数、不花 token） | `12` |
+| `PAPERSHELF_MEM_LIMIT` | 容器内存硬上限，**由 `docker-compose.yml` 读取，应用本身不读** | `900m` |
+
+### 内存（务必看一眼）
+
+转换是内存尖峰：解析 PDF、渲染页图、调用 LLM，峰值远高于稳态。
+
+- `docker-compose.yml` 给容器设了**硬上限**（默认 `900m`，用 `PAPERSHELF_MEM_LIMIT` 覆盖），
+  并令 `memswap_limit` 与它同值 ⇒ 不许拿 swap 兜底。越界时被杀的是**这个容器**，
+  而不是整台机器上的所有服务。
+- 因此**至少给容器留 1 GB 内存**，或者配 swap。机器内存不到 1 GB 时，把
+  `PAPERSHELF_MEM_LIMIT` 调成该机器真能承受的值，并把 `PAPERSHELF_MAX_CONCURRENCY` 降到 `1`。
+- 事故背景（2026-10-26）：一台 1888 MB / 2 核 / 零 swap 的机器连续上传几篇 PDF，
+  容器 RSS 只涨不回，同机 11 个容器连同 SSH 一起失去响应，只能控制台重启。
 
 ### 没有邮件服务怎么办
 
@@ -99,7 +114,7 @@ server {
     listen 443 ssl http2;
     server_name papershelf.example.com;
 
-    # 上传的是 PDF，别用默认的 1M
+    # 上传的是 PDF，别用默认的 1M（应用侧另有 PAPERSHELF_MAX_UPLOAD_MB，默认 256 MB）
     client_max_body_size 100m;
 
     location / {
