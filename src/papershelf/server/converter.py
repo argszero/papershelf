@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import logging
+import shutil
 import sqlite3
 import threading
 import time
@@ -374,6 +375,7 @@ def _run(conn: sqlite3.Connection, paper: dict, settings, fingerprint: str | Non
         if not pdf_path.exists():
             raise FileNotFoundError(f"PDF 不存在：{pdf_path}")
         # 缓存去重（待定项 7）：同一份 PDF 的解析结果复用，省下解析与公式 LaTeX 化的开销
+        assets_dir = settings.papers_dir / f"p{paper['id']}" / "assets"
         cached = None
         if fingerprint:
             row = conn.execute("SELECT doc_json FROM doc_cache WHERE fingerprint=?",
@@ -381,10 +383,24 @@ def _run(conn: sqlite3.Connection, paper: dict, settings, fingerprint: str | Non
             cached = row["doc_json"] if row else None
         if cached:
             doc = Doc.from_json(cached)
-            log.info("① 解析：命中解析缓存（fingerprint=%s…），跳过 PDF 解析", fingerprint[:12])
-        else:
+            # ⚠️ 缓存键是**全库一个命名空间**（`sha256("parse-v{N}" + PDF 字节)`，不含
+            #    paper/plan/user），而资产是**按篇**落盘的（`p<id>/assets`），块里只记相对名
+            #    `assets/<name>` ⇒ 同一份 PDF 的第二篇命中缓存时，它引用的图只在**第一篇**的
+            #    目录里，而 `_serve_asset` 的白名单不允许越出 `p<pid>/assets`。
+            #    不搬过来 = 这一篇的插图全部 404，且永不自愈（同一个 key 永远命中）。
+            if _materialise_cached_assets(doc, settings, int(paper["id"]), assets_dir):
+                log.info("① 解析：命中解析缓存（fingerprint=%s…），跳过 PDF 解析",
+                         fingerprint[:12])
+            else:
+                # 源目录已被删（那一篇被删文献了）或旧缓存没记来源 ⇒ 为这一篇就地重解析。
+                # 代价只有这一篇的解析，不触发 ①c/翻译的重新计费之外的东西。
+                log.info("① 解析：命中解析缓存但图片资产不全 → 为这一篇就地重新解析")
+                cached = None
+        if not cached:
             t_parse = time.monotonic()
-            doc = parse_pdf(pdf_path, assets_dir=settings.papers_dir / f"p{paper['id']}/assets")
+            doc = parse_pdf(pdf_path, assets_dir=assets_dir)
+            # 记下"这份缓存文档的图片在哪个目录"：下一次别人命中它时要靠这条把资产搬过去
+            doc.meta["assets_dir"] = f"p{paper['id']}/assets"
             # arXiv/上传的元数据提示：文件名常含标题，交给后续元数据抽取
             if paper.get("source_ref"):
                 doc.meta.setdefault("source_ref", paper["source_ref"])
@@ -533,6 +549,67 @@ def _run(conn: sqlite3.Connection, paper: dict, settings, fingerprint: str | Non
     log.info("④ 标记保真校验：通过（漏译 %d 块已标待校对）/ 用时 %.1fs",
              len(report.untranslated), time.monotonic() - t_v)
     return doc, tokens
+
+
+def _materialise_cached_assets(doc: Doc, settings, paper_id: int, assets_dir: Path) -> bool:
+    """把**缓存文档引用的图片**搬进这一篇自己的目录；返回资产是否齐全。
+
+    ## 为什么必须有这一步（2026-10-26 实测）
+
+    `doc_cache` 的键 = `sha256("parse-v{N}" + PDF 字节)` —— **不含 paper / plan / user**，
+    全库一个命名空间（待定项 7 的设计目的：同一份 PDF 只解析一次）。但解析产物里
+    **只有相对文件名**（`payload["src"] = "assets/<name>"`），图片本体写在
+    `papers_dir/p<id>/assets`，而供图端点 `_serve_asset` 的白名单**不允许越出** `p<pid>/assets`。
+
+    ⇒ 同一份 PDF 的第二篇命中缓存（`Doc.from_json`，一个文件都不写）时，它引用的图
+    只在**第一篇**的目录里 ⇒ 那一篇的插图全部 404，并且**永不自愈**：同一个 fingerprint
+    永远命中，唯一的出口是「重新提取」，而那会连第一篇的缓存行一起删掉（≈百万 tokens 的重解析）。
+
+    多用户自托管里两个人各传同一篇论文、或同一个人把同一份 PDF 导进两个计划，都会撞上它。
+
+    ## 判据
+
+    - 来源 = `doc.meta["assets_dir"]`（解析时记下的相对路径）。**旧缓存没有这条** ⇒ 搬不了，
+      返回 False 让调用方就地为这一篇重新解析（顺带把这条写进新缓存）。
+    - 已经在本篇目录里的文件不覆盖（幂等：重跑不会再复制一遍）。
+    - 任何一张图找不到源文件就返回 False —— 宁可重解析，也不留一张裂图。
+
+    转正副本（v12 旋转页，`meta["normalized_pdf"]`）一并搬：它的内容与源 PDF 同源、
+    但**路径**也写死在缓存里，不搬的话它指向别的篇的目录，那篇被删就没人读得到了。
+    """
+    wanted = {
+        str((b.payload or {}).get("src") or "").split("/", 1)[1]
+        for b in doc.blocks
+        if str((b.payload or {}).get("src") or "").startswith("assets/")
+    }
+
+    src_rel = str(doc.meta.get("assets_dir") or "")
+    src_dir = (settings.papers_dir / src_rel) if src_rel else None
+
+    assets_dir.mkdir(parents=True, exist_ok=True)
+    for name in sorted(wanted):
+        dst = assets_dir / name
+        if dst.is_file():
+            continue                       # 已经有了（幂等）
+        src = src_dir / name if src_dir is not None else None
+        if src is None or not src.is_file():
+            return False                   # 搬不齐：交给调用方重解析
+        shutil.copy2(src, dst)
+
+    own_dir = settings.papers_dir / f"p{paper_id}"
+    norm = doc.meta.get("normalized_pdf")
+    if norm:
+        src_norm = Path(str(norm))
+        dst_norm = own_dir / "normalized.pdf"
+        if src_norm.is_file() and not dst_norm.is_file():
+            dst_norm.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src_norm, dst_norm)
+        if dst_norm.is_file():
+            doc.meta["normalized_pdf"] = str(dst_norm)
+
+    # 指向"现在真的放着这些文件"的目录 —— 下一次别人命中这份缓存时靠它搬
+    doc.meta["assets_dir"] = f"p{paper_id}/assets"
+    return True
 
 
 def enforce_report(report: Report, doc: Doc) -> None:
