@@ -378,6 +378,44 @@ function ShareExpired({ onExit }: { onExit: () => void }) {
   )
 }
 
+/** 管理员「以他人身份查看」的常驻横幅（2026-10-26）。
+ *
+ * 与 `.share-banner` 同一个位置（顶栏之下、视图之上），但颜色取 `--danger`：
+ * 只读分享是"我是别人、只能看"，冒充是"我在操作别人的账号"，两者不该长得一样。
+ *
+ * **退出走整页重载**（`location.assign('/')`）：计划 / 文献 / 批注各有一份缓存，
+ * 逐个 Provider 失效重取容易漏一份，而漏掉的那份会让管理员看着自己的数据
+ * 却以为还在目标的视野里 —— 整页重载是这里唯一不会骗人的做法。
+ */
+export function ImpersonationBanner() {
+  const { user } = useAuth()
+  const [busy, setBusy] = useState(false)
+  const imp = user?.impersonating
+  if (!imp) return null
+
+  async function stop() {
+    setBusy(true)
+    try {
+      await api.adminStopImpersonate()
+      window.location.assign('/')
+    } catch {
+      // 退不出去（会话已过期等）：把按钮放开，让用户还能刷新页面
+      setBusy(false)
+    }
+  }
+
+  return (
+    <div className="imp-banner" role="status" aria-live="polite">
+      <span className="ib-dot" />
+      <span>正在以 <b>{user?.email}</b> 身份查看</span>
+      <span className="ib-note">管理员 {imp.actor_email}</span>
+      <button className="btn btn-secondary btn-sm" disabled={busy} onClick={() => void stop()}>
+        {busy ? '退出中…' : '退出冒充'}
+      </button>
+    </div>
+  )
+}
+
 /** 只读分享外壳：**与 PrivateShell 同构**，差别只有 banner 与只读态。
  *
  * 为什么这里也要判一次 `error`：令牌失效（撤销/过期/不存在）时，`PlanProvider`

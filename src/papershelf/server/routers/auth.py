@@ -12,7 +12,7 @@ from __future__ import annotations
 import sqlite3
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException, Response, status
+from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from pydantic import BaseModel, Field
 
 from ..config import Settings, get_settings
@@ -29,6 +29,7 @@ from ..security import (
     email_allowed,
     end_session,
     get_conn,
+    impersonation,
     issue_code,
     set_password,
     start_session,
@@ -229,5 +230,13 @@ def logout(response: Response, conn: sqlite3.Connection = Depends(get_conn),
 
 
 @router.get("/me")
-def me(user: dict[str, Any] = Depends(current_user)) -> dict[str, Any]:
-    return _public_user(user)
+def me(request: Request, user: dict[str, Any] = Depends(current_user),
+       conn: sqlite3.Connection = Depends(get_conn)) -> dict[str, Any]:
+    """`impersonating` 只在这里下发：它是**会话**的状态，不属于用户本身。
+
+    塞进 `_public_user` 会让每个返回用户的地方都多一个恒为 null 的字段，
+    而前端只在一处用它（顶部横幅）。
+    """
+    out = _public_user(user)
+    out["impersonating"] = impersonation(conn, request.cookies.get(SESSION_COOKIE))
+    return out

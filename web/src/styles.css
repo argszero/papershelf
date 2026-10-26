@@ -1050,3 +1050,34 @@ math { font-size: 1.02em; max-width: 100%; }
 
 /* 只读态再兜一层：分享管理是写入口，匿名访客即使手敲 /shares 也不给导航入口 */
 .readonly .side-goal { pointer-events: auto; }
+
+/* ── 以他人身份查看（2026-10-26）────────────────────────────────────────
+   位置与 `.share-banner` 完全相同（顶栏之下、视图之上），颜色取 `--danger`：
+   只读分享是「我是别人、只能看」，冒充是「我在操作别人的账号」，两者不该长得一样。 */
+.imp-banner {
+  flex: none; display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+  padding: 9px 24px; font-size: 12.5px; color: var(--fg);
+  background: color-mix(in oklch, var(--danger) 9%, var(--surface));
+  border-bottom: 1px solid color-mix(in oklch, var(--danger) 26%, var(--border));
+}
+.imp-banner .ib-dot {
+  width: 7px; height: 7px; border-radius: 50%; background: var(--danger); flex: none;
+  animation: imp-pulse 1.6s ease-in-out infinite;
+}
+.imp-banner b { font-weight: 600; }
+.imp-banner .ib-note { color: var(--muted); }
+.imp-banner .btn { margin-left: auto; }
+@keyframes imp-pulse { 0%, 100% { opacity: 1 } 50% { opacity: .35 } }
+@media (max-width: 920px) {
+  .imp-banner { padding: 9px 14px; }
+  .imp-banner .ib-note { display: none; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .imp-banner .ib-dot { animation: none; }
+}
+
+/* 与 `.readonly` 那三行同一套道理：`TopBar` 由各页面自己渲染，横幅在外壳里先出现，
+   用 flex `order` 把它掰到顶栏之下（原型的顺序：topbar → banner → 视图）。 */
+.impersonating .main > .topbar { order: 1; }
+.impersonating .main > .imp-banner { order: 2; }
+.impersonating .main > *:not(.topbar):not(.imp-banner) { order: 3; }
