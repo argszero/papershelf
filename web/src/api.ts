@@ -201,4 +201,10 @@ export const api = {
     request<AdminUser>('/api/admin/users', json({ email, password, display_name, is_admin })),
   adminPatchUser: (id: number, body: { status_?: string; password?: string; is_admin?: boolean }) =>
     request<AdminUser>(`/api/admin/users/${id}`, patch(body)),
+  // 以他人身份查看（2026-10-26）：开启后 `me()` 回来的就是目标用户，
+  // 退出是**唯一**在冒充期间仍可达的管理接口（此时 admin 已经 403）。
+  adminImpersonate: (id: number) =>
+    request<AdminUser>('/api/admin/impersonate', json({ user_id: id })),
+  adminStopImpersonate: () =>
+    request<AdminUser>('/api/admin/impersonate/stop', { method: 'POST' }),
 }

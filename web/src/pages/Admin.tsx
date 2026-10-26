@@ -14,6 +14,7 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
 
 import { ApiError, api } from '../api'
+import { useAuth } from '../auth'
 import { TopBar } from '../shell'
 import { Tile } from '../components'
 import { IconPlus } from '../icons'
@@ -26,6 +27,7 @@ const USTATUS: Record<AdminUser['status'], { label: string; cls: string }> = {
 }
 
 export function AdminPage() {
+  const { user: me } = useAuth()
   const [users, setUsers] = useState<AdminUser[]>([])
   const [error, setError] = useState('')
   const [msg, setMsg] = useState('')
@@ -69,6 +71,16 @@ export function AdminPage() {
       setEmail(''); setName(''); setPassword(''); setIsAdmin(false); setFormOpen(false)
       await load()
     } catch (err) { setError(err instanceof Error ? err.message : '开号失败') }
+  }
+
+  /** 以该用户身份查看（2026-10-26）。开完**整页重载**：整站的数据都要换成目标的视野，
+   *  而计划 / 文献 / 批注各有一份缓存 —— 重载是唯一不会漏掉某一份的做法。 */
+  async function impersonate(u: AdminUser) {
+    setError(''); setMsg('')
+    try {
+      await api.adminImpersonate(u.id)
+      window.location.assign('/')
+    } catch (e) { setError(e instanceof Error ? e.message : '无法以该身份查看') }
   }
 
   async function resetPassword(u: AdminUser) {
@@ -194,6 +206,12 @@ export function AdminPage() {
                           </button>
                           <button className="btn btn-ghost btn-sm"
                                   onClick={() => void resetPassword(u)}>重置密码</button>
+                          {/* 只对**普通、正常**的账号给出这个入口 —— 与后端拒绝的三条
+                              （自己 / 停用 / 另一名管理员）对齐，别让按钮点了才报错。 */}
+                          {!u.is_admin && u.status === 'active' && u.id !== me?.id && (
+                            <button className="btn btn-ghost btn-sm"
+                                    onClick={() => void impersonate(u)}>以该身份查看</button>
+                          )}
                         </div>
                       </td>
                     </tr>

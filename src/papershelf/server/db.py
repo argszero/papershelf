@@ -62,11 +62,16 @@ CREATE TABLE IF NOT EXISTS users (
   consent_at      TEXT
 );
 
+-- 会话。`user_id` **永远是真正登录的那个人**；管理员「以他人身份查看」（2026-10-26）
+-- 只是在这条会话上多记一个目标，由 `security.session_user` 解析成目标用户。
+-- 挂在会话上而不是进程状态里：退出登录 / 会话过期时冒充随之失效，不需要第二条清理路径。
 CREATE TABLE IF NOT EXISTS sessions (
   token      TEXT PRIMARY KEY,
   user_id    INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
   created_at TEXT NOT NULL,
-  expires_at TEXT NOT NULL
+  expires_at TEXT NOT NULL,
+  act_as_user_id INTEGER,             -- 冒充目标（普通用户）；NULL = 不在冒充
+  act_as_at      TEXT                 -- 冒充开始时刻（审计）
 );
 
 -- 邮箱验证码（⑭）：注册与忘记密码都靠它。**只存哈希**，明文只在发信时存在一次。
@@ -314,6 +319,13 @@ def _migrate(conn: sqlite3.Connection) -> None:
     for name, ddl in (("label", "TEXT"), ("hours", "INTEGER")):
         if name not in scols:
             conn.execute(f"ALTER TABLE shares ADD COLUMN {name} {ddl}")
+    # 管理员「以他人身份查看」（2026-10-26，rant 14:34:05）：会话上多两列。
+    # `sessions.user_id` 仍是真正登录的人（审计要能回答「谁在冒充谁」），
+    # 目标只在此处；旧库的存量会话两列为 NULL，也就是「没在冒充」。
+    sess_cols = {r["name"] for r in conn.execute("PRAGMA table_info(sessions)")}
+    for name, ddl in (("act_as_user_id", "INTEGER"), ("act_as_at", "TEXT")):
+        if name not in sess_cols:
+            conn.execute(f"ALTER TABLE sessions ADD COLUMN {name} {ddl}")
     # 存量永久分享链接（`expires_at IS NULL`）按新规收敛：从**现在**起 24 小时。
     # 给宽限而不是立即作废 —— 已经发出去的链接立刻全废会让访客撞 410，体验是"链接坏了"。
     conn.execute(

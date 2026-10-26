@@ -178,12 +178,21 @@ export interface ShareMeta {
   seconds_left: number
 }
 
+/** 会话上的冒充信息（2026-10-26）：管理员正以别人身份查看时才有值。 */
+export interface Impersonation {
+  actor_id: number
+  actor_email: string
+  since: string
+}
+
 export interface CurrentUser {
   id: number
   email: string
   display_name: string | null
   is_admin: boolean
   status: string
+  /** `null` = 没有在冒充。冒充期间 `id` / `email` 已经是**目标用户**。 */
+  impersonating?: Impersonation | null
 }
 
 export interface TermsSection {

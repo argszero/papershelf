@@ -221,17 +221,61 @@ def end_session(conn: sqlite3.Connection, token: str) -> None:
         conn.execute("DELETE FROM sessions WHERE token=?", (token,))
 
 
-def session_user(conn: sqlite3.Connection, token: str | None) -> dict[str, Any] | None:
+def session_row(conn: sqlite3.Connection, token: str | None) -> dict[str, Any] | None:
+    """会话行本身（含冒充目标）。过期、或**登录者**已不是 active 的一律当作没有。
+
+    判 `status` 用的是 `s.user_id`（真正登录的人）而不是冒充目标：管理员被停用时
+    整条会话必须立刻失效，不能因为"目标是 active"就继续用下去。
+    """
     if not token:
         return None
     row = conn.execute(
-        """SELECT u.* FROM sessions s JOIN users u ON u.id = s.user_id
+        """SELECT s.token, s.user_id, s.expires_at, s.act_as_user_id, s.act_as_at, u.status
+           FROM sessions s JOIN users u ON u.id = s.user_id
            WHERE s.token=? AND (s.expires_at IS NULL OR s.expires_at > ?)""",
         (token, utcnow()),
     ).fetchone()
-    if row is None:
+    if row is None or row["status"] != "active":
         return None
-    if row["status"] != "active":
+    return dict(row)
+
+
+def impersonation(conn: sqlite3.Connection, token: str | None) -> dict[str, Any] | None:
+    """当前会话的冒充信息（前端横幅用）；不在冒充时返回 None。"""
+    sess = session_row(conn, token)
+    if sess is None or not sess["act_as_user_id"]:
+        return None
+    # 目标被删除/停用时 `session_user` 已经退回登录者本人，横幅必须跟着消失 ——
+    # 否则界面会一边显示管理员自己的数据、一边说"正在以某人身份查看"。
+    # 把这条判断放在这里而不是 `session_user` 里：读路径不落写。
+    target = conn.execute("SELECT status FROM users WHERE id=?",
+                          (sess["act_as_user_id"],)).fetchone()
+    if target is None or target["status"] != "active":
+        return None
+    actor = conn.execute("SELECT id, email FROM users WHERE id=?", (sess["user_id"],)).fetchone()
+    if actor is None:
+        return None
+    return {"actor_id": actor["id"], "actor_email": actor["email"],
+            "since": sess["act_as_at"] or ""}
+
+
+def session_user(conn: sqlite3.Connection, token: str | None) -> dict[str, Any] | None:
+    """这条会话**此刻代表谁** —— 管理员冒充时就是目标用户。
+
+    这是「以他人身份查看」唯一生效的地方：`require_paper` / `require_plan` 一个字没改，
+    它们照旧拿这个 id 去比 `pl.user_id`，所以冒充期间管理员看到的就是目标的真实数据，
+    而普通用户之间仍然完全隔离（决策①）。放宽归属校验等于对所有人开门，那条路不走。
+    """
+    sess = session_row(conn, token)
+    if sess is None:
+        return None
+    row = conn.execute("SELECT * FROM users WHERE id=?",
+                       (sess["act_as_user_id"] or sess["user_id"],)).fetchone()
+    if (row is None or row["status"] != "active") and sess["act_as_user_id"]:
+        # 冒充目标已被删除或停用 ⇒ 这条旁路自动失效，退回登录者本人。
+        # **不写库**：读路径不落写，前端下次 `me()` 就会发现横幅自己消失了。
+        row = conn.execute("SELECT * FROM users WHERE id=?", (sess["user_id"],)).fetchone()
+    if row is None or row["status"] != "active":
         return None
     return dict(row)
 
@@ -282,7 +326,7 @@ __all__ = [
     "SESSION_COOKIE", "SESSION_DAYS", "CODE_PURPOSES", "activate_user", "code_cooldown_left",
     "consume_code", "create_user", "current_admin",
     "current_user", "email_allowed", "end_session", "ensure_admin", "get_conn",
-    "hash_password", "issue_code", "require_paper", "require_plan", "session_user",
-    "set_password", "start_session",
+    "hash_password", "impersonation", "issue_code", "require_paper", "require_plan",
+    "session_row", "session_user", "set_password", "start_session",
     "user_by_email", "verify_password",
 ]

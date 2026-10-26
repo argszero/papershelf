@@ -23,7 +23,7 @@ import { ShareProvider } from './shareContext'
 import { PlanProvider } from './planContext'
 import { NotFound } from './components'
 import { AppRoutes } from './routes'
-import { Sidebar, ShareShell } from './shell'
+import { ImpersonationBanner, Sidebar, ShareShell } from './shell'
 
 function PrivateShell() {
   const { user, loading } = useAuth()
@@ -31,9 +31,12 @@ function PrivateShell() {
   if (loading) return <div className="auth-wrap"><p className="muted">加载中…</p></div>
   if (!user) return <Navigate to={`/login?next=${encodeURIComponent(loc.pathname)}`} replace />
   return (
-    <div className="app">
+    // `impersonating` 这个类名只为一件事：让横幅靠 flex `order` 落到顶栏之下
+    // （`TopBar` 由各页面自己渲染，DOM 顺序与原型相反 —— 与只读分享同一个解法）。
+    <div className={user.impersonating ? 'app impersonating' : 'app'}>
       <Sidebar />
       <div className="main">
+        <ImpersonationBanner />
         <AppRoutes />
       </div>
     </div>
