@@ -30,23 +30,86 @@ STATIC_DIR = Path(__file__).resolve().parent.parent / "static"
 # 图片文件名白名单：p12_img3.png 这类，杜绝 ../ 穿越
 _SAFE_ASSET_NAME = re.compile(r"^[A-Za-z0-9._-]+\.(png|jpe?g|gif|webp|svg)$")
 
+# 导出里会被内联的资产引用：登录内联 `/papers/<id>/assets` 与分享内联
+# `/share/<token>/assets` 两种前缀，指向同一个 `p<id>/assets` 目录。
+_ASSET_SRC = re.compile(
+    r'src="(?:/papers/\d+/assets/|/share/[A-Za-z0-9_-]+/assets/)([^"]+)"')
 
-def _inline_images(html_doc: str, paper_id: int, settings) -> str:
-    """把 `src="/papers/<id>/assets/x.png"` 内联成 data URI → 导出物是**真·单文件**。"""
-    import base64
+# 一次从磁盘读多少字节去 base64。**必须是 3 的整数倍**：base64 按 3 字节一组编码，
+# 块边界对不齐会在流中间塞进 `=` 填充，拼出来的 data URI 直接坏掉（有测试钉住）。
+_INLINE_CHUNK = 768 * 1024
+
+
+def _inline_targets(html_doc: str, paper_id: int, settings) -> list:
+    """HTML 里的资产引用 → `[(match, 文件, mime)]`。**只 stat，不读内容。**
+
+    为什么不在内联时直接读（2026-10-26 的内存教训）：原先这里是
+    `re.sub(..., b64encode(path.read_bytes()))` —— 一篇图多的论文，单个请求同时持有
+    原始的 `bytes`、base64 的 `str`、`re.sub` 新建的整篇文档，以及最终的响应体，
+    实测峰值 **37.81 MB = 全篇资产字节的 4 倍**，且**没有任何上限**：上传有
+    `PAPERSHELF_MAX_UPLOAD_MB`，导出这边当时什么都没有。而分享导出的那个端点
+    **不需要会话**（⑪ 的设计），有链接就能反复触发。
+    """
     import mimetypes
 
-    def repl(m: re.Match[str]) -> str:
+    out: list = []
+    for m in _ASSET_SRC.finditer(html_doc):
         name = m.group(1)
         if not _SAFE_ASSET_NAME.match(name):
-            return m.group(0)
+            continue                        # 不合白名单：原样留在文档里
         path = settings.papers_dir / f"p{paper_id}" / "assets" / name
         if not path.is_file():
-            return m.group(0)
-        mime = mimetypes.guess_type(name)[0] or "image/png"
-        return f'src="data:{mime};base64,{base64.b64encode(path.read_bytes()).decode()}"'
+            continue                        # 文件不在：同样原样留着
+        out.append((m, path, mimetypes.guess_type(name)[0] or "image/png"))
+    return out
 
-    return re.sub(r'src="(?:/papers/\d+/assets/|/share/[A-Za-z0-9_-]+/assets/)([^"]+)"', repl, html_doc)
+
+def inline_asset_bytes(html_doc: str, paper_id: int, settings) -> int:
+    """即将被内联的资产**总字节数**（stat，不读内容）—— 上限判据用它。"""
+    return sum(p.stat().st_size for _, p, _ in _inline_targets(html_doc, paper_id, settings))
+
+
+def iter_inlined_html(html_doc: str, paper_id: int, settings):
+    """流式吐出内联后的 HTML：文档本身是碎的，每张资产读完一块就丢一块。
+
+    峰值因此只与 `_INLINE_CHUNK` 有关，与**论文有多少张图、图多大**无关。
+    """
+    import base64
+
+    pos = 0
+    for m, path, mime in _inline_targets(html_doc, paper_id, settings):
+        yield html_doc[pos:m.start()]
+        yield f'src="data:{mime};base64,'
+        with path.open("rb") as fh:
+            while True:
+                block = fh.read(_INLINE_CHUNK)
+                if not block:
+                    break
+                yield base64.b64encode(block).decode("ascii")
+        yield '"'
+        pos = m.end()
+    yield html_doc[pos:]
+
+
+def stream_inlined_export(html_doc: str, paper_id: int, settings):
+    """**上限与流式必须一起做**，所以只留这一个入口。
+
+    拆成两个函数、让路由自己"先查上限、再要生成器"，就会出现只做了流式、
+    没查上限的端点 —— 分享导出正好是这种最容易漏的地方（它连 `inline` 参数都没有，
+    无条件内联）。这里返回的是迭代器，**检查在返回之前就已经跑完**，路由拿到的东西
+    一定过过闸。
+
+    超限用 413：HTTP 里没有"响应太大"的状态码，而本项目已经有
+    `PAPERSHELF_MAX_UPLOAD_MB` 用 413 表示体积拒绝，沿用同一个口径。
+    """
+    cap = max(1, int(settings.max_export_mb)) * 1024 * 1024
+    total = inline_asset_bytes(html_doc, paper_id, settings)
+    if total > cap:
+        raise HTTPException(
+            status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            f"导出内联体积 {total / 1048576:.1f} MB 超过上限 {settings.max_export_mb} MB"
+            f"（配置项 PAPERSHELF_MAX_EXPORT_MB）；改用 inline=0 可只导出图片引用路径")
+    return iter_inlined_html(html_doc, paper_id, settings)
 
 
 def _lifespan(app: FastAPI):
@@ -125,7 +188,8 @@ def create_app() -> FastAPI:
 
     app.state.conn_factory = conn_factory
     app.state.settings = settings
-    app.state.inline_images = lambda html_doc, pid: _inline_images(html_doc, pid, settings)
+    app.state.stream_inlined_export = (
+        lambda html_doc, pid: stream_inlined_export(html_doc, pid, settings))
 
     app.add_middleware(
         CORSMiddleware,

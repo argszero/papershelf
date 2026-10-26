@@ -275,8 +275,19 @@ def share_paper(token: str, paper_id: int,
 
 @router.get("/shares/{token}/papers/{paper_id}/export")
 def share_export(token: str, paper_id: int, request: Request, lang: str = "dual",
+                 inline: bool = True,
                  conn: sqlite3.Connection = Depends(get_conn)):
-    from fastapi.responses import HTMLResponse
+    """分享导出的默认行为是**单文件**（`inline=True`），与登录侧一致。
+
+    `inline=0` 是 2026-10-26 新加的出口：这个端点原先**只能内联**，而内联是导出里
+    唯一会按论文图片总量吃内存的操作，且**不需要会话**（⑪：有链接就能打）。
+    所以它也需要一条"只导出引用"的路 —— 上限（`PAPERSHELF_MAX_EXPORT_MB`）挡住的那一篇，
+    匿名读者仍然拿得到可用的 HTML，只是图片走 `/share/<token>/assets/...`。
+
+    **鉴权一个字没加**：要改的是内存，不是门槛（`test_share_export_does_not_need_session`
+    钉住的就是这条）。
+    """
+    from fastapi.responses import HTMLResponse, StreamingResponse
 
     from ...pipeline import synth
 
@@ -292,7 +303,8 @@ def share_export(token: str, paper_id: int, request: Request, lang: str = "dual"
     html = synth(doc.blocks, mode, title=doc.meta.get("title_zh") or "",
                  meta_line=doc.meta.get("authors", ""),
                  asset_prefix=f"/share/{token}/assets")
-    html = request.app.state.inline_images(html, paper_id)
-    return HTMLResponse(html, headers={
-        "Content-Disposition": f'inline; filename="{paper_id}-{mode}.html"'
-    })
+    headers = {"Content-Disposition": f'inline; filename="{paper_id}-{mode}.html"'}
+    if not inline:
+        return HTMLResponse(html, headers=headers)
+    return StreamingResponse(request.app.state.stream_inlined_export(html, paper_id),
+                             media_type="text/html; charset=utf-8", headers=headers)

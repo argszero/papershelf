@@ -110,6 +110,14 @@ class Settings:
     # 免得应用比反代先拒、用户看到的是"服务器错误"而不是"文件太大"。
     max_upload_mb: int = field(default_factory=lambda: _int("PAPERSHELF_MAX_UPLOAD_MB", 256))
 
+    # 导出内联的资产体积上限（MB，2026-10-26）：超出一律 413，并在错误里点名 `inline=0`。
+    # 与上传那条是**同一族**的无上限持有者：导出把每张图读进内存再 base64，
+    # 峰值实测 4× 全篇资产字节；分享导出还**不需要会话**，有链接就能反复打。
+    # 现在内联改成了按块流式（峰值只与块大小有关），这条上限管的是另一件事 ——
+    # **别让一个请求产出几百 MB 的下载**（那既拖垮带宽也拖垮客户端）。
+    # 默认 64 MB 远大于正常论文（实测一篇 4 张重图的稿子资产 9.39 MB），远小于悬崖。
+    max_export_mb: int = field(default_factory=lambda: _int("PAPERSHELF_MAX_EXPORT_MB", 64))
+
     # 常驻转换队列（server/queue.py）：启动恢复 `doing` + 轮询排空 `queued`。
     # 关掉它 = 退回"只在请求线程里跑"，重启即丢队列（2026-09-12 事故的成因）。
     # 测试默认关（避免后台线程与用例互相干扰），由 conftest 显式设置。

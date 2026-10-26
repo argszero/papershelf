@@ -451,8 +451,11 @@ def export(paper_id: int, request: Request, lang: str = "dual", inline: bool = T
 
     `inline=True`（默认）把图片内嵌成 data URI → **真正单文件**，可离线分发、可直接打印。
     `inline=False` 时图片走 `/papers/<id>/assets/...`（便于只看不下载）。
+
+    内联那条走**流式**（`app.py::stream_inlined_export`）：峰值不再随图片总量增长，
+    总体积还有 `PAPERSHELF_MAX_EXPORT_MB` 兜底（超限 413，错误里点名 `inline=0`）。
     """
-    from fastapi.responses import HTMLResponse
+    from fastapi.responses import HTMLResponse, StreamingResponse
 
     from ...pipeline import synth
     from ..repo import load_doc
@@ -466,12 +469,14 @@ def export(paper_id: int, request: Request, lang: str = "dual", inline: bool = T
     html = synth(doc.blocks, mode, title=doc.meta.get("title_zh") or doc.meta.get("title_en", ""),
                  meta_line=doc.meta.get("authors", ""),
                  asset_prefix=f"/papers/{paper_id}/assets")
-    if inline:
-        html = request.app.state.inline_images(html, paper_id)
-    return HTMLResponse(html, headers={
+    headers = {
         "Content-Disposition": f'{("inline" if request.query_params.get("view") else "attachment")}; '
                                f'filename="{paper_id}-{mode}.html"'
-    })
+    }
+    if not inline:
+        return HTMLResponse(html, headers=headers)
+    return StreamingResponse(request.app.state.stream_inlined_export(html, paper_id),
+                             media_type="text/html; charset=utf-8", headers=headers)
 
 
 @router.get("/papers/{paper_id}/html")

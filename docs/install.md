@@ -72,6 +72,7 @@ docker run -d --name papershelf --restart unless-stopped \
 | `PAPERSHELF_SMTP_HOST` + `_FROM`（+`_PORT/_USER/_PASS/_TLS`） | **配全 → 开放自助注册（邮件激活）；未配 → 自动关闭注册，改由管理员开号** | 空 |
 | `PAPERSHELF_SHARE_HOURS` | 分享默认有效期（小时，**硬上限 24**，填更大也只按 24 算） | `24` |
 | `PAPERSHELF_MAX_UPLOAD_MB` | 单个 PDF 上传体积上限（超出返回 413） | `256` |
+| `PAPERSHELF_MAX_EXPORT_MB` | 导出内联（单文件 HTML）的图片总体积上限（超出返回 413，可用 `inline=0` 只导出引用；分享导出同受此限） | `64` |
 | `PAPERSHELF_PROOFREAD_IMAGE_CACHE` | ①c 校对时缓存的页图条数（每条约 300–400 KB，只影响本地渲染次数、不花 token） | `12` |
 | `PAPERSHELF_MEM_LIMIT` | 容器内存硬上限，**由 `docker-compose.yml` 读取，应用本身不读** | `900m` |
 
