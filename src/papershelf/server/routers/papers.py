@@ -82,14 +82,39 @@ async def upload(
 ) -> list[dict[str, Any]]:
     require_plan(conn, plan_id, user)
     tag_list = [t.strip() for t in tags.split(",") if t.strip()]
+    # 上传体积上限（MB → 字节）。原先**没有任何上限**：任何大小的文件都收。
+    limit = max(1, int(settings.max_upload_mb)) * 1024 * 1024
     created: list[dict[str, Any]] = []
     for uf in files:
         name = Path(uf.filename or "upload.pdf").name
         target = settings.papers_dir / f"{utcnow().replace(':', '')}_{name}"
-        data = await uf.read()
-        if not data[:5].startswith(b"%PDF"):
-            raise HTTPException(status.HTTP_400_BAD_REQUEST, f"{name} 不是 PDF 文件")
-        target.write_bytes(data)
+        # **流式落盘**（2026-10-26 生产事故）：原先 `data = await uf.read()` 把整份 PDF
+        # 读进内存再 `write_bytes`，于是上传 200 MB 论文 = 200 MB 的常驻内存尖峰，
+        # 而 glibc 峰值过后还不归还内核 ⇒ 连传几篇就把整台机器打挂。
+        # 现在按 1 MB 一块搬运：峰值只与块大小有关，与文件大小无关。
+        # 顺带：`%PDF` 魔数在**第一块**上判、越过上限立刻 413，两种失败都把写了一半的
+        # 文件删掉（否则 `papers_dir` 里留下一堆没人认领的孤儿）。
+        written = 0
+        try:
+            with target.open("wb") as fh:
+                while True:
+                    chunk = await uf.read(1 << 20)
+                    if not chunk:
+                        break
+                    if written == 0 and not chunk[:5].startswith(b"%PDF"):
+                        raise HTTPException(status.HTTP_400_BAD_REQUEST, f"{name} 不是 PDF 文件")
+                    written += len(chunk)
+                    if written > limit:
+                        raise HTTPException(
+                            status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                            f"{name} 超过上传上限 {settings.max_upload_mb} MB"
+                            f"（配置项 PAPERSHELF_MAX_UPLOAD_MB）")
+                    fh.write(chunk)
+            if written == 0:
+                raise HTTPException(status.HTTP_400_BAD_REQUEST, f"{name} 是空文件")
+        except BaseException:
+            target.unlink(missing_ok=True)
+            raise
         with tx(conn):
             cur = conn.execute(
                 """INSERT INTO papers (plan_id, title, source, source_ref, pdf_path, tags,
@@ -101,7 +126,7 @@ async def upload(
             )
             paper_id = int(cur.lastrowid)
         log.info("paper=%s 已入库（用户 %s 上传 %s，%.1f MB，plan=%s），排队等待转换",
-                 paper_id, user["email"], name, len(data) / 1e6, plan_id)
+                 paper_id, user["email"], name, written / 1e6, plan_id)
         created.append(paper_public(dict(conn.execute("SELECT * FROM papers WHERE id=?", (paper_id,)).fetchone())))
         if background_convert:
             background.add_task(convert_paper, paper_id, _pdf_fingerprint(target))

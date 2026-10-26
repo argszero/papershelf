@@ -97,6 +97,19 @@ class Settings:
     proofread_thinking: str = field(
         default_factory=lambda: os.environ.get("PAPERSHELF_PROOFREAD_THINKING", "minimal")
     )
+    # ①c 页图缓存条数上限（2026-10-26 生产事故）：渲染出的 base64 图原先**无淘汰**地攒在
+    # 一个 dict 里，一篇论文看完全篇就把整篇的图留在内存里 —— 1888 MB 的机器连续转几篇即被打挂。
+    # 每条整页图约 300–400 KB，12 条 ≈ 4–5 MB；被淘汰的最坏代价只是**再渲染一次**（不花 token）。
+    proofread_image_cache: int = field(
+        default_factory=lambda: _int("PAPERSHELF_PROOFREAD_IMAGE_CACHE", 12)
+    )
+
+    # 上传体积上限（MB，2026-10-26）：超出直接 413。原先**没有任何上限**，而上传走的是
+    # "整份读进内存再落盘"，200 MB 的 PDF 就是 200 MB 的常驻内存尖峰。
+    # 默认 256 与反代侧 `client_max_body_size 256m` 对齐（见 docs/install.md），
+    # 免得应用比反代先拒、用户看到的是"服务器错误"而不是"文件太大"。
+    max_upload_mb: int = field(default_factory=lambda: _int("PAPERSHELF_MAX_UPLOAD_MB", 256))
+
     # 常驻转换队列（server/queue.py）：启动恢复 `doing` + 轮询排空 `queued`。
     # 关掉它 = 退回"只在请求线程里跑"，重启即丢队列（2026-09-12 事故的成因）。
     # 测试默认关（避免后台线程与用例互相干扰），由 conftest 显式设置。

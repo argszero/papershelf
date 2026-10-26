@@ -42,6 +42,7 @@ import json
 import logging
 import re
 import time
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -65,6 +66,12 @@ BLOCKS_PER_PAGE_CALL = 20
 BLOCKS_CALL_CHARS = 6000
 # `read_page` 的放大上限（像素）：太大拖慢调用，太小看不清上下标。
 MAX_CROP_PX = 1800
+# **页图缓存条数上限**（2026-10-26 生产事故）。渲染出的 base64 图原先在 dict 里
+# 无淘汰地攒着：一篇论文从第 1 页看到最后一页（实测能跑 287 轮），整篇的图都留在
+# 内存里直到实例释放 —— 一台 1888 MB 的机器连续转换几篇就被打挂。
+# 有上限之后，被淘汰的最坏代价是**按需再渲染一次**（纯本地计算、不花 token），
+# 而复查要看的正是最近几页 ⇒ 命中率基本不受影响。可用环境变量调整。
+DEFAULT_IMAGE_CACHE = 12
 # `check_artifacts` 每页最多列几块（超了先修要紧的）。
 MAX_HINT_BLOCKS = 12
 
@@ -418,14 +425,18 @@ class ProofreadTools:
     """
 
     def __init__(self, doc: Doc, pdf_path: str | Path, *, dpi: int = 130,
-                 skip_pages: set[int] | None = None):
+                 skip_pages: set[int] | None = None,
+                 cache_size: int = DEFAULT_IMAGE_CACHE):
         self.doc = doc
         self.pdf_path = Path(pdf_path)
         self.dpi = dpi
         self.done_pages: set[int] = set(skip_pages or ())
         self.stats = ProofreadStats()
         self._src = None                       # 惰性打开（`fitz` 只在真要用图时载入）
-        self._cache: dict[tuple, str] = {}     # (page, region, dpi) → base64
+        # (page, region, dpi) → base64。**必须有上限**：一篇论文能跑几百轮，
+        # 无界 dict 等于把整篇的图按原文分辨率攒在内存里（见 DEFAULT_IMAGE_CACHE）。
+        self.cache_size = max(1, int(cache_size))
+        self._cache: OrderedDict[tuple, str] = OrderedDict()
         self._tbl: dict[int, list[dict]] | None = None      # 页 → 疑似表区（几何现算）
         self._tbl_ids: set[str] | None = None               # 表区盖住的块号（缓存）
         self.finished = False
@@ -489,6 +500,7 @@ class ProofreadTools:
         dpi = dpi or self.dpi
         key = (page, tuple(region) if region else None, dpi)
         if key in self._cache:
+            self._cache.move_to_end(key)       # 命中即"最近用过"，决定谁先被淘汰
             return self._cache[key]
         import fitz
         p = self.src[page - 1]
@@ -508,6 +520,9 @@ class ProofreadTools:
             pix = p.get_pixmap(dpi=dpi)
         b64 = base64.b64encode(_encode(pix)).decode()
         self._cache[key] = b64
+        self._cache.move_to_end(key)
+        while len(self._cache) > self.cache_size:
+            self._cache.popitem(last=False)    # 淘汰最久没用过的那张
         return b64
 
     # ── 工具定义 ──────────────────────────────────────────────────────────
@@ -1040,10 +1055,13 @@ class Proofreader:
 
     def __init__(self, cfg, *, dpi: int = 130, max_tokens: int = 32000,
                  max_rounds: int = 120, token_budget: int = 600_000,
-                 retries: int = DEFAULT_RETRIES, thinking: str = ""):
+                 retries: int = DEFAULT_RETRIES, thinking: str = "",
+                 image_cache: int = DEFAULT_IMAGE_CACHE):
         self.cfg = cfg
         self.thinking = thinking
         self.dpi = dpi
+        # 页图缓存条数上限（配置项 `PAPERSHELF_PROOFREAD_IMAGE_CACHE`）
+        self.image_cache = image_cache
         self.max_tokens = max_tokens
         self.max_rounds = max_rounds
         self.token_budget = token_budget
@@ -1137,7 +1155,8 @@ class Proofreader:
                       log_fn=None) -> ProofreadStats:
         """让 agent 校对整篇 `doc`（**就地修改** blocks）。返回统计。"""
         skip = {int(p) for p in skip_pages or ()}
-        tools_impl = ProofreadTools(doc, pdf_path, dpi=self.dpi, skip_pages=skip)
+        tools_impl = ProofreadTools(doc, pdf_path, dpi=self.dpi, skip_pages=skip,
+                                    cache_size=self.image_cache)
         self.tools = tools_impl
         # ⚠️ 账本**只有一个**：工具层在改，循环层在读 —— 各持一份会立刻对不上
         # （踩过：`text_fixed` 记在工具那份里，日志里却永远是 0）。
