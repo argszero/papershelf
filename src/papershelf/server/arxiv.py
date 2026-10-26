@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import re
 from pathlib import Path
 
@@ -55,7 +56,10 @@ def import_arxiv_doc(paper: dict, settings) -> Doc:
 
     # ── 回落：下载 PDF，走与上传相同的管线 ──
     pdf_path = out_dir / f"{arxiv_id}{version}.pdf"
-    if not pdf_path.exists() or pdf_path.stat().st_size < 10_000:
+    # 命中判据 = 「盘上这份**完整**」而不是「盘上有个够大的文件」（2026-10-26）。
+    # 换成完整性判据还顺带修了存量：旧代码留下的残篇/HTML 页不再被当成好的，
+    # 下次导入会真的重下。
+    if not _is_complete_pdf(pdf_path, min_bytes=_MIN_PDF_BYTES):
         _download_pdf(arxiv_id, version, pdf_path)
     from ..pipeline import parse_pdf
 
@@ -77,16 +81,72 @@ def _fetch_html(arxiv_id: str, version: str) -> str | None:
     return None
 
 
+# PDF 的两处结构戳：开头 `%PDF`、结尾 `%%EOF`。中间任何截断都改不了开头，
+# 所以**只验开头等于没验**（见 `_is_complete_pdf`）。
+_PDF_MAGIC = b"%PDF"
+_PDF_TAIL = 1024                        # `%%EOF` 之前允许有尾部垃圾，取最后 1 KB 找它
+_MIN_PDF_BYTES = 10_000                 # 比这小的不可能是一篇论文（沿用原有阈值）
+
+
+def _is_complete_pdf(path: Path, *, min_bytes: int = 0) -> bool:
+    """盘上这份是不是**完整**的 PDF —— 缓存命中用它，比「存在且够大」强。
+
+    2026-10-26 的教训：原来的判据只有 `exists()` + `st_size >= 10_000`，
+    于是**下一半的文件永远算命中**。截断的 PDF **仍然能打开**（实测截到原长的
+    50% 时 PyMuPDF 仍报满页数、xref 静默重建），所以「能解析」证明不了完整，
+    用户拿到的是少内容的论文，且「重新提取」只会再解析同一份残篇。
+    这里改验**结尾**：`%%EOF` 在最后 1 KB 内 ⇒ 文件写到了它该结束的地方。
+    两种情况都挡：残篇没有 `%%EOF`；反爬 HTML 页连 `%PDF` 都没有。
+
+    `min_bytes` 只在**判缓存能不能复用**时用（`_MIN_PDF_BYTES`）：那是"像不像一篇论文"，
+    与"下载完整不完整"是两件事，所以校验新下载的临时文件时**不传**它 ——
+    否则一份很小但完整的 PDF 会被判成坏的（旧代码只是每次重下，不会失败）。
+    """
+    try:
+        size = path.stat().st_size
+    except OSError:
+        return False
+    if size < min_bytes:
+        return False
+    try:
+        with path.open("rb") as f:
+            if not f.read(len(_PDF_MAGIC)).startswith(_PDF_MAGIC):
+                return False
+            f.seek(max(0, size - _PDF_TAIL))
+            return b"%%EOF" in f.read()
+    except OSError:
+        return False
+
+
 def _download_pdf(arxiv_id: str, version: str, target: Path) -> None:
+    """下载到 `.part`，验完整后**原子改名**到 `target` —— 半截文件不许落到最终路径。
+
+    为什么必须这么写（2026-10-26）：原先直接写 `target`，于是
+    ①流中途断掉（网络掉、120s 超时）⇒ 盘上留下半截 PDF，头 5 字节仍是 `%PDF`，
+      两个旧判据全过；②反爬 HTML 页 ⇒ `RuntimeError` 抛了，**但文件留在盘上**，
+      而且通常 > 10 KB ⇒ 之后每次都跳过下载、在同一步抛同一个错，
+      除了删文献重导没有出路。全模块**没有任何 `unlink`**。
+    改成 `.part` + `os.replace` 之后，`target` 存在 ⟺ 一次下载**完整跑完并验过**，
+    `_is_complete_pdf` 才是可信的命中判据。
+    """
     url = f"https://arxiv.org/pdf/{arxiv_id}{version or ''}"
-    with httpx.stream("GET", url, timeout=120, follow_redirects=True,
-                      headers={"User-Agent": "papershelf/0.1 (+self-hosted)"}) as r:
-        r.raise_for_status()
-        with target.open("wb") as f:
-            for chunk in r.iter_bytes(1 << 20):
-                f.write(chunk)
-    if not target.read_bytes()[:5].startswith(b"%PDF"):
-        raise RuntimeError("下载到的不是 PDF（可能被反爬拦截）")
+    part = target.with_name(target.name + ".part")
+    try:
+        with httpx.stream("GET", url, timeout=120, follow_redirects=True,
+                          headers={"User-Agent": "papershelf/0.1 (+self-hosted)"}) as r:
+            r.raise_for_status()
+            with part.open("wb") as f:
+                for chunk in r.iter_bytes(1 << 20):
+                    f.write(chunk)
+        # 中途断流不用在这儿另判：实测 httpx 自己抛 `RemoteProtocolError`
+        # （"peer closed connection without sending complete message body"），
+        # 下面的 `finally` 负责把 `.part` 收掉。这里要挡的是**正常结束但内容不全**
+        # 的那种 —— 反爬页、被代理改写的响应，`%%EOF` 判据才看得见。
+        if not _is_complete_pdf(part):
+            raise RuntimeError("下载到的不是完整的 PDF（可能被反爬拦截或中途截断）")
+        os.replace(part, target)        # 唯一让 target 出现的语句
+    finally:
+        part.unlink(missing_ok=True)    # 成功时已改名，失败时正是要删的那份
 
 
 # ── HTML → Doc（laTeXML 输出的结构）────────────────────────────────────────
