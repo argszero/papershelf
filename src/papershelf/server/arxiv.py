@@ -16,6 +16,7 @@ import re
 from pathlib import Path
 
 import httpx
+from PIL import Image
 
 from ..pipeline.model import Block, Doc, make_block_id
 
@@ -248,11 +249,66 @@ def _alttext_to_latex(alttext: str, display: bool) -> str:
     return f"\\( {tex} \\)"
 
 
+_IMAGE_PROBE = 512                      # 认 SVG 只需要开头这点字节
+
+
+def _is_usable_image(path: Path, min_bytes: int = 1) -> bool:
+    """盘上这个文件能不能当图片用：**完整**，而且确实是一张图。
+
+    判据交给 Pillow（`pillow>=10.0` 本来就是本项目的运行时依赖）。`verify()`
+    会校验容器结构与 CRC —— 实测**截断到 90% 的 PNG 也能抓出来**
+    （`OSError: truncated PNG file`），而只看魔数完全看不出来：截断的 PNG
+    开头仍是 `\\x89PNG`。空文件、HTML 页面、随机字节同样被拒。
+
+    SVG 是唯一的例外：它是 XML 文本，**栅格库本来就不认**（实测 `Image.open`
+    必抛 `UnidentifiedImageError`）⇒ 若一并交给 Pillow，arXiv 那些 SVG 插图
+    会被一律判成坏图、永远缓存不上。所以开头认得出 `<svg` 的按文本图接受。
+    """
+    try:
+        if path.stat().st_size < min_bytes:
+            return False
+        with path.open("rb") as f:
+            head = f.read(_IMAGE_PROBE)
+    except OSError:
+        return False
+    if b"<svg" in head.lower():
+        return True
+    try:
+        with Image.open(path) as im:
+            im.verify()
+        return True
+    except Exception:  # noqa: BLE001 —— 异常类型随格式而异（Unidentified/OSError/SyntaxError）
+        return False
+
+
 def _download_image(url: str, target: Path) -> None:
-    """下载 arXiv 页面里的图片（抽成函数便于测试打桩，避免单测真联网）。"""
-    r = httpx.get(url, timeout=30, follow_redirects=True)
-    if r.status_code == 200:
-        target.write_bytes(r.content)
+    """下载到 `.part`，验过再**原子改名**到 `target` —— 半截/HTML 页不许落到最终路径。
+
+    为什么必须这么写（2026-10-26 实测，全部在修复前的代码上跑出来的）：
+
+    ①**服务器不给 `Content-Length` 时，中途断开并不抛异常**（`Connection: close`
+      式收尾），`httpx.get` 认为响应正常结束 ⇒ 盘上留下半截图（实测 2008 字节的图
+      只剩 1004 字节）；②反爬/错误页若以 200 落地，一页 HTML 被存成 `fig.png`
+      （实测 87 字节）；③`r.content` 把整份图读进内存（实测 8 MiB 的图峰值 16 MiB）。
+
+    ①②原先没有出路：调用方的命中判据只有 `local.exists()` ⇒ 坏文件**永久**当缓存，
+    再也不会重下（与 `_download_pdf` 那条同一族病，见 2026-10-26 的 PDF 修复）。
+    改成 `.part` + 校验 + `os.replace` 之后，`target` 存在 ⟺ 一次下载**完整跑完并验过**，
+    `exists()` 才是可信的判据。
+    """
+    part = target.with_name(target.name + ".part")
+    try:
+        # 流式写盘：图多大都不进内存（③）。
+        with httpx.stream("GET", url, timeout=30, follow_redirects=True) as r:
+            r.raise_for_status()   # 非 200 必须抛：原先只是"不写文件"，静默到没人知道
+            with part.open("wb") as f:
+                for chunk in r.iter_bytes(1 << 16):
+                    f.write(chunk)
+        if not _is_usable_image(part):
+            raise RuntimeError("下载到的不是完整的图片（可能被反爬拦截或中途截断）")
+        os.replace(part, target)    # 唯一让 target 出现的语句
+    finally:
+        part.unlink(missing_ok=True)  # 成功时已改名，失败时正是要删的那份
 
 
 def _from_html(html: str, arxiv_id: str, version: str, paper: dict, settings) -> Doc:
@@ -328,7 +384,9 @@ def _from_html(html: str, arxiv_id: str, version: str, paper: dict, settings) ->
                 assets = settings.papers_dir / f"p{paper['id']}/assets"
                 assets.mkdir(parents=True, exist_ok=True)
                 local = assets / name
-                if not local.exists():
+                # 命中判据换成"这份文件真的是一张完整的图"：既挡住新的坏文件，
+                # 也让老代码留在盘上的坏文件（HTML 页 / 半截图）**重新下载一次**。
+                if not _is_usable_image(local):
                     url = (src.group(1) if src.group(1).startswith("http")
                            else f"https://arxiv.org/html/{arxiv_id}{version}/{src.group(1)}")
                     try:
