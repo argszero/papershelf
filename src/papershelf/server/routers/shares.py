@@ -264,7 +264,10 @@ def share_paper(token: str, paper_id: int,
                        (paper_id, share["plan_id"])).fetchone()
     if row is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "文献不在分享范围内")
-    data = doc_public(conn, paper_id, asset_prefix=f"/share/{token}/assets")
+    # 资产前缀**必须带 paper id**：文件名按页编号（`p1_img1.png`），与篇无关，
+    # 同一个计划里两篇都有第 1 页插图时必然同名 —— 不带 id 就只能靠猜。
+    data = doc_public(conn, paper_id,
+                      asset_prefix=f"/share/{token}/papers/{paper_id}/assets")
     if data is None:
         # ⑪ 只读分享是**无鉴权**入口：状态码之外必须给一句人话，否则匿名读者
         # 只会看到一个 409 数字（前端兜底文案是给登录用户写的「稍后自动刷新」）。
@@ -282,7 +285,8 @@ def share_export(token: str, paper_id: int, request: Request, lang: str = "dual"
     `inline=0` 是 2026-10-26 新加的出口：这个端点原先**只能内联**，而内联是导出里
     唯一会按论文图片总量吃内存的操作，且**不需要会话**（⑪：有链接就能打）。
     所以它也需要一条"只导出引用"的路 —— 上限（`PAPERSHELF_MAX_EXPORT_MB`）挡住的那一篇，
-    匿名读者仍然拿得到可用的 HTML，只是图片走 `/share/<token>/assets/...`。
+    匿名读者仍然拿得到可用的 HTML，只是图片走
+    `/share/<token>/papers/<id>/assets/...`。
 
     **鉴权一个字没加**：要改的是内存，不是门槛（`test_share_export_does_not_need_session`
     钉住的就是这条）。
@@ -302,7 +306,7 @@ def share_export(token: str, paper_id: int, request: Request, lang: str = "dual"
     mode = "dual" if lang == "dual" else ("en" if lang == "en" else "zh")
     html = synth(doc.blocks, mode, title=doc.meta.get("title_zh") or "",
                  meta_line=doc.meta.get("authors", ""),
-                 asset_prefix=f"/share/{token}/assets")
+                 asset_prefix=f"/share/{token}/papers/{paper_id}/assets")
     headers = {"Content-Disposition": f'inline; filename="{paper_id}-{mode}.html"'}
     if not inline:
         return HTMLResponse(html, headers=headers)

@@ -31,9 +31,15 @@ STATIC_DIR = Path(__file__).resolve().parent.parent / "static"
 _SAFE_ASSET_NAME = re.compile(r"^[A-Za-z0-9._-]+\.(png|jpe?g|gif|webp|svg)$")
 
 # 导出里会被内联的资产引用：登录内联 `/papers/<id>/assets` 与分享内联
-# `/share/<token>/assets` 两种前缀，指向同一个 `p<id>/assets` 目录。
+# `/share/<token>/papers/<id>/assets` 两种前缀，指向同一个 `p<id>/assets` 目录。
+# ⚠️ 第三个分支是**旧分享前缀的兼容项**（2026-10-26 之前的 `inline=0` HTML 用它）。
+#    改了前缀却没改这里的正则，分享内联导出会**静默地不再内联任何图片** ——
+#    不报错、不出异常，只是导出件里剩一堆链接。
+#    `test_share_inline_export_still_inlines_the_bytes` 就是钉这条的。
 _ASSET_SRC = re.compile(
-    r'src="(?:/papers/\d+/assets/|/share/[A-Za-z0-9_-]+/assets/)([^"]+)"')
+    r'src="(?:/papers/\d+/assets/'
+    r'|/share/[A-Za-z0-9_-]+/papers/\d+/assets/'
+    r'|/share/[A-Za-z0-9_-]+/assets/)([^"]+)"')
 
 # 一次从磁盘读多少字节去 base64。**必须是 3 的整数倍**：base64 按 3 字节一组编码，
 # 块边界对不齐会在流中间塞进 `=` 填充，拼出来的 data URI 直接坏掉（有测试钉住）。
@@ -256,9 +262,41 @@ def create_app() -> FastAPI:
             raise HTTPException(status.HTTP_404_NOT_FOUND, "图片不存在")
         return _serve_asset(paper_id, name)
 
+    @app.get("/share/{token}/papers/{paper_id}/assets/{name:path}", include_in_schema=False)
+    def share_paper_asset(token: str, paper_id: int, name: str):
+        """匿名只读分享里的图片：URL 自带 paper id，且**必须属于本次分享的计划**。
+
+        为什么 id 是必需的：资产文件名**按页编号**（`p1_img1.png` / `p1_deco1.png`），
+        与篇无关 —— 同一个计划里两篇都有第 1 页插图时，两个文件必然同名。旧路由
+        拿不到 id，只能按 id 升序遍历计划内所有文献、返回第一个有该文件的，
+        于是**编号最小的那篇永远赢**：读者看的是别人的图。失败模式是"换成另一篇的图"
+        而不是"图片 404"，肉眼极难发现。
+
+        归属检查是**安全边界**而不是顺手校验：没有它，一个分享链接就能读到**别的
+        计划**里的资产。计划归属只由 `share["plan_id"]` 决定，查不到就 404，
+        绝不落到"换一篇试试"的兜底上。
+        """
+        conn = conn_factory()
+        try:
+            share = resolve_share(conn, token)
+            row = conn.execute("SELECT id FROM papers WHERE id=? AND plan_id=?",
+                               (paper_id, share["plan_id"])).fetchone()
+        finally:
+            conn.close()
+        if row is None:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "图片不存在")
+        return _serve_asset(paper_id, name)
+
     @app.get("/share/{token}/assets/{name:path}", include_in_schema=False)
     def share_asset(token: str, name: str):
-        """匿名只读分享里的图片（⑪ 持链接即可看整篇，图不能缺）。"""
+        """**兼容保留，只发不收**：已经没有任何地方生成这种 URL 了。
+
+        2026-10-26 之前的分享导出把图片写成 `/share/<token>/assets/<name>` ——
+        那些 HTML 已经交到读者手里（`inline=0` 的导出件），链接不能一夜失效，
+        所以这条路由继续服务。但这条 URL 天生问不出"这是哪一篇的图"，只能猜
+        （按 id 升序取第一个有该文件的）：同名插图的歧义在这里**服务端修不了**，
+        修法是"以后不再生成它"（见上一条路由）。
+        """
         if not _SAFE_ASSET_NAME.match(name) or "/" in name or "\\" in name or ".." in name:
             raise HTTPException(status.HTTP_400_BAD_REQUEST, "非法文件名")
         conn = conn_factory()

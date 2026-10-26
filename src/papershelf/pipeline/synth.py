@@ -35,7 +35,10 @@ def with_asset_prefix(blocks: list[Block], prefix: str) -> list[Block]:
 
     解析产物统一用相对路径（导出成单文件/整目录时可直接双击打开），
     但**服务端阅读器与分享**走 HTTP，必须改成 `/papers/<id>/assets/x.png`
-    或 `/share/<token>/assets/x.png`，否则图片全是 404。
+    或 `/share/<token>/papers/<id>/assets/x.png`，否则图片全是 404。
+
+    分享前缀**必须带 paper id**：资产文件名按页编号（`p1_img1.png`），与篇无关，
+    不带 id 的话服务端只能按 id 升序猜，同一个计划里两篇的同名插图会互相顶替。
     """
     if not prefix:
         return blocks
