@@ -105,6 +105,12 @@ export const api = {
   rebuildRefs: (id: number) =>
     request<{ ok: boolean; conv_state: string; job: string }>(
       `/api/papers/${id}/rebuild-refs`, { method: 'POST' }),
+  // 修复插图（存量出口）：只把缺的图片文件补回来 —— 一个块都不改 ⇒ 笔记与划痕一条不动，
+  // 且**零 token**（插图是磁盘文件，不是译文）。与「重建参考文献」同一套异步观感：
+  // 返回 202 后看 `conv_state`，修不了的原因落在 `conv_error` 里行内显示。
+  rebuildAssets: (id: number) =>
+    request<{ ok: boolean; conv_state: string; job: string }>(
+      `/api/papers/${id}/rebuild-assets`, { method: 'POST' }),
 
   // ── 阅读（块级 JSON 是唯一事实来源，决策⑳）──
   doc: (paperId: number) => request<PaperDoc>(`/api/papers/${paperId}/doc`),

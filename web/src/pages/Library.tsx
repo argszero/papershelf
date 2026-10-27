@@ -141,6 +141,26 @@ export function LibraryPage() {
     } finally { setBusy(null) }
   }, [reload])
 
+  // 修复插图（存量出口）：只把磁盘上缺掉的图片文件补回来 —— **一个块都不改**，所以
+  // 笔记与划痕一条不动；插图是磁盘文件，所以**零 token**。与「重建参考文献」同族：
+  // 两者都是"这篇的产物坏了，但我不想丢掉批注"的出口。
+  // ⚠️ 确认框必须划清与「重新提取」的分界：那个会作废整篇笔记与划痕、且重花百万级 token，
+  //    而这件事恰好不需要它 —— 别再让用户在两件代价差三个数量级的事之间盲选。
+  const rebuildAssets = useCallback(async (p: Paper) => {
+    const name = paperLabel(p)
+    if (!window.confirm(
+      `修复${name}的插图？\n\n` +
+      '只把磁盘上缺失的图片文件补回来：不重跑转换、不动译文，笔记与划痕都保留，不消耗 token。\n' +
+      '如果连图片的原始来源都找不到了，会提示改用「重新提取」（那一步会作废整篇笔记与划痕）。')) return
+    setBusy(p.id)
+    try {
+      await api.rebuildAssets(p.id)
+      await reload()
+    } catch (e) {
+      window.alert(e instanceof Error ? e.message : '修复插图失败')
+    } finally { setBusy(null) }
+  }, [reload])
+
   if (!plan) return <><TopBar title="文献库" sub="还没有阅读计划" /><NoPlan /></>
 
   const chips: Array<{ k: 'all' | PaperStatus; label: string }> = [
@@ -219,6 +239,15 @@ export function LibraryPage() {
                                         aria-label={`重建《${p.title || p.id}》的参考文献`}
                                         disabled={busy === p.id}
                                         onClick={(e) => { e.stopPropagation(); void rebuildRefs(p) }}>重建参考文献</button>
+                              )}
+                              {/* 修复插图：同族的第二个保批注出口 —— 只补磁盘上缺掉的图片文件
+                                  （磁盘清理 / 同源那篇被删 / #7 之前转换的存量篇目）。零 token，
+                                  所以不做代价警告，确认框只说清它不碰批注。 */}
+                              {p.conv_state === 'done' && (
+                                <button className="t-edit t-ast" title="只补回缺失的插图文件（笔记、划痕与译文都保留，不消耗 token）"
+                                        aria-label={`修复《${p.title || p.id}》的插图`}
+                                        disabled={busy === p.id}
+                                        onClick={(e) => { e.stopPropagation(); void rebuildAssets(p) }}>修复插图</button>
                               )}
                               <button className="t-edit t-del" title="删除这篇文献"
                                       aria-label={`删除《${p.title || p.id}》`}

@@ -145,6 +145,7 @@ def enqueue(conn: sqlite3.Connection, paper_id: int, job: str | None = None,
     一处声明，别处不可能漏（`tests/test_refs_rebuild.py` 钉住"重试入口必须清掉旧 job"）。
 
     `job=None` = 完整转换。`job="refs"` = 只重建文末参考文献（`server/refsfix.py`）。
+    `job="assets"` = 只把缺的插图文件补回来（`server/assetsfix.py`，零 token）。
     `reset_attempts=True` = 人工入口（重试/重新提取/重建参考文献）把 `conv_attempts` 归零，
     理由见 `retrigger`：护栏防的是自动重试烧钱，不是防用户。
     """
@@ -205,6 +206,9 @@ def convert_paper(paper_id: int, fingerprint: str | None = None) -> None:
             with paper_log(paper_id, settings.logs_dir, enabled=settings.log_per_paper):
                 if (fresh["pending_job"] or "") == "refs":
                     _run_refs_fix(conn, paper_id, t0)
+                    return
+                if (fresh["pending_job"] or "") == "assets":
+                    _run_assets_fix(conn, paper_id, t0, settings)
                     return
                 log.info("paper=%s 开始转换（第 %s 次尝试，来源=%s，PDF=%s）", paper_id,
                          int(fresh["conv_attempts"]) + 1, fresh["source"],
@@ -268,6 +272,41 @@ def _run_refs_fix(conn: sqlite3.Connection, paper_id: int, t0: float) -> None:
                  result.get("anchors_moved"), result.get("anchors_dropped"),
                  time.monotonic() - t0)
     _set_state(conn, paper_id, "done", None, tokens=tokens)
+
+
+def _run_assets_fix(conn: sqlite3.Connection, paper_id: int, t0: float, settings) -> None:
+    """`pending_job='assets'` 的那条支路：**只把缺的插图文件补回来**，不重跑管线。
+
+    挂进同一个外壳（等槽位 → 认领 → 记日志 → 落终态）的理由与 `_run_refs_fix` 完全一致：
+    共用并发闸门、共享启动恢复（`doing → queued` 只看 `conv_state`，`pending_job` 原样留着
+    ⇒ 重启后它仍知道该干"补图"而不是"重跑整篇"）、请求线程里不干长活。
+
+    与「重建参考文献」唯一的区别是**代价**：这条活一次模型调用都不发（插图是磁盘文件），
+    所以 `tokens_used` 一分不涨。
+    """
+    from .assetsfix import rebuild_paper_assets
+
+    log.info("paper=%s 开始修复插图（只搬文件；块、译文、笔记与划痕都不动，不调模型）", paper_id)
+    try:
+        result = rebuild_paper_assets(conn, paper_id, settings, log_fn=log.info)
+    except Exception as exc:                           # noqa: BLE001
+        log.exception("paper=%s 修复插图失败（%.1fs）", paper_id, time.monotonic() - t0)
+        _set_state(conn, paper_id, "failed", f"{type(exc).__name__}: {exc}")
+        return
+    if not result.get("ok"):
+        # 修不了**不等于**转换失败，但也**不能写 `done`**：那会让界面显示"转换完成"而插图
+        # 仍然裂着，用户还会以为自己已经修过了。原因原样进 `conv_error`（界面行内显示全文，
+        # 决策⑪），里面点名了下一步该点哪个按钮。
+        _set_state(conn, paper_id, "failed", str(result.get("reason") or "没有可修复的产物"))
+        return
+    if not result.get("changed"):
+        log.info("paper=%s 修复插图：无事可做（%s），未改动任何文件",
+                 paper_id, result.get("reason"))
+    else:
+        log.info("paper=%s 修复插图完成：补回 %s 张（产物共引用 %s 张，来源=%s）/ 用时 %.1fs",
+                 paper_id, result.get("repaired"), result.get("referenced"),
+                 result.get("source"), time.monotonic() - t0)
+    _set_state(conn, paper_id, "done", None)
 
 
 def _writeback_meta(conn: sqlite3.Connection, paper_id: int, paper: dict[str, Any],

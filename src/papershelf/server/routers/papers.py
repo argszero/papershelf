@@ -443,6 +443,54 @@ def rebuild_refs(paper_id: int, background: BackgroundTasks,
     return {"ok": True, "conv_state": "queued", "job": "refs"}
 
 
+@router.post("/papers/{paper_id}/rebuild-assets", status_code=202)
+def rebuild_assets(paper_id: int, background: BackgroundTasks,
+                   conn: sqlite3.Connection = Depends(get_conn),
+                   user: dict[str, Any] = Depends(current_user)) -> dict[str, Any]:
+    """**修复插图**（存量出口）：把这一篇缺的图片文件补回来。零 token。
+
+    ## 它补的是哪一类洞（离线实测，`tests/test_assets_rebuild.py` 钉住）
+
+    `#7`（`84e94bc`）让「命中解析缓存时把资产搬进本篇目录」成立，但那段代码**只在整条
+    转换里跑**（`converter._run`，全仓库唯一调用点）⇒ 已经 `done` 的篇目**永远不会再进它**。
+    于是磁盘上少一张图就是**永久 404**，而现存三条出口没有一条能把文件放回去：
+
+    | 出口 | 跑什么 | 图片会回来吗 |
+    |---|---|---|
+    | `POST /papers/{id}/convert` | `job=None` → 整条管线（重译，百万级 token） | 否 |
+    | `POST /papers/{id}/reextract` | 清缓存 + **`DELETE FROM notes/highlights`** | 是，但批注全没 |
+    | `POST /papers/{id}/rebuild-refs` | 只重跑文末文献段 | 否 |
+    | `POST /papers/{id}/rebuild-assets`（本入口） | 只复制缺的图片文件 | **是** |
+
+    可发生面不是"新用户"：`#7` 之前转换的存量篇目（生产上有）、`p<id>/assets/` 被磁盘
+    清理或恢复丢失、同一份 PDF 的**同源那篇被删文献**（整目录被收走，缓存行却还在）。
+
+    ## 为什么不自己做身份判断，而是要么"来源确定"要么"就 409"
+
+    资产文件名**按页编号**（`p1_img1.png`），与篇无关 ⇒ 随手去别处找个同名文件搬过来，
+    修出来的不是"裂图"而是**别人的图**（`#8` 修的正是这个失败模式的分享页版本：肉眼极难
+    发现）。所以本入口只承认两种来源：解析时记进 `meta["assets_dir"]` 的那一个目录，或者
+    "同一份 PDF 在同一个 `PARSE_VERSION` 下重新解析、且块 id 与原文逐字相同"的产物。
+    后者量不过就**放弃**，并点名「重新提取」及其代价 —— 破坏性出口由用户自己选，不由我们代签。
+
+    ## 异步
+
+    重新解析那一支是秒级但会阻塞，所以走常驻队列（`pending_job='assets'` →
+    `converter._run_assets_fix`），与转换共用并发闸门与启动恢复；请求当下只做能立刻判定的
+    「没有产物可修」409。幂等：插图齐全时再点是 no-op（不复制、不解析，`changed=False`）。
+    """
+    paper = require_paper(conn, paper_id, user)
+    if paper["conv_state"] == "doing":
+        raise HTTPException(status.HTTP_409_CONFLICT, "该文献正在转换中")
+    if paper["conv_state"] != "done":
+        raise HTTPException(status.HTTP_409_CONFLICT,
+                            f"该文献还没有可修复的产物（当前状态：{paper['conv_state']}）")
+    enqueue(conn, paper_id, job="assets", reset_attempts=True)
+    log.info("paper=%s 修复插图：已排入队列（只补图片文件，笔记与划痕保留，零 token）", paper_id)
+    background.add_task(convert_paper, paper_id, None)
+    return {"ok": True, "conv_state": "queued", "job": "assets"}
+
+
 @router.get("/papers/{paper_id}/export")
 def export(paper_id: int, request: Request, lang: str = "dual", inline: bool = True,
            conn: sqlite3.Connection = Depends(get_conn),
