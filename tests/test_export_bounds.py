@@ -258,7 +258,7 @@ def test_share_export_can_opt_out_of_inlining(client, settings, seeded):
     r = _anon(client).get(f"/api/shares/{tok}/papers/{pid}/export?inline=0")
     assert r.status_code == 200
     assert _data_uris(r.text) == []
-    assert f"/share/{tok}/assets/p1_img1.png" in r.text
+    assert f"/share/{tok}/papers/{pid}/assets/p1_img1.png" in r.text
 
 
 def test_share_export_over_the_cap_is_413_not_500(client, settings, seeded):
