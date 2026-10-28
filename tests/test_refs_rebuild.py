@@ -383,20 +383,190 @@ def test_converter_runs_the_refs_job_without_touching_the_pipeline(seeded, setti
     assert len([b for b in _blocks(seeded).blocks if b.type == "ref"]) == 4
 
 
-def test_refs_job_failure_lands_failed_and_clears_the_job(seeded, settings, monkeypatch):
-    """炸了要落 `failed` + 带上原因，**并且**清掉 `pending_job`（不许留着污染下一轮）。"""
-    import papershelf.server.refsfix as refsfix
-    import papershelf.server.converter as converter
 
-    def boom(*a, **k):
+# ── 4. 失败支路：判据跟产物走，**不跟**这一次修成没修成走 ────────────────────
+# `#10`（`5b0fe55`）在「修复插图」支路上定下了这条判据（`converter._set_decline_state`），
+# 但**只修了那一条支路**：本文这条 `except` 当时仍写死 `failed`。而两个修复端点
+# （`/rebuild-refs`、`/rebuild-assets`）都只对 `conv_state == 'done'` 开放 ⇒ 修文献途中
+# 抛一次异常（模型不可达/欠费、写库时 `OSError`）就把这篇**永久**锁在「重新提取」
+# （`DELETE FROM notes/highlights`）之外，病因去掉也点不回来。
+#
+# ⚠️ 下面这几条**一次网络请求都不发**：`Translator._chat` 被桩成抛错，任何绕过桩的真调用
+#    都会当场炸成 AssertionError，而不是悄悄连上模型服务。
+
+
+def _markup(settings, pid: int) -> dict[str, list[dict]]:
+    """笔记与划痕的**全字段**快照（逐字段比对，不只看行数）。"""
+    from papershelf.server.db import connect
+
+    conn = connect(settings)
+    try:
+        return {t: [dict(r) for r in conn.execute(
+            f"SELECT * FROM {t} WHERE paper_id=? ORDER BY id", (pid,)).fetchall()]
+            for t in ("notes", "highlights")}
+    finally:
+        conn.close()
+
+
+def _ids(settings, pid: int) -> list[str]:
+    """产物里的块 id 序列（"只修文献"这条活的硬不变量：正文块绝不重编号）。"""
+    from papershelf.server.db import connect
+
+    conn = connect(settings)
+    try:
+        return [r[0] for r in conn.execute(
+            "SELECT id FROM blocks WHERE paper_id=? ORDER BY ord", (pid,)).fetchall()]
+    finally:
+        conn.close()
+
+
+def _no_network(monkeypatch) -> None:
+    from papershelf.pipeline import translator as tr_mod
+
+    def _boom(*_a, **_k):
+        raise AssertionError("这套测试不许发起真实的模型调用")
+
+    monkeypatch.setattr(tr_mod.Translator, "_chat", _boom)
+
+
+def test_a_failed_refs_repair_keeps_the_paper_repairable(seeded, settings, monkeypatch):
+    """抛异常 = **这一次**没修成，不是这篇坏了：产物还在就留在 `done`，原因进 `conv_error`。
+
+    判据与「修复插图」支路完全一致（`_set_decline_state`）：`conv_state` 只回答
+    "这篇有没有产物"，"这一次为什么没修成"是 `conv_error` 的事。两者混在一起写，
+    代价不对称 —— 误判成 `done` 只是多一行看得见的原因 + 一个仍然点得动的按钮；
+    误判成 `failed` 是永久锁死。
+    """
+    import papershelf.server.converter as converter
+    import papershelf.server.refsfix as refsfix
+
+    _no_network(monkeypatch)
+    before_notes = seeded.execute("SELECT COUNT(*) FROM notes").fetchone()[0]
+    before_marks = seeded.execute("SELECT COUNT(*) FROM highlights").fetchone()[0]
+    before_ids = _ids(settings, 1)
+
+    # 合并在内存里做完、要译新条目时模型不可达 —— 生产上最常见的那个成因。
+    def boom(*_a, **_k):
         raise RuntimeError("模型欠费")
 
-    monkeypatch.setattr(refsfix, "rebuild_paper_refs", boom)
+    monkeypatch.setattr(refsfix, "_make_translator", boom)
     _queue_refs(settings, 1)
     converter.convert_paper(1)
+
     row = _job(settings, 1)
-    assert row["conv_state"] == "failed" and row["pending_job"] is None
-    assert "模型欠费" in (row["conv_error"] or "")
+    assert row["conv_state"] == "done", \
+        f"产物还在，却把这篇降级成 {row['conv_state']}（{row['conv_error']}）"
+    assert "模型欠费" in (row["conv_error"] or ""), \
+        f"失败的原因没有留给用户看：{row['conv_error']}"
+    assert row["pending_job"] is None, "终态必须清掉 pending_job，否则下一轮排队会被它劫持"
+    assert seeded.execute("SELECT COUNT(*) FROM notes").fetchone()[0] == before_notes
+    assert seeded.execute("SELECT COUNT(*) FROM highlights").fetchone()[0] == before_marks
+    assert _ids(settings, 1) == before_ids, "这一次没修成，块 id 一个都不该动"
+
+
+def test_a_refs_repair_without_a_product_still_lands_failed(settings):
+    """反向也要成立：库里**真的没有产物**时仍然落 `failed`。
+
+    不是"对称好看"：`done` 的另一半含义是"点得进阅读器"。产物不在却写 `done`，
+    用户点进去是一片空白。`ok=False` 这一支本来就是"没有产物"，改走同一条判据之后
+    结果必须是**同一个** `failed` —— 换的是判据的落点，不是判决。
+    """
+    from papershelf.server.converter import convert_paper
+    from papershelf.server.db import connect
+
+    conn = connect(settings)
+    try:
+        conn.execute("INSERT INTO users (id,email,password_hash,status,created_at) "
+                     "VALUES (1,'u@tsinghua.edu.cn','x','active','')")
+        conn.execute("INSERT INTO plans (id,user_id,name) VALUES (1,1,'p')")
+        conn.execute("INSERT INTO papers (id,plan_id,title,conv_state) "
+                     "VALUES (1,1,'测试文献','done')")     # 标着 done，一行产物都没有
+        conn.commit()
+    finally:
+        conn.close()
+
+    _queue_refs(settings, 1)
+    convert_paper(1)
+    row = _job(settings, 1)
+    assert row["conv_state"] == "failed", "没有产物却留在了 done（点进阅读器会是空白）"
+    assert "没有产物" in (row["conv_error"] or ""), row["conv_error"]
+    assert row["pending_job"] is None
+
+
+def test_both_repair_exits_stay_usable_after_a_failed_refs_repair(
+        client, settings, make_user, monkeypatch):
+    """端到端（真 HTTP 端点）：一次失败的修文献之后，**两个**便宜出口仍然点得动。
+
+    这是本条的验收：原先 202 → `failed` → **409 + 409**，而且**病因去掉也还是 409**。
+    现在同一条路径要走到 202 → `done`（原因在 `conv_error`）→ 202 / 202。
+    """
+    from papershelf.pipeline.model import Block, Doc
+    from papershelf.server import refsfix
+    from papershelf.server.db import connect, tx
+    from papershelf.server.repo import save_doc
+
+    _no_network(monkeypatch)
+    email, pw = make_user()
+    pid = 9
+    conn = connect(settings)
+    try:
+        conn.execute("INSERT INTO plans (id,user_id,name) VALUES (?,1,'p')", (pid,))
+        conn.execute("INSERT INTO papers (id,plan_id,title,conv_state) "
+                     "VALUES (?,?,'测试文献','done')", (pid, pid))
+        doc = Doc(meta={"refs_start": "b-0003", "refs_count": 2}, assets=[], blocks=[
+            Block(id="b-0001", type="h2", en="1 Introduction", zh="1 引言", zh_source="mt"),
+            Block(id="b-0002", type="p", en="Metal additive manufacturing is growing fast.",
+                  zh="金属增材制造发展迅速。", zh_source="mt"),
+            Block(id="b-0003", type="h2", en="References", zh="参考文献", zh_source="mt",
+                  section="REFERENCES"),
+            Block(id="b-0004", type="refs", section="REFERENCES",
+                  en="[1] A. Author. TITLE-1 sensing in metal additive man-",
+                  payload={"page": 8}),
+            Block(id="b-0005", type="refs", section="REFERENCES",
+                  en="ufacturing. Journal of Manufacturing Processes 12(3):45. "
+                     "[2] C. Author. TITLE-2 for laser powder bed fusion. Materials 9(1):1.",
+                  payload={"page": 8}),
+        ])
+        save_doc(conn, pid, doc)
+        with tx(conn):
+            conn.execute("INSERT INTO notes (paper_id, block_id, content, created_at) "
+                         "VALUES (?,?,?,datetime('now'))", (pid, "b-0002", "我的笔记"))
+            conn.execute("INSERT INTO highlights (paper_id, block_id, lang, start, end, "
+                         "color, created_at) VALUES (?,?,?,?,?,?,datetime('now'))",
+                         (pid, "b-0002", "zh", 0, 6, "amber"))
+    finally:
+        conn.close()
+    client.post("/api/auth/login", json={"email": email, "password": pw})
+
+    before_marks = _markup(settings, pid)
+    before_ids = _ids(settings, pid)
+
+    def boom(*_a, **_k):
+        raise RuntimeError("模型欠费")
+
+    monkeypatch.setattr(refsfix, "_make_translator", boom)
+
+    r1 = client.post(f"/api/papers/{pid}/rebuild-refs")
+    assert r1.status_code == 202, r1.text
+    row = _job(settings, pid)
+    assert row["conv_state"] == "done", \
+        f"产物还在，却把这篇降级成 {row['conv_state']}（{row['conv_error']}）"
+    assert "模型欠费" in (row["conv_error"] or ""), row["conv_error"]
+    assert row["pending_job"] is None
+    # 这一次没修成，但产物与批注一个字节都不该动
+    assert _markup(settings, pid) == before_marks
+    assert _ids(settings, pid) == before_ids
+
+    # 病因还在时也点得动：重试是 202，而不是一道单向门
+    assert client.post(f"/api/papers/{pid}/rebuild-refs").status_code == 202
+
+    # 病因去掉 ⇒ 修文献真的跑通，姐妹出口也还开着
+    monkeypatch.setattr(refsfix, "_make_translator",
+                        lambda _conn, _pid: FakeTr())
+    assert client.post(f"/api/papers/{pid}/rebuild-refs").status_code == 202
+    assert _job(settings, pid)["conv_state"] == "done"
+    assert client.post(f"/api/papers/{pid}/rebuild-assets").status_code == 202, \
+        "一次修文献失败不该把「修复插图」也一起锁死"
 
 
 def test_a_normal_retry_is_not_hijacked_by_a_leftover_refs_job(seeded, settings, client,
