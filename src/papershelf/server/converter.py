@@ -294,13 +294,19 @@ def _run_refs_fix(conn: sqlite3.Connection, paper_id: int, t0: float) -> None:
         result = rebuild_paper_refs(conn, paper_id, log=log.info)
     except Exception as exc:                           # noqa: BLE001
         log.exception("paper=%s 重建参考文献失败（%.1fs）", paper_id, time.monotonic() - t0)
-        _set_state(conn, paper_id, "failed", f"{type(exc).__name__}: {exc}")
+        # 抛异常只说明**这一次**没修成（模型不可达 / 欠费、写库途中 `OSError` …），
+        # 不说明这篇坏了 ⇒ 与「修图」支路走同一条判据（产物在不在），不默认 `failed`。
+        # 原先这里写死 `failed`，而两个修复端点都只对 `done` 开放 ⇒ 一次模型抖动就把
+        # 这篇永久锁在两条便宜出口之外（`#10` 修的就是同一形状，只是修了另一条支路）。
+        _set_decline_state(conn, paper_id, f"{type(exc).__name__}: {exc}")
         return
     tokens = int(result.get("tokens", 0) or 0)
     if not result.get("ok"):
         # `ok=False` = 这篇根本没有产物（转换还没完成 / 已被删）。不是失败，
         # 但也**不能**写 `done`：那会让界面显示"转换完成"而实际一片空白。
-        _set_state(conn, paper_id, "failed", str(result.get("reason") or "没有可修复的产物"))
+        # 判据同样只留一处（`_set_decline_state`）：产物真的不在 ⇒ 它给出的正是 `failed`，
+        # 与这里原先写死的结果一致；而"量不到"那种边角也由它按不对称代价处理。
+        _set_decline_state(conn, paper_id, str(result.get("reason") or "没有可修复的产物"))
         return
     if not result.get("changed"):
         log.info("paper=%s 重建参考文献：无事可做（%s），未改动库也未调模型",
