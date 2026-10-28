@@ -384,6 +384,14 @@ select.input { width: auto; }
 /* 「中文版」列的第一行（已生成 / 待转换 / 失败…）。绿色表示这篇已经能读了，
    与 `.t-year` 同字号同字重，让该列与「发表」列的骨架一致。 */
 .ptable .t-cv { font-family: var(--font-mono); font-size: 12.5px; color: var(--st-read); }
+/* 上一次「修复插图」放弃的原因。**必须看得见**：那一步不降级状态（产物还在 ⇒ 仍是
+   `done`），原因若只挂在"失败"那一格，用户就只剩一行看不懂的裂图。用 warn 而不是
+   danger —— 这篇是能读的，失败的只是"补图"这一个动作。 */
+.ptable .t-warn {
+  font-family: var(--font-mono); font-size: 11px; color: var(--warn);
+  margin-top: 4px; max-width: 46ch; line-height: 1.45;
+  overflow-wrap: anywhere;
+}
 .ptable .t-venue { font-size: 12px; color: var(--muted); }
 .ptable .t-tags { display: flex; gap: 4px; flex-wrap: wrap; max-width: 190px; }
 .ptable .num-col { text-align: right; font-family: var(--font-mono); font-variant-numeric: tabular-nums; }

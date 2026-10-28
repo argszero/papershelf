@@ -285,6 +285,13 @@ export function LibraryPage() {
                             <div className="t-sub">
                               创建 {shortDay(p.created_at)} · 最近阅读 {p.last_read_at ? relTime(p.last_read_at) : '未读'}
                             </div>
+                            {/* 上一次「修复插图」放弃的原因。状态留在 `done`（产物还在 ⇒
+                                这篇仍然可读、两个修复按钮也仍然点得动），所以原因不能只挂在
+                                `failed` 那一格 —— 否则按钮回来了，用户却不知道上次为什么没修成
+                                （判据见 `converter._set_decline_state`）。 */}
+                            {p.conv_error && (
+                              <div className="t-warn" title={p.conv_error}>⚠ {p.conv_error}</div>
+                            )}
                           </div>
                         ) : p.conv_state === 'failed' ? (
                           <button className="chip danger" disabled={busy === p.id}
