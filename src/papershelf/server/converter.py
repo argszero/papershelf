@@ -25,7 +25,7 @@ from ..pipeline.metadata import MetadataExtractor
 from ..pipeline.validate import Report, expects_chinese, validate
 from .config import get_settings
 from .db import dump_json, load_json, tx, utcnow
-from .repo import save_doc
+from .repo import load_doc, save_doc
 from .titlemeta import is_placeholder_title
 
 log = logging.getLogger("papershelf.converter")
@@ -132,6 +132,46 @@ def _set_state(conn: sqlite3.Connection, paper_id: int, state: str,
                WHERE id=?""",
             (state, error, utcnow(), tokens, paper_id),
         )
+
+
+def _set_decline_state(conn: sqlite3.Connection, paper_id: int, reason: str) -> None:
+    """「这一次修不了」时该落哪个状态：**看产物在不在，不看这次修成功没有**。
+
+    ## 这条规则换掉的是什么（`#9` 自己带进来的回归）
+
+    `_run_assets_fix` 起初抄了 `_run_refs_fix` 的终态分支，把 `ok=False` 一律写成
+    `failed`。可两条支路的 `ok=False` 语义并不一样：
+
+    - **重建参考文献**只有一个成因 —— 「该文献没有产物」⇒ 写 `failed` 是诚实的；
+    - **修复插图**有三个，其中**两个是"产物在、但我不敢猜"**（来源目录与 PDF 都没了 /
+      重新解析出的块 id 或原文对不上 / 连重新解析的产物里也没有这几张图），
+      另外 `except Exception`（复制途中 `OSError` 之类）也是同一个形状。
+
+    后两个成因被塞进「没有产物」那一支之后，一道**单向门**就形成了：两个修复端点
+    （`POST /papers/{id}/rebuild-assets` 与 `-refs`）都只对 `conv_state == 'done'` 开放，
+    一旦落成 `failed`，这篇就**再也点不动这两条便宜出口** —— 病因去掉也点不回来 ——
+    而 `conv_error` 把用户指去「重新提取」（`DELETE FROM notes/highlights` + ≈整篇 token），
+    正是这条出口本来要避免的那件事。实测复现见 `tests/test_assets_rebuild.py`
+    「修不了 ≠ 这篇坏了」那一段。
+
+    ## 规则
+
+    产物在（`load_doc` 拿得到）⇒ `conv_state` 留在 `done`，原因原样进 `conv_error`；
+    产物真的不在 ⇒ `failed`（此时用户该走「重新转换」/「重新提取」：确实没有东西可修）。
+
+    "这次没修成"是 `conv_error` 的事，"这篇有没有产物"才是 `conv_state` 的事 ——
+    两者混在一起写，就是上面那道门。
+
+    量不到（`load_doc` 自己抛）时按**产物在**处理：误判成 `done` 的代价是一行仍然
+    看得见的原因 + 一个仍然点得动的按钮，误判成 `failed` 的代价是永久锁死。两者不对称。
+    """
+    try:
+        product_here = load_doc(conn, paper_id) is not None
+    except Exception:                                  # noqa: BLE001
+        log.warning("paper=%s 复核产物时出错，按「产物在」处理（宁可留一个重试按钮，"
+                    "也不把这篇锁死）", paper_id, exc_info=True)
+        product_here = True
+    _set_state(conn, paper_id, "done" if product_here else "failed", reason)
 
 
 def enqueue(conn: sqlite3.Connection, paper_id: int, job: str | None = None,
@@ -291,13 +331,15 @@ def _run_assets_fix(conn: sqlite3.Connection, paper_id: int, t0: float, settings
         result = rebuild_paper_assets(conn, paper_id, settings, log_fn=log.info)
     except Exception as exc:                           # noqa: BLE001
         log.exception("paper=%s 修复插图失败（%.1fs）", paper_id, time.monotonic() - t0)
-        _set_state(conn, paper_id, "failed", f"{type(exc).__name__}: {exc}")
+        # 抛异常只说明**这一次**没搬成（复制途中 `OSError` 之类），不说明这篇坏了
+        # ⇒ 与「放弃」走同一条判据（产物在不在），不默认 `failed`。
+        _set_decline_state(conn, paper_id, f"{type(exc).__name__}: {exc}")
         return
     if not result.get("ok"):
-        # 修不了**不等于**转换失败，但也**不能写 `done`**：那会让界面显示"转换完成"而插图
-        # 仍然裂着，用户还会以为自己已经修过了。原因原样进 `conv_error`（界面行内显示全文，
-        # 决策⑪），里面点名了下一步该点哪个按钮。
-        _set_state(conn, paper_id, "failed", str(result.get("reason") or "没有可修复的产物"))
+        # 修不了**不等于**转换失败：`conv_state` 只回答"这篇有没有产物"，
+        # 而"这一次为什么没修成"写进 `conv_error`（界面在"已生成"那格里行内显示，
+        # 决策⑪），里面点名了下一步该点哪个按钮。判据见 `_set_decline_state`。
+        _set_decline_state(conn, paper_id, str(result.get("reason") or "没有可修复的产物"))
         return
     if not result.get("changed"):
         log.info("paper=%s 修复插图：无事可做（%s），未改动任何文件",

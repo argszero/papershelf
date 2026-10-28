@@ -11,7 +11,7 @@
 可发生面不是"新用户"：`#7` 之前转换的存量篇目、`p<id>/assets/` 被磁盘清理或恢复丢失、
 以及**同源那篇被删文献**（整目录被收走，`doc_cache` 行却还在）。
 
-本文件钉住四条不变量（顺序就是风险从大到小）：
+本文件钉住五条不变量（顺序就是风险从大到小）：
 
 1. **批注一条不动、一个字节不变** —— 这条出口的全部价值就在这里；它是**结构性**成立的：
    本操作从不写 `docs` / `blocks` / `notes` / `highlights`，只写文件；
@@ -19,6 +19,11 @@
 3. **幂等** —— 插图齐全时再点一次是 no-op（不复制、不重新解析）；
 4. **不猜** —— 来源目录没了就必须先证明"重新解析出来的是同一篇"（块 id + 原文逐字相同），
    证明不了就放弃并点名「重新提取」，绝不把别人的同名图安到这篇上（`#8` 同源的失败模式）。
+5. **状态跟产物走，不跟"这一次修成没修成"走** —— 放弃（以及复制途中抛异常）时，产物还在
+   就留在 `done`、原因进 `conv_error`；**只有**真的没有产物才落 `failed`
+   （`converter._set_decline_state`）。`#9` 起初一律写 `failed`，而两个修复端点都只对
+   `done` 开放 ⇒ 一次"我不猜"就把这篇锁在「重新提取」（`DELETE FROM notes/highlights`）
+   之外，而且**病因去掉也点不回来**。这一条是回归，不是新功能。
 """
 
 from __future__ import annotations
@@ -271,42 +276,80 @@ def test_rebuild_assets_reparses_when_the_source_is_gone_and_identity_holds(
         "重新解析用的临时目录没有收拾掉（会一直留在 p<id>/ 里）"
 
 
+def _fake_parse(pdf_path, stored, assets_dir=None, **_kw):
+    """「重新解析」的替身：把那张图写进 scratch，再按库里那份造出产物。"""
+    out = Path(assets_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    (out / "p1_img1.png").write_bytes(_PNG)
+    return _fresh_doc_like(stored)
+
+
 @pytest.mark.parametrize("kwargs, why", [
     ({"changed_text": True}, "块原文变了"),
     ({"extra_block": True}, "块序列变了"),
 ])
 def test_rebuild_assets_declines_when_the_reparse_does_not_match(
         client, settings, make_user, monkeypatch, kwargs, why):
-    """证明不了是同一篇就**放弃**：绝不把同名文件当成"这张图"安上去。"""
+    """证明不了是同一篇就**放弃**：绝不把同名文件当成"这张图"安上去。
+
+    而且放弃**只否定这一次操作** —— 产物还在，所以这是"我不猜"，不是"这篇坏了"：
+    状态留在 `done`、原因进 `conv_error`、两个修复端点仍然点得动（`#9` 带进来的回归
+    正是把这三样一起弄丢了：状态落 `failed` ⇒ 端点永远 409 ⇒ 病因去掉也点不回来）。
+    """
     from papershelf.server import assetsfix as af
 
     pid = _done_paper(client, make_user)
     stored = _store_doc(pid, meta={"assets_dir": "p4242/assets"}, figures=["p1_img1.png"])
 
-    def fake_parse(pdf_path, assets_dir=None, **kw):
+    def mismatch(pdf_path, assets_dir=None, **kw):
         out = Path(assets_dir)
         out.mkdir(parents=True, exist_ok=True)
         (out / "p1_img1.png").write_bytes(_PNG)
         return _fresh_doc_like(stored, **kwargs)
 
-    monkeypatch.setattr(af, "parse_pdf", fake_parse)
+    monkeypatch.setattr(af, "parse_pdf", mismatch)
 
     _annotate(pid)
     before = _annotations(pid)
     assert client.post(f"/api/papers/{pid}/rebuild-assets").status_code == 202
 
     st = _state(pid)
-    assert st["conv_state"] == "failed", f"{why}却仍然报了成功（用户会以为已经修过了）"
+    assert st["conv_state"] == "done", (
+        f"{why}时把一篇产物完好的文献降级成了 failed —— 两个修复端点都只对 done 开放，"
+        "这一步就把它永久锁在「重新提取」之外（那条路会清空笔记与划痕）"
+    )
     assert "重新提取" in (st["conv_error"] or ""), \
         f"没有点名下一步该点哪个按钮（{why}）：{st['conv_error']}"
+    assert st["pending_job"] is None, "终态没有清掉 pending_job"
     assert not (settings.papers_dir / f"p{pid}" / "assets" / "p1_img1.png").exists(), \
         f"{why}时仍然把文件搬过去了 —— 那可能是别人的同名图"
     assert client.get(_asset_url(pid, "p1_img1.png")).status_code == 404
     assert _annotations(pid) == before, "放弃修复时不该动批注"
 
+    # 放弃之后**再点得动**（202，不是 409）：这一次的拒绝对下一次不作数。
+    assert client.post(f"/api/papers/{pid}/rebuild-assets").status_code == 202, \
+        "放弃一次之后就点不动了 —— 这正是那道单向门"
+    assert client.post(f"/api/papers/{pid}/rebuild-refs").status_code == 202, \
+        "同一个状态门后面的「重建参考文献」也被一起锁上了"
+
+    # ……病因（对不上）一旦不在了，同一条便宜出口就真的把它修好，且不留旧原因。
+    monkeypatch.setattr(af, "parse_pdf",
+                        lambda pdf_path, assets_dir=None, **kw: _fake_parse(
+                            pdf_path, stored, assets_dir, **kw))
+    assert client.post(f"/api/papers/{pid}/rebuild-assets").status_code == 202
+    assert client.get(_asset_url(pid, "p1_img1.png")).status_code == 200, \
+        "病因去掉之后仍然没修好（用户被永远困在「重新提取」）"
+    st = _state(pid)
+    assert st["conv_state"] == "done"
+    assert st["conv_error"] is None, f"修好之后上一次的原因还挂着：{st['conv_error']}"
+    assert _annotations(pid) == before
+
 
 def test_rebuild_assets_declines_without_a_source_or_a_pdf(client, settings, make_user):
-    """来源目录没了、PDF 也没了 ⇒ 明确放弃（不解析、不复制），并说清下一步。"""
+    """来源目录没了、PDF 也没了 ⇒ 明确放弃（不解析、不复制），并说清下一步。
+
+    产物还在 ⇒ 这是"我不敢猜"，同样是 `done` + 原因，而不是把这篇判成转换失败。
+    """
     from papershelf.server.config import get_settings
     from papershelf.server.db import connect, tx
 
@@ -322,12 +365,63 @@ def test_rebuild_assets_declines_without_a_source_or_a_pdf(client, settings, mak
 
     assert client.post(f"/api/papers/{pid}/rebuild-assets").status_code == 202
     st = _state(pid)
-    assert st["conv_state"] == "failed"
+    assert st["conv_state"] == "done", (
+        "来源与 PDF 都没了只是「这一次补不了」，产物本身还完好 —— "
+        "写成 failed 会把这篇的便宜出口永久关掉"
+    )
     assert "重新提取" in (st["conv_error"] or ""), st["conv_error"]
     assert not (settings.papers_dir / f"p{pid}" / "assets" / "p1_img1.png").exists()
 
 
-# ── ④ 状态与权限：没有产物就先 409，别排一趟空队 ────────────────────────
+# ── ④ 「修不了」≠「这篇坏了」：状态跟产物走，不跟这一次修成没修成走 ──────────
+def test_a_paper_without_a_product_still_lands_failed(client, settings, make_user):
+    """反向也要成立：库里**真的没有产物**时仍然落 `failed`。
+
+    不是"对称好看"：`done` 的另一半含义是"点得进阅读器"。产物不在却写 `done`，
+    用户点进去是一片空白，而「修复插图」会以 `done` 为前提一直排队做同一件修不成的事
+    —— 那一头才是真的错。
+    """
+    pid = _done_paper(client, make_user)        # `conv_state='done'`，但一行产物都没有
+    assert client.post(f"/api/papers/{pid}/rebuild-assets").status_code == 202
+
+    st = _state(pid)
+    assert st["conv_state"] == "failed", "没有产物却留在了 done（点进阅读器会是空白）"
+    assert "没有产物" in (st["conv_error"] or ""), st["conv_error"]
+
+
+@pytest.mark.parametrize("with_product, expected", [
+    (True, "done"),
+    (False, "failed"),
+])
+def test_an_error_while_repairing_is_judged_by_the_product_not_by_the_error(
+        client, settings, make_user, monkeypatch, with_product, expected):
+    """复制途中抛异常（`OSError` 之类）也只说明**这一次**没搬成。
+
+    `#9` 的异常分支默认写 `failed`，于是一次"文件被别的进程占了一下"就等于把这篇的
+    便宜出口永久关掉。判据同样换成"产物在不在"：有产物 ⇒ `done` + 原因，没产物 ⇒ `failed`。
+    """
+    from papershelf.server import assetsfix as af
+
+    pid = _done_paper(client, make_user)
+    if with_product:
+        _store_doc(pid, meta={"assets_dir": "p4242/assets"}, figures=["p1_img1.png"])
+    _annotate(pid)
+    before = _annotations(pid)
+
+    def boom(*_a, **_k):
+        raise OSError("磁盘被占用 / 空间不足")
+
+    monkeypatch.setattr(af, "rebuild_paper_assets", boom)
+
+    assert client.post(f"/api/papers/{pid}/rebuild-assets").status_code == 202
+    st = _state(pid)
+    assert st["conv_state"] == expected, st
+    assert "OSError" in (st["conv_error"] or ""), \
+        f"异常的原因没有留给用户看：{st['conv_error']}"
+    assert _annotations(pid) == before
+
+
+# ── ⑤ 状态与权限：没有产物就先 409，别排一趟空队 ────────────────────────
 def test_rebuild_assets_409_before_there_is_a_product(client, settings, make_user):
     """还没转换完就别排队（重活留给队列，能立刻判定的错当场说清）。"""
     from papershelf.server.config import get_settings
@@ -359,7 +453,7 @@ def test_rebuild_assets_missing_or_foreign_paper_is_404(client, make_user):
     assert client.post("/api/papers/999999/rebuild-assets").status_code == 404
 
 
-# ── ⑤ `pending_job` 是跨请求存活的：残留值不许劫持下一次操作 ─────────────
+# ── ⑥ `pending_job` 是跨请求存活的：残留值不许劫持下一次操作 ─────────────
 def test_a_stale_refs_job_does_not_hijack_the_assets_repair(client, settings, make_user):
     """上一轮「重建参考文献」留下的 `job='refs'` 不能把这次「修复插图」变成修文献。
 
@@ -391,7 +485,7 @@ def test_a_stale_assets_job_does_not_hijack_a_full_conversion(client, make_user)
     )
 
 
-# ── ⑥ 前端必须接线（本仓库已出现过两次"后端早有、前端从没接"）─────────────
+# ── ⑦ 前端必须接线（本仓库已出现过两次"后端早有、前端从没接"）─────────────
 def test_frontend_actually_wires_the_button():
     """api 里有封装、Literature 里真的调用它、按钮带自己的标记类。
 
@@ -405,3 +499,19 @@ def test_frontend_actually_wires_the_button():
     assert "api.rebuildAssets(" in lib_tsx, "文献库从没调用 rebuildAssets（死入口）"
     assert "t-ast" in lib_tsx, "修复插图按钮缺少标记类 t-ast"
     assert "修复插图" in lib_tsx, "按钮文案没了（用户看不懂 t-ast 是什么）"
+
+
+def test_the_decline_reason_is_visible_where_the_state_stays_done():
+    """状态留在 `done` 之后，原因必须**还看得见**。
+
+    原先 `conv_error` 只在 `failed` 那一格（以及概览的关注卡）里被读；把状态改成 `done`
+    而不动界面，用户就只剩一行看不懂的裂图 —— 修好了"能重试"，却弄丢了"为什么"。
+    """
+    lib = (ROOT / "web" / "src" / "pages" / "Library.tsx").read_text(encoding="utf-8")
+    css = (ROOT / "web" / "src" / "styles.css").read_text(encoding="utf-8")
+
+    assert "p.conv_error" in lib, "文献库没有渲染 conv_error（放弃的原因无处可见）"
+    assert "t-warn" in lib, "警示行缺少标记类 t-warn"
+    # 锚点带上左花括号：`.ptable .t-warn-gone` 也包含 `.ptable .t-warn`，
+    # 只比子串的话"把规则改名"这种真回归会被判绿（变异检验抓过一次）。
+    assert ".ptable .t-warn {" in css, "t-warn 没有样式 —— 写了类名却没样式等于看不见"
