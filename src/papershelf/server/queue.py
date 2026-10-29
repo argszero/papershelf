@@ -94,6 +94,79 @@ def _fingerprint_for(paper: dict[str, Any]):
     return _pdf_fingerprint(path) if path and path.exists() else None
 
 
+def record_preclaim_failure(settings: Settings, paper_id: int,
+                            exc: BaseException) -> bool:
+    """认领**之前**就失败的投递也要记账，否则这篇文献永远回到队首。返回是否记了账。
+
+    ## 它补的是哪一段（2026-10-30 实测）
+
+    `run_once` **刻意不认领**（`doing` 只能出现在拿到并发槽位之后，见模块 docstring
+    与 `convert_paper` 的顺序铁律），而 `conv_attempts + 1` **只**发生在 `claim_paper`
+    里 —— 于是「认领之前」抛出的异常既不计数、也不写 `conv_error`、也不落终态：
+
+    - `_fingerprint_for` 在 `_deliver` 里**先于 `run`** 执行，它要读 PDF 才出指纹，
+      「存在但读不出」（`pdf_path` 指向目录 / 权限被改 / 卷掉了 / 磁盘 EIO）就在这里抛；
+    - 那一刻 `claim_paper` 还没跑 ⇒ 只 `log.exception` 的话，这一行原样停在
+      `queued`、`conv_attempts` 恒 0、`conv_error` 恒 NULL ⇒ **下一轮再投一次，永远**。
+      实测 5 轮交付 5 次、`convert_paper` 一次没进；真轮询线程 2 秒投了 78 次
+      （生产 `POLL_SECONDS=3.0` ⇒ 20 次/分、1200 次/小时）；
+    - `max_conv_attempts` 这道成本护栏因此**结构上够不着**，界面也拿不到任何按钮
+      （`queued` 是光秃秃的状态药丸，`conv_error` 又是 NULL ⇒ 连原因都没得看）。
+      症状与 2026-09-12 那次事故同族（「9 篇永久 queued、UI 不给按钮」），成因不同。
+
+    ## 为什么「仍是 `queued`」就是「认领没跑到」的证明
+
+    认领之后的每个出口都写状态：`doing`（`claim_paper` 自己）、`done`/`failed`
+    （`_set_state`，`convert_paper` 的 `except` 与终态分支都走它）。所以异常落回来时
+    这一行**仍是 `queued`** ⇔ `claim_paper` 从未成功。这条等价关系就是下面那条
+    `WHERE conv_state = 'queued'`，而把它**写成一条语句**是要害：判据与计数同时成立
+    或同时不成立，两条投递路径不可能各记一次。
+
+    `rowcount == 0` ⇒ 这一行已归别人（认领后失败自己记过账）⇒ **一个字段都不碰**。
+    少了这个判据，认领之后的异常会被重复计一次，重试预算凭空少一半。
+
+    ## 到顶就用**真实原因**落终态
+
+    不落终态的话，`convert_paper` 下一次仍会被交付、由它的 `>= max` 分支写成
+    「超过最大重试次数」—— 那句话对排障等于什么也没说（运维要知道的是**为什么**）。
+    所以这里自己把 `Type: message` 写进 `failed`，界面同时得到按钮和可读的原因。
+
+    ⚠️ 记账用的是**本次新开的连接**：`_deliver` 跑在队列线程上，`run_once` 的连接
+    在交付之前就已经 `close()` 了。
+
+    ⚠️ 崩溃窗口：计数提交与终态写入是两条事务（`db.tx` 不可重入，`_set_state` 自带
+    事务），极端情况下进程在两者之间死掉 ⇒ 行停在 `queued` + 计数已到顶 + 原因在，
+    下一轮由 `convert_paper` 的 `>= max` 分支兜成 `failed`（仍是终态，只是原因换成
+    通用那句）。**不会**退回无限重投。
+    """
+    from .converter import _set_state
+    from .db import connect, tx, utcnow
+
+    # 与 `converter` 落 `conv_error` 的写法**逐字同源**：`Type: message`。
+    # 两种写法会让人以为是两种故障，而界面（⑪）与排障读的都是这一列的原文。
+    reason = f"{type(exc).__name__}: {exc}"
+    conn = connect(settings)
+    try:
+        with tx(conn):
+            cur = conn.execute(
+                """UPDATE papers SET conv_attempts = conv_attempts + 1,
+                          conv_error = ?, updated_at = ?
+                   WHERE id = ? AND conv_state = 'queued'""",
+                (reason, utcnow(), paper_id),
+            )
+            bumped = cur.rowcount == 1
+            row = (conn.execute("SELECT conv_attempts FROM papers WHERE id=?",
+                                (paper_id,)).fetchone() if bumped else None)
+        if not bumped:
+            return False
+        attempts = int(row["conv_attempts"]) if row is not None else 0
+        if attempts >= settings.max_conv_attempts:
+            _set_state(conn, paper_id, "failed", reason)
+        return True
+    finally:
+        conn.close()
+
+
 def run_once(settings: Settings, *, limit: int | None = None,
              runner: Any = None, pool: "_Pool | None" = None) -> int:
     """扫一轮：把 `queued` 交给转换器。返回本次**交付**的篇数。
@@ -124,10 +197,21 @@ def run_once(settings: Settings, *, limit: int | None = None,
     def _deliver(paper: dict[str, Any]) -> None:
         # 兜底只为「绝不因一篇炸掉整个轮询线程」；正常失败由 convert_paper 自己
         # 落到 `conv_state=failed`（§5.7）。
+        #
+        # ⚠️ 但这条 `try` 里**先于 `run`** 还有 `_fingerprint_for`，它要读 PDF 才出
+        #    指纹 —— 「存在但读不出」的 PDF 就在这里抛，那一刻 `claim_paper` 还没跑。
+        #    只 `log.exception` 的话，这一行会原样留在 `queued` 并被**无限重投**
+        #    （实测 2 秒 78 次、计数恒 0、无原因可看）。所以兜底出口也要记账，
+        #    记完到顶就落 `failed`：原因见 `record_preclaim_failure`。
         try:
             run(int(paper["id"]), _fingerprint_for(paper))
-        except Exception:                 # noqa: BLE001
+        except Exception as exc:          # noqa: BLE001
             log.exception("队列执行失败 paper=%s", paper["id"])
+            try:
+                record_preclaim_failure(settings, int(paper["id"]), exc)
+            except Exception:             # noqa: BLE001
+                # 记账自己失败**绝不能**带走轮询线程 —— 那是这条兜底原本唯一的职责。
+                log.exception("认领前失败记账失败 paper=%s", paper["id"])
 
     if pool is None:
         for paper in todo:
