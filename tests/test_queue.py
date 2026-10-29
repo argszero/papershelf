@@ -217,7 +217,9 @@ def test_waiting_for_slot_stays_queued_not_doing(settings, monkeypatch):
     started = threading.Event()
     release = threading.Event()
 
-    def fake_run(conn, paper, s, fingerprint):
+    def fake_run(conn, paper, s, fingerprint, spend=None):
+        # `spend` 是 `convert_paper` 传进来的**已花 token 累加器**（失败路径要记账，
+        # 见 `converter._Spend`）；本用例只关心槽位-认领顺序，值不参与判定。
         started.set()
         release.wait(5)
         raise RuntimeError("到此为止（不落真实产物）")

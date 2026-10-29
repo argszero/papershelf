@@ -198,6 +198,31 @@ def enqueue(conn: sqlite3.Connection, paper_id: int, job: str | None = None,
         conn.execute(f"UPDATE papers SET {cols} WHERE id=?", args)
 
 
+class _Spend:
+    """一次转换**已经花掉**的 token —— 累加器必须活过抛出点。
+
+    ## 为什么不是一个局部 `int`
+
+    原先 `tokens` 只是 `_run` 的局部变量，而 `tokens_used` 唯一的写入点是成功路径的
+    `_writeback_meta`。于是一篇**花了钱但没跑完**的文献在库里记 0：
+
+    - `enforce_report` 的结构性破损（阶段④）抛在 `_run` 里 ⇒ ②/②b/③ 的消耗随栈帧一起消失；
+    - `save_doc` 抛（重复块 id 撞 `UNIQUE` 约束）⇒ 同上；
+    - 更糟的是后者原先连 `failed` 都落不下（见 `convert_paper` 的 `except` 范围）。
+
+    局部 `int` 无法在异常路径上取值，所以把累加器挪到**调用方**的作用域：`convert_paper`
+    持有它，`_run` 往里累加。抛出时 `spend.tokens` 就是真数，失败分支照原样记进库。
+
+    实测（2026-10-29，`011b1e0`）：一篇 ②b `1500` + ③ `2400` 的文献在阶段④结构失败后，
+    库里 `tokens_used` 是 **0**，用户看到的是「转换失败」，用量面板与成本护栏读到的也是 0。
+    """
+
+    __slots__ = ("tokens",)
+
+    def __init__(self) -> None:
+        self.tokens = 0
+
+
 def convert_paper(paper_id: int, fingerprint: str | None = None) -> None:
     """完整流程：解析 → 公式 LaTeX 化 → 翻译 → 校验 → 落库。
 
@@ -253,15 +278,29 @@ def convert_paper(paper_id: int, fingerprint: str | None = None) -> None:
                 log.info("paper=%s 开始转换（第 %s 次尝试，来源=%s，PDF=%s）", paper_id,
                          int(fresh["conv_attempts"]) + 1, fresh["source"],
                          Path(str(fresh["pdf_path"] or "")).name or "—")
+                # `spend` 在**认领之后、try 之前**建立：`_run` 往里累加，抛出的异常
+                # 就不再带走"已经花掉的钱"（见 `_Spend`）。
+                spend = _Spend()
                 try:
-                    doc, tokens = _run(conn, dict(fresh), settings, fingerprint)
+                    doc, tokens = _run(conn, dict(fresh), settings, fingerprint, spend)
+                    save_doc(conn, paper_id, doc)
+                    _writeback_meta(conn, paper_id, dict(fresh), doc.meta, tokens)
                 except Exception as exc:                   # noqa: BLE001
-                    log.exception("paper=%s 转换失败（%.1fs）", paper_id, time.monotonic() - t0)
-                    _set_state(conn, paper_id, "failed", f"{type(exc).__name__}: {exc}")
+                    log.exception("paper=%s 转换失败（%.1fs，已花 %d tokens）",
+                                  paper_id, time.monotonic() - t0, spend.tokens)
+                    # ⚠️ `save_doc` / `_writeback_meta` **必须**在这个 try 里：它们原先在
+                    # 外面，一个异常就绕过整个 `except`，逃到 `queue.run_once` 的
+                    # `_deliver`（只 `log.exception`）⇒ 这一行永久停在 `doing`、
+                    # `conv_error` 还是 NULL，界面上永远是「转换中」，只有重启的
+                    # `recover_stuck` 才把它捞回来。这与本函数文档的承诺
+                    # 「任何异常都必须落到 `conv_state=failed`」直接矛盾。
+                    #
+                    # `tokens=spend.tokens` 是另一半：这次没跑完，但钱是真花了
+                    # （②/②b/③/①c 都可能已经付过费），失败不该把它从账上抹掉。
+                    _set_state(conn, paper_id, "failed", f"{type(exc).__name__}: {exc}",
+                               tokens=spend.tokens)
                     return
 
-                save_doc(conn, paper_id, doc)
-                _writeback_meta(conn, paper_id, dict(fresh), doc.meta, tokens)
                 log.info("paper=%s 转换完成：%d 块 / %d tokens / 用时 %.1fs（状态已置 done）",
                          paper_id, len(doc.blocks), tokens, time.monotonic() - t0)
     finally:
@@ -443,8 +482,15 @@ def _pending_proofread_pages(doc: Doc, ok_pages) -> list[int]:
     return sorted(have - {int(p) for p in (ok_pages or ())})
 
 
-def _run(conn: sqlite3.Connection, paper: dict, settings, fingerprint: str | None) -> tuple[Doc, int]:
-    """真正跑管线，返回 (Doc, tokens)。"""
+def _run(conn: sqlite3.Connection, paper: dict, settings, fingerprint: str | None,
+         spend: "_Spend | None" = None) -> tuple[Doc, int]:
+    """真正跑管线，返回 (Doc, tokens)。
+
+    `spend` 由调用方持有（见 `_Spend`）：本函数**往它里面累加**，而不是攒一个局部 `int`
+    —— 这样阶段④的 `enforce_report`、`save_doc` 或任何一处抛出时，调用方手里仍有真数，
+    能把已经花掉的 token 记进库。不传则自建一个（`_run` 单独调用时行为不变）。
+    """
+    spend = _Spend() if spend is None else spend
     # ── ⓪ 未配 LLM 就别开始 ──────────────────────────────────────────────
     # 踩过：不前置检查时，整篇会一路跑到最后的校验，因为"一个块都没译"而报
     # 「标记保真校验未通过 · 疑似漏译」→ 用户去查翻译质量问题，而真正的原因是
@@ -495,8 +541,6 @@ def _run(conn: sqlite3.Connection, paper: dict, settings, fingerprint: str | Non
                      doc.meta.get("pages"), len(doc.blocks), len(doc.assets),
                      time.monotonic() - t_parse)
 
-    tokens = 0
-
     # ── ①c 原文抽取校对（VLM agent，宿主 2026-09-14）—— 必须在公式 LaTeX 化与翻译之前 ──
     # 只有 PDF 路线有「渲染页图」可比对；arXiv 路线走官方 HTML（原生结构化，没有抽取误差）。
     # 命中解析缓存时**只补做没校过的页**：缓存里存的可能是校对前的旧产物（存量文献），
@@ -536,9 +580,11 @@ def _run(conn: sqlite3.Connection, paper: dict, settings, fingerprint: str | Non
                          retries=settings.proofread_retries,
                          thinking=settings.proofread_thinking,
                          image_cache=settings.proofread_image_cache)
+        # ①c 之前已经花掉的量 —— 用它算出「这次 try 里到底记了多少」，避免重复记账
+        spent_before = spend.tokens
         try:
             stats = pf.proofread_doc(doc, proofread_pdf, skip_pages=done_pages)
-            tokens += stats.tokens
+            spend.tokens += stats.tokens
             # 续跑时把上一次的计数**累加**进来（否则界面上"文字修订 3 块"会突然变小，
             # 看起来像校对白做了）；`failed` 只记本次 —— 它决定下次是否还重试。
             def _cum(key: str, now: int) -> int:
@@ -568,7 +614,14 @@ def _run(conn: sqlite3.Connection, paper: dict, settings, fingerprint: str | Non
             for note in stats.notes:
                 log.info("①c 校对记录：%s", note)
         except Exception as exc:                         # noqa: BLE001 — 校对失败不该毁掉整篇转换
-            log.warning("①c 原文校对整体失败（已跳过，不影响其余步骤）：%s", exc)
+            # 同族第三处漏账：`Proofreader` 实例自己累计 `stats.tokens`（每成功一次
+            # `_chat` 就加），而汇总那行 `spend.tokens += stats.tokens` 在**抛出点之后**
+            # ⇒ 校对跑到一半炸了（504/欠费/工具调用失控）时，那段钱一分也进不了账。
+            # 只补差额：`try` 里已经记过的部分不重复加（上面那行跑通过就说明记完了）。
+            spend.tokens += max(0, int(getattr(pf.stats, "tokens", 0) or 0)
+                                - (spend.tokens - spent_before))
+            log.warning("①c 原文校对整体失败（已跳过，不影响其余步骤，已花 %d tokens）：%s",
+                        int(getattr(pf.stats, "tokens", 0) or 0), exc)
     else:
         log.info("①c 原文校对：未启用或无 PDF 原件，跳过")
 
@@ -582,7 +635,7 @@ def _run(conn: sqlite3.Connection, paper: dict, settings, fingerprint: str | Non
         t_lz = time.monotonic()
         lz = Latexizer(cfg)
         stats = lz.latexize(doc.blocks, log=lambda *a: log.info(*a))
-        tokens += lz.tokens_used
+        spend.tokens += lz.tokens_used
         log.info("② 公式 LaTeX 化完成：%d 块 / %d 切片 / 正式改写 %d / 重试 %d / 失败回落 %d / 用时 %.1fs",
                  stats.get("blocks", 0), stats.get("chunks", 0), stats.get("done", 0),
                  stats.get("retried", 0), stats.get("failed", 0), time.monotonic() - t_lz)
@@ -606,7 +659,7 @@ def _run(conn: sqlite3.Connection, paper: dict, settings, fingerprint: str | Non
     mx = MetadataExtractor(cfg)
     doc.meta.update(mx.extract(doc.blocks, candidates=doc.meta.get("title_candidates"),
                                log=lambda *a: log.info(*a)))
-    tokens += mx.tokens_used
+    spend.tokens += mx.tokens_used
     log.info("②b 元数据抽取完成：title=%r / 用时 %.1fs",
              doc.meta.get("title_en") or doc.meta.get("title_zh"), time.monotonic() - t_mx)
 
@@ -617,7 +670,7 @@ def _run(conn: sqlite3.Connection, paper: dict, settings, fingerprint: str | Non
     t_tr = time.monotonic()
     tr = Translator(cfg, glossary)
     texts = tr.translate_blocks(doc.blocks, log=lambda *a: log.info(*a))
-    tokens += tr.tokens_used
+    spend.tokens += tr.tokens_used
     log.info("③ 翻译完成：%d 块需译 / 待校对 %d 块 / 用时 %.1fs",
              len(tr.ordered(doc.blocks)), len(getattr(tr, "needs_review", []) or []),
              time.monotonic() - t_tr)
@@ -635,7 +688,7 @@ def _run(conn: sqlite3.Connection, paper: dict, settings, fingerprint: str | Non
     enforce_report(report, doc)
     log.info("④ 标记保真校验：通过（漏译 %d 块已标待校对）/ 用时 %.1fs",
              len(report.untranslated), time.monotonic() - t_v)
-    return doc, tokens
+    return doc, spend.tokens
 
 
 def _materialise_cached_assets(doc: Doc, settings, paper_id: int, assets_dir: Path) -> bool:
