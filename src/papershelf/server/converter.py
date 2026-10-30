@@ -103,6 +103,14 @@ def claim_paper(conn: sqlite3.Connection, paper_id: int) -> bool:
     - 每篇日志都写「第 1 次尝试」，**在撒谎** —— 排障时会得出"它只试过一次"的错误结论。
 
     计数语义 = **"这篇开始跑第几次了"**，所以它应该落在"开始"那一步，也就是认领。
+
+    ⚠️ **2026-10-30 补充：本函数不是唯一的 `conv_attempts` 写入方了。**
+    认领**之前**就抛异常的投递（`queue._deliver` 里 `_fingerprint_for` 要读 PDF，
+    「存在但读不出」即抛）从来没开始过第 N 次尝试，按上面的语义就不该计数 ——
+    可不计数的后果是 `max_conv_attempts` 这道护栏**结构上够不着**：那一行永远停在
+    `queued`，无限重投。所以 `queue.record_preclaim_failure` 现在也会 `+1`
+    （带 `WHERE conv_state='queued'`，只碰"认领从未发生"的行，不会与这里重复计）。
+    ⇒ 这一列的含义读作"**这篇已经被交付了几次**"：认领算一次，认领前就死掉也算一次。
     检查仍在 `convert_paper` 开头（先看 `>= max` 再认领），因此第 `max+1` 次会被挡下。
     人工主动入口（`/convert` 重试、`/reextract`）会把计数**归零** —— 护栏防的是
     "自动重试烧钱"，不是防用户（`docs/design.md` 的原文即「超限置 failed 待人工重试」，
