@@ -9,10 +9,12 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
 import shutil
 import sqlite3
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 from fastapi import (APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, Request,
                      UploadFile, status)
@@ -69,6 +71,46 @@ def _pdf_fingerprint(path: Path) -> str:
     return h.hexdigest()
 
 
+_UPLOAD_NAME_ATTEMPTS = 8
+
+
+def _open_exclusive_target(directory: Path, name: str) -> tuple[Path, Any]:
+    """独占创建一个落盘文件，返回 `(路径, 已打开的写句柄)`；同名同秒也不再共用一条路径。
+
+    ## 它补的是哪一段（2026-10-31 实测）
+
+    原先路径是 `directory / f"{utcnow().replace(':', '')}_{name}"`，而 `utcnow()` 是
+    `isoformat(timespec="seconds")` —— **只到秒**。于是「同一 UTC 秒 + 同一个 basename」
+    的两篇拿到**同一条路径**，后一份 `open("wb")` 先把前一份截断成 0 字节、再写自己：
+    实测同一秒内 **6 次串行**上传 `same.pdf` → **6 行 papers / 1 个文件**，文件里只剩
+    最后一份的字节，前 5 行的 `pdf_path` 全指向它，而 6 个请求**全部 201**、日志全绿。
+    转换 / 导出 / 「重新提取」读的都是 `pdf_path` ⇒ 那几篇会**静默变成另一篇的副本**。
+
+    这**不是竞态**：同一秒的多次**串行**上传照样撞，`<input type="file" multiple>` 里
+    选两个同名 PDF（同一个请求的 `files` 里两个元素）更是**确定性**撞 —— 那条路连并发
+    都不需要。所以修法不是加锁，而是让「落盘名唯一」在**文件系统层**成立：`O_CREAT|O_EXCL`
+    的创建要么成功，要么说明这个名字已被占，换个名字重试。
+
+    ⚠️ 第一条仍用原来的名字（`<秒级时间戳>_<basename>`），只在**撞上**时才追加短随机
+    后缀 —— 常见情形下盘上文件名与修复前一致，按时间戳找文件的习惯不受影响。
+
+    ⚠️ 路径与句柄一起返回，也是给调用方的一道结构保证：调用方拿到的路径**从创建那一刻
+    起就属于自己**，所以「写失败就把半截文件删掉」只可能删掉自己这份（同秒另一个请求
+    即使 413，也不会顺手删掉前一份已经写好的文件）。
+    """
+    stamp = utcnow().replace(":", "")
+    for attempt in range(_UPLOAD_NAME_ATTEMPTS):
+        suffix = "" if attempt == 0 else f"-{uuid4().hex[:8]}"
+        candidate = directory / f"{stamp}{suffix}_{name}"
+        try:
+            fd = os.open(candidate, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o666)
+        except FileExistsError:
+            continue
+        return candidate, os.fdopen(fd, "wb")
+    raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR,
+                        f"无法为 {name} 分配落盘文件名（重试 {_UPLOAD_NAME_ATTEMPTS} 次仍被占用）")
+
+
 @router.post("/plans/{plan_id}/papers/upload", status_code=201)
 async def upload(
     plan_id: int,
@@ -87,16 +129,20 @@ async def upload(
     created: list[dict[str, Any]] = []
     for uf in files:
         name = Path(uf.filename or "upload.pdf").name
-        target = settings.papers_dir / f"{utcnow().replace(':', '')}_{name}"
         # **流式落盘**（2026-10-26 生产事故）：原先 `data = await uf.read()` 把整份 PDF
         # 读进内存再 `write_bytes`，于是上传 200 MB 论文 = 200 MB 的常驻内存尖峰，
         # 而 glibc 峰值过后还不归还内核 ⇒ 连传几篇就把整台机器打挂。
         # 现在按 1 MB 一块搬运：峰值只与块大小有关，与文件大小无关。
         # 顺带：`%PDF` 魔数在**第一块**上判、越过上限立刻 413，两种失败都把写了一半的
         # 文件删掉（否则 `papers_dir` 里留下一堆没人认领的孤儿）。
+        # **落盘名独占创建**（2026-10-31）：文件名原先只由「秒级时间戳 + basename」决定，
+        # 同一秒的同名上传会共用一条路径、后一份把前一份的字节覆盖掉。现在路径在
+        # `_open_exclusive_target` 里独占拿到（撞名就换后缀），下面的 `unlink` 因此
+        # **只可能删掉本请求自己创建的那个文件** —— 同秒另一个请求 413 也删不到别人的。
         written = 0
+        target, handle = _open_exclusive_target(settings.papers_dir, name)
         try:
-            with target.open("wb") as fh:
+            with handle:
                 while True:
                     chunk = await uf.read(1 << 20)
                     if not chunk:
@@ -109,7 +155,7 @@ async def upload(
                             status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
                             f"{name} 超过上传上限 {settings.max_upload_mb} MB"
                             f"（配置项 PAPERSHELF_MAX_UPLOAD_MB）")
-                    fh.write(chunk)
+                    handle.write(chunk)
             if written == 0:
                 raise HTTPException(status.HTTP_400_BAD_REQUEST, f"{name} 是空文件")
         except BaseException:
