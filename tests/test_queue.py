@@ -313,3 +313,103 @@ def test_queue_delivers_concurrently_up_to_the_limit(settings):
     q.stop(timeout=3.0)
     assert peak == 2, f"交付并发应为 2（实测峰值 {peak}）—— 串行交付会让并发配置失效"
     assert peak <= 2, "不得超过 max_concurrency"
+
+
+def test_stop_returns_even_when_the_pool_queue_is_backlogged(settings):
+    """有积压时 `stop()` **必须返回** —— 关服务不能挂住（2026-11-02 实测的死锁）。
+
+    关服务那条链是 `app._lifespan` → `ConversionQueue.stop()` → `_Pool.shutdown()`。
+    `_q` 是**有界**的（maxsize = 线程数），而 `shutdown()` 原先在 `_stop.set()` 之后
+    逐个 `_q.put(None)`：`_stop` 一置工作线程就从 `while` 里退了，再没人 `get` ——
+    队列此刻若正满，`put(None)` 就**永久阻塞**。
+
+    实测（4 篇排队 + 1 个槽位）：`stop()` 5 秒未返回，faulthandler 的栈停在
+    `_Pool.shutdown` → `queue.put`。生产上的收场只剩 `docker stop` 的 SIGKILL。
+
+    ⚠️ 判定用**有界等待 + 事件**，不断言墙钟时间（与 `test_worker_thread_drains_then_stops`
+    的「不能拖满一个轮询周期」同口径）。`stop(timeout=1.0)` 的这 1 秒是**既有的**语义
+    （关服务最多等在跑的转换这么久），要钉住的是它**之后**不再永久挂住。
+    """
+    import threading
+    import time
+
+    from papershelf.server.queue import ConversionQueue
+
+    for i in range(4):
+        _mk_paper(settings, conv_state="queued", title=f"b{i}")
+
+    entered = threading.Event()
+    release = threading.Event()
+
+    def runner(pid: int, fp):
+        entered.set()
+        release.wait(10)          # 装作一篇长转换，把唯一的槽位占住
+
+    q = ConversionQueue(settings, interval=0.05, runner=runner, concurrency=1)
+    q.start()
+    try:
+        assert entered.wait(5), "工作线程应当已经开始第一篇"
+        time.sleep(0.3)           # 让轮询线程把有界队列塞满、并在 put 上等住
+        done = threading.Event()
+
+        def _stop():
+            q.stop(timeout=1.0)
+            done.set()
+
+        threading.Thread(target=_stop, daemon=True).start()
+        assert done.wait(5.0), "stop() 在满队列上必须返回（不能挂住关服务）"
+    finally:
+        release.set()
+
+
+def test_pool_shutdown_settles_tasks_it_never_started(settings):
+    """关闭时**没被取走的任务必须结算**，关闭后再 `submit` 也不得阻塞。
+
+    另一半死锁：`run_once` 里 `for f in futures: f.result()` **没有超时**。池关闭时若把
+    队列里的任务直接丢掉，那些句柄永远不设结果 ⇒ 轮询线程吊死在关闭途中（实测栈上看到的
+    正是这一半）。所以 `shutdown()` 先排空队列、逐个写异常，再补哨兵。
+
+    `submit` 那一半同样要紧：池已无人 `get`，再阻塞着等位置就是永远 —— 关掉之后必须
+    当场回一个失败的句柄，让轮询线程跑完本轮、看到 `_stop` 退出。
+    """
+    import threading
+
+    from papershelf.server.queue import _Pool, _PoolClosed
+
+    pool = _Pool(1)
+    started = threading.Event()
+    release = threading.Event()
+
+    def job():
+        started.set()
+        release.wait(10)
+
+    pool.submit(job)
+    assert started.wait(5), "唯一的槽位应当已被第一篇占住"
+    pending = pool.submit(job)              # 排在有界队列里，没人取
+
+    done = threading.Event()
+
+    def _shut():
+        pool.shutdown()
+        done.set()
+
+    threading.Thread(target=_shut, daemon=True).start()
+    settled = done.wait(5.0)
+    release.set()
+    assert settled, "shutdown() 在满队列上必须返回"
+    with pytest.raises(_PoolClosed):
+        pending.result(1.0)
+    # 关闭后的投递：**立刻回来**，不是"等一个再没人取的位置"。所以投递本身也要有界
+    # 等待 —— 只断言 result() 会抛的话，"卡在 put 上"这种失败会表现成整个套件挂住。
+    late: list[object] = []
+    late_done = threading.Event()
+
+    def _late():
+        late.append(pool.submit(job))
+        late_done.set()
+
+    threading.Thread(target=_late, daemon=True).start()
+    assert late_done.wait(5.0), "关闭之后 submit() 必须立刻返回，不能阻塞在没人取的位置上"
+    with pytest.raises(_PoolClosed):
+        late[0].result(1.0)

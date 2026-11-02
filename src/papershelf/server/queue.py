@@ -35,6 +35,7 @@
 from __future__ import annotations
 
 import logging
+import queue as _queue
 import sqlite3
 import threading
 from typing import Any
@@ -236,6 +237,15 @@ def run_once(settings: Settings, *, limit: int | None = None,
     return done
 
 
+class _PoolClosed(RuntimeError):
+    """池已关闭（或正在关闭）时投递 / 未执行的任务得到的异常。
+
+    为什么用异常而不是静默丢弃：`run_once` 里 `future.result()` 会把它抛出来，被那条
+    **只记日志**的 `except` 接住（`队列并发任务异常`），轮询线程照常跑完本轮、再看
+    `_stop` 退出 —— 既不静默少跑一篇，也不会把线程吊死在 `result()` 上。
+    """
+
+
 class _Pool:
     """`max_concurrency` 个常驻工作线程的极简池（**不用 `run_once` 里临时建线程**）。
 
@@ -264,7 +274,15 @@ class _Pool:
 
         ⚠️ `self._q.put` 是**有界阻塞**的（maxsize = 线程数），池满时本调用会阻塞 ——
         这正是 `run_once` 要的背压；否则它会把整队列一次性丢进来。
+
+        ⚠️ 但**池一关闭就再没人 `get`**（2026-11-02 实测）：那时再阻塞着等位置就是永远。
+        所以关闭之后当场回一个**失败的**句柄 —— 不是把任务丢掉：它的异常会在
+        `run_once` 的 `f.result()` 里留下日志，轮询线程跑完本轮后看到 `_stop` 退出。
         """
+        if self._stop.is_set():
+            fut = _Future()
+            fut.set_exception(_PoolClosed("转换队列已关闭，任务未执行"))
+            return fut
         fut = _Future()
         self._q.put((fut, fn, args))
         return fut
@@ -284,11 +302,35 @@ class _Pool:
                 fut.set_exception(exc)
 
     def shutdown(self) -> None:
+        """停池：**不阻塞，也不留下永远不结算的任务**（2026-11-02 实测的死锁）。
+
+        原先只有两行 —— `self._stop.set()` 然后逐个 `self._q.put(None)`。可 `_q` 是
+        **有界**的（maxsize = 线程数），而 `_stop` 一置，工作线程就从 `while` 里退了，
+        再没人 `get`：队列此刻若正满，`put(None)` 就**永久阻塞**。
+        实测（4 篇排队 + 1 个槽位）：`stop()` 5 秒未返回，faulthandler 的栈停在
+        `_Pool.shutdown` → `queue.put`。生产上这条链是 `app._lifespan` → `q.stop()`，
+        即**有积压时容器关闭会挂住**，只剩 `docker stop` 的 SIGKILL 收场。
+
+        两件事按顺序补上：
+
+        1. 把还没被取走的任务**就地了结** —— `run_once` 里 `f.result()` **没有超时**，
+           不结算的话关闭时轮询线程会在那上面永久挂住（栈上看到的另一半）；
+        2. 哨兵改用 `put_nowait`：**绝不阻塞**。工作线程本来就靠 `_stop` +
+           `get(timeout=0.2)` 自己退出，哨兵只是让它早点醒，排不进去也不影响正确性。
+        """
         self._stop.set()
+        while True:
+            try:
+                item = self._q.get_nowait()
+            except _queue.Empty:
+                break
+            fut = item[0] if item else None
+            if fut is not None:
+                fut.set_exception(_PoolClosed("转换队列已关闭，任务未执行"))
         for _ in self._threads:
             try:
-                self._q.put(None)
-            except Exception:             # noqa: BLE001
+                self._q.put_nowait(None)
+            except _queue.Full:
                 pass
 
 
