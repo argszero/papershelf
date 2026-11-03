@@ -413,3 +413,64 @@ def test_pool_shutdown_settles_tasks_it_never_started(settings):
     assert late_done.wait(5.0), "关闭之后 submit() 必须立刻返回，不能阻塞在没人取的位置上"
     with pytest.raises(_PoolClosed):
         late[0].result(1.0)
+
+
+def test_poll_thread_terminates_when_stop_lands_mid_submit(settings):
+    """关停落在投递中途时，`papershelf-queue` 轮询线程**必须真的退出**。
+
+    2026-11-02 实测的漏线程（上面两条测试盖不到的那一半）：`_Pool.submit` 的
+    `if self._stop.is_set()` 守卫在**等待之前**求值，而 `_q.put` 没有超时。
+    于是有两种收场，都表现为"`stop()` 返回了，线程还在"：
+
+    - 投递方恰好在 `_stop` 置位**之前**进入、且队列**正满** ⇒ 它挡在 `put` 上；
+      `shutdown()` 排空队列把它放行，那件任务落进**已经排空完**的队列里再没人取,
+      它的句柄永不结算 ⇒ `run_once` 的 `f.result()`（无超时）永久挂住；
+    - 同一个窗口的另一种穿过：任务入队与"置位+排空"之间没有任何互斥。
+
+    实测 `stop()` 返回 10 秒后线程仍存活，栈停在 `_loop` → `run_once` → `submit` → `put`
+    （`run_once:230` / `submit:287` / `put:162`）。两个线程都是 `daemon=True`，所以进程
+    退得掉 —— 但这**是**一次关停里的线程泄漏，每关一次漏一个。
+
+    ⚠️ 断言落在**线程终止**上，不是 `stop()` 的返回时间：`stop(timeout=…)` 等正在跑的
+    转换是有意语义（`test_stop_returns_even_when_the_pool_queue_is_backlogged` 钉的那条），
+    本轮换的那一半在它之后。所以先放行在跑的那篇（合法等待），再只问线程还在不在。
+    """
+    import threading
+    import time
+
+    from papershelf.server.queue import ConversionQueue
+
+    for i in range(5):
+        _mk_paper(settings, conv_state="queued", title=f"leak{i}")
+
+    entered = threading.Event()
+    release = threading.Event()
+
+    def runner(pid: int, fp):
+        entered.set()
+        release.wait(20)
+
+    q = ConversionQueue(settings, interval=0.05, runner=runner, concurrency=1)
+    q.start()
+    poll = q._thread                    # `stop()` 会把 `q._thread` 置 None，先留住引用
+    try:
+        assert entered.wait(5), "唯一的槽位应当已经开始第一篇"
+        time.sleep(0.5)                 # 让有界队列（maxsize=1）灌满，投递停在第 3 篇上
+        stopped = threading.Event()
+
+        def _stop():
+            q.stop(timeout=1.0)
+            stopped.set()
+
+        threading.Thread(target=_stop, daemon=True).start()
+        assert stopped.wait(10), "stop() 本身也必须返回（另一半缺陷）"
+        release.set()                   # 在跑的那篇结束 —— 关服务等它是有意的，不是缺陷
+        for _ in range(500):            # 最多 5 秒
+            if not poll.is_alive():
+                break
+            time.sleep(0.01)
+        assert not poll.is_alive(), (
+            "stop() 返回后 papershelf-queue 仍存活 —— 投递方卡在没人取的位置或它的句柄"
+            "永不结算，每关一次服务就漏一个线程")
+    finally:
+        release.set()

@@ -264,28 +264,56 @@ class _Pool:
         self._q: Any = _q.Queue(maxsize=max(1, size))
         self._threads: list[threading.Thread] = []
         self._stop = threading.Event()
+        # 投递与关闭互斥的那把锁（见 `submit` / `shutdown` 的注释）。
+        # ⚠️ 它**只**圈住"入队"这一瞬间：持锁期间绝不阻塞等待，否则关闭会被投递挡住。
+        self._lock = threading.Lock()
         for i in range(max(1, size)):
             t = threading.Thread(target=self._worker, name=f"papershelf-conv-{i}", daemon=True)
             t.start()
             self._threads.append(t)
 
+    def _closed_future(self) -> Any:
+        fut = _Future()
+        fut.set_exception(_PoolClosed("转换队列已关闭，任务未执行"))
+        return fut
+
     def submit(self, fn: Any, *args: Any) -> Any:
         """投递一个任务，返回可 `result()` 的句柄。
 
-        ⚠️ `self._q.put` 是**有界阻塞**的（maxsize = 线程数），池满时本调用会阻塞 ——
+        ⚠️ `self._q` 是**有界**的（maxsize = 线程数），池满时本调用会**等**一个位置 ——
         这正是 `run_once` 要的背压；否则它会把整队列一次性丢进来。
 
-        ⚠️ 但**池一关闭就再没人 `get`**（2026-11-02 实测）：那时再阻塞着等位置就是永远。
-        所以关闭之后当场回一个**失败的**句柄 —— 不是把任务丢掉：它的异常会在
-        `run_once` 的 `f.result()` 里留下日志，轮询线程跑完本轮后看到 `_stop` 退出。
+        ⚠️ 但**池一关闭就再没人 `get`**（2026-11-02 实测）：那时再等位置就是永远。
+        只用"进去之前查一次 `_stop`"不够 —— 守卫在**等待之前**求值，而 `put` 没有超时：
+        若本调用恰好在 `_stop` 置位**之前**进入、且队列**正满**，就没有任何东西会唤醒它
+        （工作线程正是被 `_stop` 停掉的那批人），于是轮询线程永久卡在 `put` 上
+        （实测栈 `_loop` → `run_once` → `submit` → `queue.put`，`stop()` 返回 10 秒后
+        `papershelf-queue` 仍存活）。那一轮剩下的交付出不去，轮到的 `future` 也永远不结算。
+
+        所以入队这一步与 `shutdown` 的"置位 + 排空"**共用一把锁**，并且**不等**：
+
+        1. 持锁查 `_stop` —— 已关闭 ⇒ 当场回**失败的**句柄（任务不入队，调用不阻塞）；
+        2. 持锁 `put_nowait` —— 要么此刻进队列（⇒ `shutdown` 的排空**一定**会结算它，
+           因为排空也在这把锁里），要么 `Full`；
+        3. 队列满 ⇒ **放开锁**等一小会儿（`_stop.wait` 既当重试间隔又当唤醒源），再回 (1)。
+        关闭一旦发生，这一步立刻就醒 —— 没有任何路径能让本调用等下去。
         """
-        if self._stop.is_set():
-            fut = _Future()
-            fut.set_exception(_PoolClosed("转换队列已关闭，任务未执行"))
-            return fut
         fut = _Future()
-        self._q.put((fut, fn, args))
-        return fut
+        item = (fut, fn, args)
+        while True:
+            with self._lock:
+                if self._stop.is_set():
+                    return self._closed_future()
+                try:
+                    self._q.put_nowait(item)
+                    return fut
+                except _queue.Full:
+                    pass
+            # 池满：让出锁再等，关闭能立刻把它唤醒。
+            # 走到这里 ⇒ 上面那次 `put_nowait` 没成功 ⇒ 这件任务**从未入队**，
+            # 也就没有被 `shutdown` 的排空结算过 —— 关掉时它同样要自己结算。
+            if self._stop.wait(0.05):
+                return self._closed_future()
 
     def _worker(self) -> None:
         while not self._stop.is_set():
@@ -317,16 +345,23 @@ class _Pool:
            不结算的话关闭时轮询线程会在那上面永久挂住（栈上看到的另一半）；
         2. 哨兵改用 `put_nowait`：**绝不阻塞**。工作线程本来就靠 `_stop` +
            `get(timeout=0.2)` 自己退出，哨兵只是让它早点醒，排不进去也不影响正确性。
+
+        3. **置位与排空在同一把锁里**（`submit` 的入队也用这把）：否则"投递方刚查完
+           `_stop`、正要入队"与"这里排空完"之间有个窗口 —— 那件任务会落在**已排空的**
+           `_q` 里，再没人取，它的句柄永远不结算，`run_once` 的 `f.result()` 就此挂住
+           （2026-11-02 实测的那半条漏线程正是它）。锁把两者变成"要么投递先入队、
+           排空必然看见它；要么关闭先发生、投递当场拿到失败句柄"。
         """
-        self._stop.set()
-        while True:
-            try:
-                item = self._q.get_nowait()
-            except _queue.Empty:
-                break
-            fut = item[0] if item else None
-            if fut is not None:
-                fut.set_exception(_PoolClosed("转换队列已关闭，任务未执行"))
+        with self._lock:
+            self._stop.set()
+            while True:
+                try:
+                    item = self._q.get_nowait()
+                except _queue.Empty:
+                    break
+                fut = item[0] if item else None
+                if fut is not None:
+                    fut.set_exception(_PoolClosed("转换队列已关闭，任务未执行"))
         for _ in self._threads:
             try:
                 self._q.put_nowait(None)
