@@ -408,6 +408,12 @@ def _writeback_meta(conn: sqlite3.Connection, paper_id: int, paper: dict[str, An
                     meta: dict[str, Any], tokens: int) -> None:
     """收尾：`conv_state=done` + token 记账 + ⑲ 元数据写回（决策⑲）。
 
+    **终态一并清掉 `pending_job`**（与 `_set_state` 同一个不变量）：这一列回答的是
+    「轮到它时做什么」，而一篇已经 `done` 的文献没有「轮到它」的时刻。原先这里漏了，
+    于是 `done` 的行可以带着 `pending_job='refs'` 留在库里；没出事只因为**四个排队入口
+    都记得显式声明 `job`**（`enqueue(..., job=None)` 会把它清成 NULL）—— 那是约定，
+    不是结构。护栏见 `tests/test_pending_job.py`。
+
     ## ⚠️ 这里踩过一个把占位值锁死的坑（2026-09-12）
 
     原先是 `title = COALESCE(NULLIF(title,''), ?)`，意图「别覆盖用户手填的标题」。
@@ -426,6 +432,15 @@ def _writeback_meta(conn: sqlite3.Connection, paper_id: int, paper: dict[str, An
         "conv_state": "done",
         "conv_error": None,
         "updated_at": utcnow(),
+        # 终态一并清掉 `pending_job`（与 `_set_state` 同一个不变量）。
+        #
+        # 这一行原先漏了，于是 `done` 的行可以带着 `pending_job='refs'` 躺在库里 ——
+        # 一列在回答"轮到它时做什么"，而这篇已经没有任何"轮到它"的时刻了。
+        # 今天它之所以还没造成事故，全靠**四个排队入口都记得显式声明 job**
+        # （`enqueue(..., job=None)` 会把它清成 NULL）：那是一条约定，不是结构。
+        # 约定漏一处，残留的声明就会把下一次排队变成上一次的活
+        # （「修文献 → 用户又点重新转换 → 实际又跑了一遍修文献」）。
+        "pending_job": None,
     }
     # 标题：占位值可被覆盖，用户手填值绝不覆盖（⑲「可手动改」）
     #
