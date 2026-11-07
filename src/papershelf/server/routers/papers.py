@@ -345,12 +345,39 @@ def delete_paper(paper_id: int, conn: sqlite3.Connection = Depends(get_conn),
 
 
 def _remove_paper_files(settings: Settings, pdf_path: str | None, paper_id: int) -> None:
-    """删除磁盘产物，**失败只记日志不抛** —— 行已经从库里删了，此时 500 会让用户以为没删掉。
+    """删除一篇文献**在磁盘上的全部产物**，**失败只记日志不抛** —— 行已经从库里删了，
+    此时 500 会让用户以为没删掉。
 
-    两个位置：落盘的 PDF（`papers_dir/<时间戳>_<原名>.pdf`）与图片资产目录
-    （`papers_dir/p<id>/`）。目录用 `shutil.rmtree` 整个收掉，不然会留一堆孤儿 PNG。
+    三个位置，一篇文献名下的文件就这三处：
+    - 落盘的 PDF（`papers_dir/<时间戳>_<原名>.pdf`）；
+    - 这一篇的目录 `papers_dir/p<id>/`（图片资产 + 整页转正副本 `normalized.pdf`），
+      用 `shutil.rmtree` 整个收掉，不然会留一堆孤儿 PNG；
+    - 每篇日志 `logs/p<id>.log`（`logging_setup.paper_log` 写的，**追加**打开）。
+
+    ## 日志为什么也必须一起收（2026-11-06 实测）
+
+    它原先不在上面这份清单里，于是有两条可复现的后果：
+
+    1. **删了还留在盘上**：删一篇文献后 `logs/p<id>.log` 原样在（实测 4,626 B）；
+    2. **死篇的日志被新篇继承**：`papers.id` 是 `INTEGER PRIMARY KEY`（**没有**
+       `AUTOINCREMENT`）⇒ 删掉最大的那个 id 后，下一篇会**复用同一个号**，而日志是
+       追加写 ⇒ 新篇的时间线直接接在死篇后面。实测：新篇第一次转换时日志里有
+       **两条**「开始转换」，还带着已删那篇的 PDF 名 —— 排障时问"这篇为什么失败"，
+       读到的是另一篇的历史。
+
+    这不是"日志该只增不减"的问题：同一篇多轮累积是**要的**（`max_conv_attempts=3`，
+    三整轮 ≈4.7 KB，封顶后一次投递 +0 B）。错的是**文件活过了它描述的那一行**。
+    让它跟着行一起走，复用的 id 就从空文件开始 —— 继承在结构上不可能发生，
+    不必给 id 加 `AUTOINCREMENT`，也不必改表。
+
+    ⚠️ 这是**每一次**删除文献的收尾，所以 `DELETE /api/plans/{id}`（级联删整批文献）
+    也走这里：一处实现，两条删除路径共用（原先那条路径**一个文件都不收**）。
     """
-    for target in ([Path(pdf_path)] if pdf_path else []) + [settings.papers_dir / f"p{paper_id}"]:
+    for target in (
+        *([Path(pdf_path)] if pdf_path else []),
+        settings.papers_dir / f"p{paper_id}",
+        settings.logs_dir / f"p{paper_id}.log",
+    ):
         try:
             if target.is_dir():
                 shutil.rmtree(target, ignore_errors=True)

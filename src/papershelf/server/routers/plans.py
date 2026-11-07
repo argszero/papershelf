@@ -11,6 +11,7 @@ from typing import Any
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, Field
 
+from ..config import Settings, get_settings
 from ..db import dump_json, load_json, rows_to_list, tx, utcnow
 from ..repo import plan_public
 from ..security import current_user, get_conn, require_plan
@@ -90,10 +91,29 @@ def patch_plan(plan_id: int, body: PlanPatch, conn: sqlite3.Connection = Depends
 
 @router.delete("/{plan_id}", status_code=204)
 def delete_plan(plan_id: int, conn: sqlite3.Connection = Depends(get_conn),
-                user: dict[str, Any] = Depends(current_user)) -> None:
+                user: dict[str, Any] = Depends(current_user),
+                settings: Settings = Depends(get_settings)) -> None:
+    """删除一个计划，**连同它名下每篇文献的磁盘产物**。
+
+    `DELETE FROM plans` 只级联数据库里的行（`papers`/`docs`/`blocks`/`notes`/`shares`），
+    而 PDF、`papers/p<id>/`、`logs/p<id>.log` 是裸文件 —— 级联碰不到它们。原先这条路径
+    **一个文件都不收**：删计划 = 库里干净、盘上原名原样留着（实测见
+    `tests/test_delete_paper.py::test_deleting_a_plan_reclaims_every_papers_files`）。
+
+    收尾复用 `_remove_paper_files`（与 `DELETE /api/papers/{id}` 同一个函数）——
+    一处实现，两条删除路径共用，不新增第二个删除助手。
+
+    ⚠️ **行必须在删之前读出来**：级联删完就查不到 `pdf_path` 了。
+    """
     require_plan(conn, plan_id, user)
+    papers = rows_to_list(conn.execute(
+        "SELECT id, pdf_path FROM papers WHERE plan_id=?", (plan_id,)).fetchall())
     with tx(conn):                      # 级联删 papers/docs/blocks/notes/shares
         conn.execute("DELETE FROM plans WHERE id=?", (plan_id,))
+    from .papers import _remove_paper_files
+
+    for paper in papers:
+        _remove_paper_files(settings, paper.get("pdf_path"), int(paper["id"]))
 
 
 @router.get("/{plan_id}/settings")
