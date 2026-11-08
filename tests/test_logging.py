@@ -342,3 +342,154 @@ def test_queue_round_logs_state_when_busy(settings, monkeypatch, caplog):
         q._log_round()
     assert not [r for r in caplog.records if "队列状态" in r.getMessage()]
 
+
+
+# ── 4. 封顶那次投递：日志里必须写清「为什么不再试」 ────────────────────────
+#
+# 缺陷面（cycle 49 实测，修于 cycle 50）：`convert_paper` 的 `>= max` 分支原先在
+# `paper_log` **之前** `return`，而 `paper_log` 要等认领之后才打开 ⇒ 让一篇文献停下来的
+# 那次投递在 `logs/p<id>.log` 里 **+0 B**。文件最后一行永远是**上一次**的 traceback，
+# 运维 `tail` 出来的结论是「它失败了一次」，而不是「它被成本护栏挡住了」——后者只落在
+# `papers.conv_error`，要先查到这篇文章才读得到。
+#
+# 触达这条分支的真实路径是**崩溃窗口**：`queue.record_preclaim_failure` 先把计数提交到
+# 上限、`_set_state` 还没来得及落终态进程就死了 ⇒ 行停在 `queued` + `conv_attempts`
+# 已到顶 + `conv_error` 里是**真实原因**，下一轮由这里兜成 `failed`（见 queue.py 的
+# docstring）。所以用例摆出的形状就是这个：计数到顶、行仍 `queued`、原因在。
+
+CAP_LINE = "不再自动重试"
+
+
+def _mk_queued_paper(settings, *, attempts: int = 0) -> int:
+    """建一篇 `queued` 的文献（用户与计划复用，一个用例里多次调用不会撞 UNIQUE）。"""
+    from papershelf.server.db import connect
+    from papershelf.server.security import create_user
+
+    conn = connect(settings)
+    try:
+        row = conn.execute("SELECT id FROM users WHERE email='cap@x.edu.cn'").fetchone()
+        if row is None:
+            create_user(conn, email="cap@x.edu.cn", password="password123", status_="active")
+            row = conn.execute("SELECT id FROM users WHERE email='cap@x.edu.cn'").fetchone()
+        uid = int(row[0])
+        pl = conn.execute("SELECT id FROM plans WHERE user_id=?", (uid,)).fetchone()
+        if pl is None:
+            pl_id = int(conn.execute(
+                "INSERT INTO plans (user_id,name,created_at,updated_at) "
+                "VALUES (?,'p',datetime('now'),datetime('now'))", (uid,)).lastrowid)
+        else:
+            pl_id = int(pl[0])
+        pid = int(conn.execute(
+            """INSERT INTO papers (plan_id,title,source,status,conv_state,conv_attempts,
+                                   created_at,updated_at)
+               VALUES (?,?,?,?,?,?,datetime('now'),datetime('now'))""",
+            (pl_id, "t", "upload", "unread", "queued", attempts)).lastrowid)
+        conn.commit()
+        return pid
+    finally:
+        conn.close()
+
+
+def _requeue(settings, paper_id: int, attempts: int) -> None:
+    """把这一行放回队首、把计数摆到 `attempts`，**保留 `conv_error`**。
+
+    只清 `conv_error` 会把这篇文章摆成一条现实中不存在的形状：真实路径（崩溃窗口）
+    里计数到顶时原因**还在**，而"这一行为什么停"正是要拿它来说明的。
+    """
+    from papershelf.server.db import connect, tx
+
+    conn = connect(settings)
+    try:
+        with tx(conn):
+            conn.execute("UPDATE papers SET conv_state='queued', conv_attempts=? WHERE id=?",
+                         (attempts, paper_id))
+    finally:
+        conn.close()
+
+
+def _paper_state(settings, paper_id: int) -> tuple[str, str, int]:
+    from papershelf.server.db import connect
+
+    conn = connect(settings)
+    try:
+        r = conn.execute("SELECT conv_state, conv_error, conv_attempts FROM papers WHERE id=?",
+                         (paper_id,)).fetchone()
+    finally:
+        conn.close()
+    return (str(r["conv_state"]), str(r["conv_error"] or ""), int(r["conv_attempts"]))
+
+
+def _paper_log_text(settings, paper_id: int) -> str:
+    path = settings.logs_dir / f"p{paper_id}.log"
+    return path.read_text(encoding="utf-8", errors="replace") if path.exists() else ""
+
+
+def test_the_delivery_that_hits_the_retry_cap_says_why_in_the_per_paper_log(
+        settings, monkeypatch, caplog):
+    """封顶那次投递必须在这篇的日志里留一行，**且排在最后一次 traceback 之后**。
+
+    钉三件事，缺一条这个缺口就能悄悄回来：
+    1. 恰好**一行**（不是"日志变长了"就算过）；
+    2. 这一行带**上一次的真实失败原因**（只抄通用那句等于什么都没说）；
+    3. 它排在最后一次 traceback **之后** —— 日志是追加的，运维读「最后一行」时拿到的
+       必须是"为什么停"，而不是"上一次为什么失败"。
+    """
+    from papershelf.server import converter as cv
+
+    def _boom(*_a, **_k):
+        raise RuntimeError("round-level failure: the model never answered")
+
+    monkeypatch.setattr(cv, "_run", _boom)
+    cap = settings.max_conv_attempts
+
+    pid = _mk_queued_paper(settings, attempts=max(cap - 1, 0))
+    # ⚠️ `paper_log` 只是往 `papershelf` logger 上挂 handler；**要不要发这条 INFO 记录**
+    # 由 logger 自己的级别决定，而级别是产品入口 `setup_logging()` 配的。用例里没人调它，
+    # 默认 root 是 WARNING ⇒ INFO 会被源头丢掉、文件始终是空的（实测：只挑这两个用例跑
+    # 时日志 0 B，全文件一起跑却"通过"—— 因为前面的用例把级别改成了 INFO）。
+    with caplog.at_level(logging.INFO, logger="papershelf"):
+        cv.convert_paper(pid)                # 最后一次「真」失败：写一条 traceback + 真原因
+        # 状态必须在**两次投递之间**读：让这篇停下来的那次会把 `conv_error` 改写成通用那句，
+        # 之后再读就看不到"上一次的真实原因"了（这也正是这条缺陷的后果之一）。
+        state, error, attempts = _paper_state(settings, pid)
+        assert (state, attempts) == ("failed", cap), (state, error, attempts)
+        assert "round-level failure" in error, error
+        _requeue(settings, pid, cap)         # 崩溃窗口形状：计数到顶、行仍 queued、原因在
+        cv.convert_paper(pid)                # ← 让这篇文献停下来的那次投递
+
+    text = _paper_log_text(settings, pid)
+    cap_lines = [ln for ln in text.splitlines() if CAP_LINE in ln]
+    assert len(cap_lines) == 1, f"封顶那次必须**恰好**写一行，实际 {len(cap_lines)} 行：\n{text}"
+    cap_line = cap_lines[0]
+    assert "超过最大重试次数" in cap_line, cap_line
+    assert f"停在第 {cap} 次" in cap_line, f"这一行必须说清停在第几次：{cap_line}"
+    assert "round-level failure: the model never answered" in cap_line, (
+        f"这一行必须带上上一次的真实失败原因，而不是只抄一遍通用那句：{cap_line}")
+
+    marker = "Traceback (most recent call last)"
+    assert marker in text, f"日志是**追加**的，上一次的 traceback 必须还在：\n{text}"
+    assert text.rindex(marker) < text.index(cap_line), (
+        "封顶那一行必须排在最后一次 traceback **之后**（最后一行才是「为什么不再试」）：\n"
+        + text)
+
+    state, error, attempts = _paper_state(settings, pid)
+    assert state == "failed" and error == "超过最大重试次数"
+    assert attempts == cap, "判据仍在认领之前：封顶那次不得再记一次尝试"
+
+
+def test_a_successful_conversion_writes_no_retry_cap_line(settings, monkeypatch, caplog):
+    """正常转换**不得**出现封顶那一行 —— 否则上一条用例可以靠"永远写"混过去。"""
+    from papershelf.pipeline.model import Block as PBlock, Doc as PDoc
+    from papershelf.server import converter as cv
+
+    pid = _mk_queued_paper(settings)
+    monkeypatch.setattr(
+        cv, "_run",
+        lambda *a, **k: (PDoc(meta={}, blocks=[PBlock(id="b-0001", type="p", en="a")]), 7))
+
+    with caplog.at_level(logging.INFO, logger="papershelf"):   # 同上：级别是入口配的
+        cv.convert_paper(pid)
+
+    text = _paper_log_text(settings, pid)
+    assert "转换完成" in text, f"正常路径必须留下完成那条，否则这个用例什么都没验到：\n{text}"
+    assert CAP_LINE not in text, f"正常转换不该出现封顶行：\n{text}"
