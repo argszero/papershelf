@@ -258,6 +258,24 @@ def convert_paper(paper_id: int, fingerprint: str | None = None) -> None:
         if paper is None:
             return
         if paper["conv_attempts"] >= settings.max_conv_attempts:
+            # ⚠️ 停下来的这一次**也必须写进这篇自己的日志**。
+            #
+            # 这条分支原先在 `paper_log` 之前 `return`（`paper_log` 在下面认领之后才
+            # 打开），所以让一篇文献停下来的那次投递在 `logs/p<id>.log` 里**一个字都不
+            # 写**：文件的最后一行永远是**上一次**的 traceback，运维 `tail` 一下只能看到
+            # 「第 N 次为什么失败」，看不到「为什么不再试了」—— 后者只落在
+            # `papers.conv_error`，而那一列要先查到这篇文章才读得到。
+            #
+            # 判据本身**不挪**：`claim_paper` 的 docstring 写死了顺序（先看 `>= max`
+            # 再认领，第 `max+1` 次必须被挡下），挪到认领之后会白记一次 `conv_attempts`、
+            # 让这篇走一遍 `doing`，改的是状态机而不是可观测性。所以这里只额外挂一次
+            # 同一个 `paper_log`，把这一句抄进同一个文件。
+            from .logging_setup import paper_log
+
+            with paper_log(paper_id, settings.logs_dir, enabled=settings.log_per_paper):
+                log.info("paper=%s 停在第 %s 次尝试：超过最大重试次数，不再自动重试"
+                         "（上次失败原因：%s）", paper_id,
+                         int(paper["conv_attempts"]), paper["conv_error"] or "—")
             _set_state(conn, paper_id, "failed", "超过最大重试次数")
             return
         if paper["conv_state"] not in ("queued", "doing"):
