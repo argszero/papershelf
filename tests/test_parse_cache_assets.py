@@ -19,10 +19,15 @@
 2. 供图端点对第二篇返回 200 —— 判据落在用户真正走的那一层；
 3. **缓存复用没有被修掉**：资产齐全时第二篇不再解析（否则等于用"每次都重解析"换掉了这个设计）；
 4. 源目录已消失（第一篇被删文献）时**就地为这一篇重新解析**，并且把来源记进 meta。
+5. **目录被收走之后，缓存行不许再把它当来源**：`p<id>` 会被下一篇复用（`INTEGER PRIMARY
+   KEY` 无 `AUTOINCREMENT`），资产名又只按页编号，所以"行还指着 p<id>/assets"等于
+   "按名字复制别人的图"。删除时摘掉这条指针 ⇒ 命中缓存只能就地为这一篇重新解析。
 """
 
 from __future__ import annotations
 
+import hashlib
+import json
 import struct
 import zlib
 from pathlib import Path
@@ -44,13 +49,16 @@ def _png(w: int = 8, h: int = 8, rgb: tuple[int, int, int] = (200, 60, 60)) -> b
             + chunk(b"IEND", b""))
 
 
-def _make_pdf(path: Path) -> None:
-    """一页、一张图、一行字 —— 让解析真的产出一个引用图片的块。"""
+def _make_pdf(path: Path, rgb: tuple[int, int, int] = (200, 60, 60)) -> None:
+    """一页、一张图、一行字 —— 让解析真的产出一个引用图片的块。
+
+    `rgb` 让不同 PDF 的插图**字节不同**：本文件要靠"图是谁的"来判断有没有搬错。
+    """
     import fitz
 
     doc = fitz.open()
     page = doc.new_page()
-    page.insert_image(fitz.Rect(72, 72, 172, 172), stream=_png())
+    page.insert_image(fitz.Rect(72, 72, 172, 172), stream=_png(rgb=rgb))
     page.insert_text((72, 220), "The figure above is the whole point of this page.")
     doc.save(str(path))
     doc.close()
@@ -155,16 +163,24 @@ def _referenced_names(doc) -> set[str]:
     return names
 
 
-def _seed(client, settings, make_user, monkeypatch, cv, *, first: str, second: str):
-    """登录 + 建计划 + 传**字节完全相同**的两份 PDF；返回 (pid_a, pid_b, pdf_a, pdf_b)。"""
+def _prepare(client, settings, make_user, monkeypatch, cv) -> int:
+    """登录 + 建一个计划，返回 plan_id（LLM 全替身：零 token、零网络）。"""
     _stub_llm(monkeypatch, cv)
     settings.llm_base_url = "https://example.invalid/v1"   # 只为过前置检查，不联网
     settings.llm_api_key = "test-key"
     settings.proofread = False
 
     email, pw = make_user("owner@tsinghua.edu.cn")
-    client.post("/api/auth/login", json={"email": email, "password": pw})
-    plan_id = client.post("/api/plans", json={"name": "精读"}).json()["id"]
+    assert client.post("/api/auth/login",
+                       json={"email": email, "password": pw}).status_code == 200
+    plan = client.post("/api/plans", json={"name": "精读"})
+    assert plan.status_code in (200, 201), plan.text
+    return int(plan.json()["id"])
+
+
+def _seed(client, settings, make_user, monkeypatch, cv, *, first: str, second: str):
+    """登录 + 建计划 + 传**字节完全相同**的两份 PDF；返回 (pid_a, pid_b, pdf_a, pdf_b)。"""
+    plan_id = _prepare(client, settings, make_user, monkeypatch, cv)
 
     src = settings.data_dir / "seed.pdf"
     src.parent.mkdir(parents=True, exist_ok=True)
@@ -254,3 +270,113 @@ def test_cache_hit_falls_back_to_reparsing_when_the_source_assets_are_gone(
     assert doc_b.meta.get("assets_dir") == f"p{pid_b}/assets", (
         "重解析后没把资产的来源目录记进 meta —— 下一次别人命中这份缓存时又搬不了"
     )
+
+
+def _cache_meta(settings, fingerprint: str) -> dict | None:
+    """读缓存行里的 `meta`（行不在则 None）。"""
+    from papershelf.server.db import connect
+
+    conn = connect(settings)
+    try:
+        row = conn.execute("SELECT doc_json FROM doc_cache WHERE fingerprint=?",
+                           (fingerprint,)).fetchone()
+    finally:
+        conn.close()
+    if row is None:
+        return None
+    return json.loads(row["doc_json"]).get("meta") or {}
+
+
+def _asset_digests(directory: Path) -> dict[str, str]:
+    if not directory.is_dir():
+        return {}
+    return {p.name: hashlib.sha256(p.read_bytes()).hexdigest()
+            for p in sorted(directory.iterdir()) if p.is_file()}
+
+
+def test_reclaimed_assets_dir_is_never_used_as_another_papers_figure_source(
+        client, settings, make_user, monkeypatch):
+    """⭐ 删掉一篇之后，缓存行**不许**再把这已收走的目录当来源（`#19`）。
+
+    四段，全走真上传 / 真删除 / 真解析（LLM 全替身）：
+
+    1. 传 F（红图）并转换 ⇒ `p<id>/assets` 里是 F 的图；
+    2. `DELETE /api/papers/<id>` ⇒ 目录与 PDF 都收了，**缓存行留下**（它是共享的）——
+       但它**不能再指着** `p<id>/assets`（这就是本文件要钉的不变量）；
+    3. 传另一份 G（蓝图）⇒ 复用同一个 id，把**自己的**图写进同一个 `p<id>/assets`；
+    4. 再传 F 的字节 ⇒ 命中缓存也必须**为这一篇重新解析**，拿到的是 F 自己的图。
+
+    没有第 2 步那条要求时，第 4 步会按名字从 `p<id>/assets` 复制 —— 0 次解析、
+    不报错、不缺图，但那一篇显示的是 **G 的插图**（实测 digest 与 G 相同）。
+    """
+    from papershelf.server import converter as cv
+
+    plan_id = _prepare(client, settings, make_user, monkeypatch, cv)
+    calls = _spy_parse(monkeypatch, cv)
+
+    def _bytes_of(rgb: tuple[int, int, int]) -> bytes:
+        src = settings.data_dir / f"seed-{rgb[0]}.pdf"
+        src.parent.mkdir(parents=True, exist_ok=True)
+        _make_pdf(src, rgb=rgb)
+        return src.read_bytes()
+
+    red, blue = (200, 60, 60), (60, 60, 200)
+    f_bytes, g_bytes = _bytes_of(red), _bytes_of(blue)
+
+    # ── 1. F 真解析 ──
+    pid_f, pdf_f = _upload(client, plan_id, "F.pdf", f_bytes)
+    fp_f = _fp(pdf_f)                     # ⚠️ 必须在删除**之前**算：键取自 PDF 字节
+    _run_paper(settings, pid_f, fp_f)
+    assert len(calls) == 1, "第一篇没有真正解析过 —— 夹具没跑通"
+    calls.clear()
+    f_digests = _asset_digests(settings.papers_dir / f"p{pid_f}" / "assets")
+    assert f_digests, "第一篇的资产目录是空的 —— 夹具没跑通"
+    assert _cache_meta(settings, fp_f).get("assets_dir") == f"p{pid_f}/assets"
+
+    # ── 2. 删掉它：目录收了，缓存行留下，但**指针必须没了** ──
+    assert client.delete(f"/api/papers/{pid_f}").status_code == 204
+    assert not (settings.papers_dir / f"p{pid_f}").exists(), "目录没被收走 —— 夹具没跑通"
+    meta_after = _cache_meta(settings, fp_f)
+    assert meta_after is not None, (
+        "缓存行被跟着删了 —— 它会打掉共用同一份 PDF 的另一篇的命中（这一格刻意保留行）"
+    )
+    assert meta_after.get("assets_dir") != f"p{pid_f}/assets", (
+        f"目录 p{pid_f}/ 已经不在了，缓存行却还把它记成图片来源 "
+        f"（assets_dir={meta_after.get('assets_dir')!r}）—— p<id> 会被下一篇复用，"
+        "届时命中缓存的篇目会按名字复制到**别人的**插图"
+    )
+
+    # ── 3. 传另一份 PDF：复用同一个 id，往同一个目录写它自己的图 ──
+    pid_g, pdf_g = _upload(client, plan_id, "G.pdf", g_bytes)
+    assert pid_g == pid_f, (
+        f"id 没有被复用（{pid_g} != {pid_f}）—— 本缺陷需要复用才会发生，夹具不成立"
+    )
+    _run_paper(settings, pid_g, _fp(pdf_g))
+    assert len(calls) == 1, "第二份 PDF 应当真解析一次"
+    calls.clear()
+    g_digests = _asset_digests(settings.papers_dir / f"p{pid_f}" / "assets")
+    assert g_digests, "第二篇的资产目录是空的 —— 夹具没跑通"
+    shared = set(f_digests) & set(g_digests)
+    assert shared, "两份 PDF 的插图不同名 —— 那这个缺陷就撞不上，夹具不成立"
+    assert any(f_digests[n] != g_digests[n] for n in shared), \
+        "两份 PDF 的插图字节相同 —— 分不出是谁的图，夹具不成立"
+
+    # ── 4. 再传 F 的字节：必须重解析，且图必须是 F 自己的 ──
+    pid_d, pdf_d = _upload(client, plan_id, "F-again.pdf", f_bytes)
+    assert pid_d != pid_f, "第三篇应当拿到另一个 id"
+    _run_paper(settings, pid_d, _fp(pdf_d))
+    assert len(calls) == 1, (
+        f"命中缓存后没有为这一篇重新解析（parse_pdf 调用 {len(calls)} 次）—— "
+        "它按名字从 p<id>/assets 复制，而那个目录现在属于另一篇"
+    )
+    d_digests = _asset_digests(settings.papers_dir / f"p{pid_d}" / "assets")
+    for name, digest in f_digests.items():
+        assert d_digests.get(name) == digest, (
+            f"{name} 不是 F 自己的图：这篇拿到 {d_digests.get(name)}，"
+            f"F 的原图是 {digest}（G 在同名文件里是 {g_digests.get(name)}）—— "
+            "用户看到的是一张**属于别的文献**的插图，不报错、不缺图、不自愈"
+        )
+    for name in shared:
+        assert d_digests.get(name) != g_digests[name], (
+            f"{name} 是 G 的图被搬过来了 —— 名字一样、字节不同，复制端无法察觉"
+        )

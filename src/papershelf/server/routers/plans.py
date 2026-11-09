@@ -113,7 +113,7 @@ def delete_plan(plan_id: int, conn: sqlite3.Connection = Depends(get_conn),
     from .papers import _remove_paper_files
 
     for paper in papers:
-        _remove_paper_files(settings, paper.get("pdf_path"), int(paper["id"]))
+        _remove_paper_files(settings, paper.get("pdf_path"), int(paper["id"]), conn)
 
 
 @router.get("/{plan_id}/settings")
