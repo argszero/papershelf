@@ -341,10 +341,11 @@ def delete_paper(paper_id: int, conn: sqlite3.Connection = Depends(get_conn),
     paper = require_paper(conn, paper_id, user)
     with tx(conn):
         conn.execute("DELETE FROM papers WHERE id=?", (paper_id,))
-    _remove_paper_files(settings, paper.get("pdf_path"), paper_id)
+    _remove_paper_files(settings, paper.get("pdf_path"), paper_id, conn)
 
 
-def _remove_paper_files(settings: Settings, pdf_path: str | None, paper_id: int) -> None:
+def _remove_paper_files(settings: Settings, pdf_path: str | None, paper_id: int,
+                        conn: sqlite3.Connection | None = None) -> None:
     """删除一篇文献**在磁盘上的全部产物**，**失败只记日志不抛** —— 行已经从库里删了，
     此时 500 会让用户以为没删掉。
 
@@ -372,7 +373,13 @@ def _remove_paper_files(settings: Settings, pdf_path: str | None, paper_id: int)
 
     ⚠️ 这是**每一次**删除文献的收尾，所以 `DELETE /api/plans/{id}`（级联删整批文献）
     也走这里：一处实现，两条删除路径共用（原先那条路径**一个文件都不收**）。
+
+    ⚠️ 它还负责**摘掉解析缓存里指向这个目录的来源指针**（`_forget_reclaimed_assets_dir`）——
+    和收文件放在同一个入口是**故意的**：`p<id>/` 不再属于这一篇的那一刻，库里那条指针
+    就同时失效，两者分开写必然有一条路径漏掉（PR #17 就是这样漏掉了日志）。
     """
+    # 先摘指针、再收目录：反过来会留一个"目录已经没了、行还指着它"的窗口。
+    _forget_reclaimed_assets_dir(conn, settings, paper_id)
     for target in (
         *([Path(pdf_path)] if pdf_path else []),
         settings.papers_dir / f"p{paper_id}",
@@ -385,6 +392,82 @@ def _remove_paper_files(settings: Settings, pdf_path: str | None, paper_id: int)
                 target.unlink()
         except OSError as exc:                       # noqa: PERF203
             log.warning("删除磁盘产物失败（已忽略）：%s：%s", target, exc)
+
+
+def _forget_reclaimed_assets_dir(conn: sqlite3.Connection | None, settings: Settings,
+                                 paper_id: int) -> None:
+    """把**仍指向「已被收走的 `p<id>/`」**的解析缓存行摘掉来源指针。
+
+    ## 不变量（本函数实现的就是它）
+
+    `doc_cache` 的行**可以**越过删除 —— 键是 PDF 字节、全库共享，删掉一行会连带打掉
+    共用同一份 PDF 的另一篇的命中（`tests/test_delete_paper.py` 钉住了这一口径）。
+    但**没有任何一行可以继续把来源指进一个已经不属于那一篇的目录**：
+    "行留下"与"指针留下"是两件事，本条只管后者。
+
+    ## 为什么（cycle 51 实测，`#19`）
+
+    `doc_json.meta["assets_dir"]` 记的是**按位置**起的相对路径 `p<id>/assets`，而
+    `papers.id` 是 `INTEGER PRIMARY KEY`（**没有** `AUTOINCREMENT`）⇒ 删掉最大的 id 后
+    下一篇复用同一个号、往同一个 `p<id>/assets` 写**它自己的**图。此时共用那一行的 PDF
+    再命中缓存，`converter._materialise_cached_assets` 是按**名字**复制
+    （`p{page}_img{n}.{ext}`）—— 名字里既没有内容也没有篇号 ⇒ 复制"必然成功"，
+    于是把**另一篇的图**发给了这一篇。实测：删 F → 传 G（复用 id 1，写蓝色图）→
+    再传 F 的字节 ⇒ 命中缓存、**0 次解析**、拿到的是 G 的图（`65a68126381d`），
+    而 F 的原图是 `d57cf45c8b7a`。**不报错、不缺图、不自愈。**
+
+    ## 做法
+
+    - 先按 `p<id>/` 粗筛 `doc_json`，再逐行解析比对（`p1/` 不会命中 `p11/`），
+      以解析出来的值为准；
+    - `assets_dir` 恰好等于 `p<id>/assets` ⇒ **摘掉这个键**。不要改成空串或别的路径：
+      "键缺席"是既有的"来源未知"语义 —— `_materialise_cached_assets` 靠它返回 False，
+      这一篇就地为**它自己**重新解析，并把新来源写回缓存行。
+    - `normalized_pdf`（v12 旋转页的转正副本，记的是**绝对路径**）落在该目录里 ⇒ 一并摘掉：
+      id 复用会把它指到别人的 `p<id>/normalized.pdf`，那是同一类错误的另一件。摘掉之后
+      ①c 退回读原件（`converter._run` 已有这条回落），不影响正确性。
+    - 只动指着**这一篇**的指针；共用同一行的另一篇仍指着的**活目录**一律不碰。
+
+    ⚠️ 已知边界：本函数只在删除时生效 —— 本改动**之前**落库、且其目录早已被无关篇目复用
+    的行不会被追溯修掉；那样的实例用那几篇的「重新提取」清掉对应行（用户自己选的
+    破坏性出口，见 `reextract`）。没有**更强的**运行时判据可用：资产名与篇号无关，
+    缓存里也没有可核对的字节哈希，所以"这次搬对了没有"只能由**记录在案的来源**回答。
+    """
+    if conn is None:                     # 只收文件、不碰库的调用（脚本/单测）行为不变
+        return
+    reclaimed = settings.papers_dir / f"p{paper_id}"
+    own_assets = f"p{paper_id}/assets"
+    stale: list[tuple[str, str]] = []
+    for row in conn.execute("SELECT fingerprint, doc_json FROM doc_cache WHERE doc_json LIKE ?",
+                            (f"%p{paper_id}/%",)).fetchall():
+        try:
+            doc = json.loads(row["doc_json"])
+        except (TypeError, ValueError):
+            continue                     # 不是本程序写的 JSON：不碰
+        meta = doc.get("meta") if isinstance(doc, dict) else None
+        if not isinstance(meta, dict):
+            continue
+        changed = False
+        if str(meta.get("assets_dir") or "") == own_assets:
+            meta.pop("assets_dir", None)
+            changed = True
+        norm = str(meta.get("normalized_pdf") or "")
+        if norm:
+            try:
+                inside = Path(norm).parent == reclaimed
+            except (OSError, ValueError):   # 路径无法解析：不是我们记的那种指针
+                inside = False
+            if inside:
+                meta.pop("normalized_pdf", None)
+                changed = True
+        if changed:
+            stale.append((json.dumps(doc), row["fingerprint"]))
+    if not stale:
+        return
+    with tx(conn):
+        conn.executemany("UPDATE doc_cache SET doc_json=? WHERE fingerprint=?", stale)
+    log.info("paper=%s 删除：摘掉 %d 行解析缓存的来源指针（它们指着已收走的 p%s/）",
+             paper_id, len(stale), paper_id)
 
 
 @router.get("/papers/{paper_id}/doc")
