@@ -353,6 +353,57 @@ def test_plans_are_private_between_users(client, make_user):
     assert other.patch(f"/api/plans/{plan_id}", json={"name": "x"}).status_code == 404
 
 
+def test_arxiv_import_into_another_users_plan_is_refused(client, make_user, monkeypatch):
+    """⭐ 往**别人的**计划里导入 arXiv 论文必须 404，而且一行都不许多。
+
+    这一条钉住一个真实缺陷（2026-11 离线实测，`main` 上复现）：
+    `POST /api/plans/{plan_id}/papers/arxiv` 只挂了 `current_user`，而同目录下
+    几乎一模一样的 `upload` 挂了 `require_plan`。于是用户 B 拿 A 的 `plan_id`
+    （自增整数）调 arxiv 导入，拿到的是 **201**，库里真落下一行
+    `plan_id=A, source=arxiv, conv_state=queued` —— A 刷新列表多出一篇，
+    B 自己反而看不见它；接着那个转换会用服务端的 LLM key 跑 A 的配额。
+    `upload` 在完全相同的调用下一直是 404，两条路由的不对称本身就是证据。
+
+    断言落在**两处**，因为只看状态码会漏掉「返回 404 但行已经写进去」：
+    1. B 打 A 的计划 = 404；
+    2. A 的计划里文献数**前后不变**；
+    3. B 打自己的计划仍然是 201（证明 404 来自归属判断，不是路由或校验坏掉）。
+    """
+    from papershelf.server.routers import papers as papers_router
+
+    # 导入会真的排一次转换（`convert_paper` 是 BackgroundTasks，TestClient 会同步跑掉）：
+    # 这里只关心「行有没有落进别人的计划」，转换本身换成空操作，零 token、零网络。
+    monkeypatch.setattr(papers_router, "convert_paper", lambda *a, **k: None)
+
+    a = make_user("a@tsinghua.edu.cn")
+    b = make_user("b@tsinghua.edu.cn")
+    client.post("/api/auth/login", json={"email": a[0], "password": a[1]})
+    plan_id = client.post("/api/plans", json={"name": "P"}).json()["id"]
+    before = client.get(f"/api/plans/{plan_id}/papers").json()
+    assert before == [], "夹具：A 的计划一开始应当是空的"
+
+    other = client.__class__(client.app_ref)          # 新 cookie jar = 另一个用户
+    other.post("/api/auth/login", json={"email": b[0], "password": b[1]})
+
+    r = other.post(f"/api/plans/{plan_id}/papers/arxiv", json={"ref": "2401.99999"})
+    assert r.status_code == 404, (
+        f"B 往 A 的计划导入 arXiv 拿到 {r.status_code}（期望 404）—— "
+        "这条写接口能落一行指向别人计划的文献，同目录的 upload 却是 404"
+    )
+
+    after = client.get(f"/api/plans/{plan_id}/papers").json()
+    assert after == before, (
+        f"A 的计划里多出了 {len(after) - len(before)} 篇文献："
+        f"{[p.get('title') for p in after]} —— 拒绝必须发生在写库之前"
+    )
+
+    # 对照：B 打自己的计划，同样的调用必须成功（否则上面那个 404 可能是别的原因）
+    own = other.post("/api/plans", json={"name": "B-own"}).json()["id"]
+    assert other.post(f"/api/plans/{own}/papers/arxiv",
+                      json={"ref": "2401.99998"}).status_code == 201
+    assert len(other.get(f"/api/plans/{own}/papers").json()) == 1
+
+
 # ── 进度语义（⑰）────────────────────────────────────────────────────────
 def _seed_paper(settings, plan_id: int, blocks: list[Block]) -> int:
     from papershelf.server.db import connect
