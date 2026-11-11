@@ -380,3 +380,85 @@ def test_reclaimed_assets_dir_is_never_used_as_another_papers_figure_source(
         assert d_digests.get(name) != g_digests[name], (
             f"{name} 是 G 的图被搬过来了 —— 名字一样、字节不同，复制端无法察觉"
         )
+
+
+def test_a_live_paper_keeps_its_cache_hit_after_the_other_one_is_deleted(
+        client, settings, make_user, monkeypatch):
+    """⭐ 删掉共用同一份 PDF 的另一篇之后，**活着的那篇不许开始重解析**。
+
+    摘掉 `assets_dir` 指针只有在「来源目录真的不归这一篇了」时才该付代价。
+    这里钉住代价没有被误付：A、B 用**同一份字节**（同一个缓存键），B 第一次命中时
+    `_materialise_cached_assets` 已经把 `assets_dir` 改写成 `p<B>/assets`，
+    所以 A 被删时那条清空条件根本不成立 —— B 的命中照旧，之后同字节的 C 也只是复制。
+
+    四段，全走真上传 / 真删除 / 真解析（LLM 全替身、零 token）：
+
+    1. 删 A（`p<A>/` 整个收走，缓存行留下）；
+    2. **紧接着**传第三份同字节的 C ⇒ **0 次解析**（指针此刻指着 `p<B>/assets`，那是活的）；
+    3. C 的插图字节 = 这份 PDF **自己的**图；
+    4. B 再转换 ⇒ 也 **0 次解析**。
+
+    ⚠️ 第 2 步的**顺序**是这条用例的关键：`_materialise_cached_assets` 对已经在本篇目录
+    里的文件直接跳过，所以*B 自己*哪怕丢了指针也不会重解析；真正会变贵的是**新来的**那一篇
+    ——它目录是空的，只能按指针去别处复制。把 C 放在 B 重新转换**之前**，
+    测的才是「删除之后这条指针还指着活目录」这个不变量；反过来放，
+    B 的命中会把指针重新写回去，等于替被测代码把洞补上了（实测：那样变异也不会红）。
+
+    它在「清空条件不再问这个目录还是不是那一篇的」时红：那时 C 找不到来源，
+    只能就地重解析 —— 同一份 PDF 每被删掉一个引用者，下一个新篇目就要重解析一次。
+    """
+    from pathlib import Path as _Path
+
+    from papershelf.server import converter as cv
+    from papershelf.server.db import connect
+
+    pid_a, pid_b, pdf_a, pdf_b = _seed(
+        client, settings, make_user, monkeypatch, cv, first="甲.pdf", second="乙.pdf")
+    calls = _spy_parse(monkeypatch, cv)
+
+    _run_paper(settings, pid_a, _fp(pdf_a))
+    assert len(calls) == 1, "第一篇没有真正解析过 —— 夹具没跑通"
+    calls.clear()
+    a_digests = _asset_digests(settings.papers_dir / f"p{pid_a}" / "assets")
+    assert a_digests, "第一篇的资产目录是空的 —— 夹具没跑通"
+
+    _run_paper(settings, pid_b, _fp(pdf_b))
+    assert not calls, "第二篇本该命中缓存（同一份字节）—— 夹具没跑通"
+    assert _cache_meta(settings, _fp(pdf_b)).get("assets_dir") == f"p{pid_b}/assets", (
+        "命中缓存没有把 assets_dir 改写成**这一篇自己**的目录 —— "
+        "后面那条清空条件就会把它当成别人的"
+    )
+
+    # ── 删除 A：B 还活着，而它是这份缓存当前唯一的引用者 ──
+    assert client.delete(f"/api/papers/{pid_a}").status_code == 204
+    assert not (settings.papers_dir / f"p{pid_a}").exists(), "目录没被收走 —— 夹具没跑通"
+    calls.clear()
+
+    # ── 第三篇：同字节，**在 B 重新转换之前**到来 ──
+    conn = connect(settings)
+    try:
+        plan_id = int(conn.execute("SELECT plan_id FROM papers WHERE id=?",
+                                   (pid_b,)).fetchone()[0])
+    finally:
+        conn.close()
+    pid_c, pdf_c = _upload(client, plan_id, "丙.pdf", _Path(pdf_b).read_bytes())
+    assert _fp(pdf_c) == _fp(pdf_b), "第三篇与前面不是同一份字节 —— 夹具没跑通"
+    _run_paper(settings, pid_c, _fp(pdf_c))
+    assert not calls, (
+        f"删掉共用同一份 PDF 的另一篇之后，新传的同一份 PDF 重新解析了 {len(calls)} 次 —— "
+        "删除时的清空条件打到了还活着的那篇头上：缓存行不再指着任何活目录，"
+        "下一个引用同一份字节的篇目只能自己重解析"
+    )
+    c_digests = _asset_digests(settings.papers_dir / f"p{pid_c}" / "assets")
+    for name, digest in a_digests.items():
+        assert c_digests.get(name) == digest, (
+            f"{name} 不是这份 PDF 自己的插图：这一篇拿到 {c_digests.get(name)}，"
+            f"原始字节是 {digest}"
+        )
+
+    # ── 活着的那篇自己再转换一次：同样是 0 次解析 ──
+    calls.clear()
+    _run_paper(settings, pid_b, _fp(pdf_b))
+    assert not calls, (
+        f"这一篇自己也重新解析了 {len(calls)} 次 —— 它的命中不该被别人的删除影响"
+    )

@@ -188,6 +188,11 @@ def import_arxiv(
     user: dict[str, Any] = Depends(current_user),
 ) -> dict[str, Any]:
     """⑱：优先抓 arXiv 官方 HTML（`arxiv.org/html/<ID>v<N>`），无则回落 PDF。"""
+    # ⚠️ 这一行曾经缺失：arxiv 导入是**写**接口（落一行 `plan_id` 指向传入计划的
+    # 文献、还会把一个真实转换排进队列），却只挂了 `current_user`。于是任何登录用户
+    # 只要知道对方的 `plan_id`（自增整数），就能往别人的计划里插论文 —— 同目录下的
+    # `upload` 一直是 404，只有这条路由答 201，攻击者拿到的正是「写进去了」的回执。
+    require_plan(conn, plan_id, user)
     ref = body.ref.strip()
     with tx(conn):
         cur = conn.execute(
