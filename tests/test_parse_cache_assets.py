@@ -22,6 +22,10 @@
 5. **目录被收走之后，缓存行不许再把它当来源**：`p<id>` 会被下一篇复用（`INTEGER PRIMARY
    KEY` 无 `AUTOINCREMENT`），资产名又只按页编号，所以"行还指着 p<id>/assets"等于
    "按名字复制别人的图"。删除时摘掉这条指针 ⇒ 命中缓存只能就地为这一篇重新解析。
+6. **判据落在字节上**（`meta["asset_digests"]`）：解析时记下每张图的 sha256，命中缓存时
+   源文件必须对得上（老行没有这个字段 ⇒ 重解析），并且本篇目录里的同名文件**必须被覆盖**。
+   只按目录名（老行的指针）、只按"文件在不在"（`if dst.is_file(): continue`）判断，
+   都会把别人的图当成这一篇的：不报错、不缺图、不自愈。
 """
 
 from __future__ import annotations
@@ -462,3 +466,215 @@ def test_a_live_paper_keeps_its_cache_hit_after_the_other_one_is_deleted(
     assert not calls, (
         f"这一篇自己也重新解析了 {len(calls)} 次 —— 它的命中不该被别人的删除影响"
     )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 目录名不够，同名文件也不够 —— 判据必须是**字节**（`meta["asset_digests"]`）
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _age_row(settings, fingerprint: str, *, pointer: str | None,
+             drop_digests: bool) -> dict:
+    """把缓存行改成"老版本写下的样子"（没有 `asset_digests`），或只把指针挪到别处。"""
+    from papershelf.server.db import connect
+
+    conn = connect(settings)
+    try:
+        row = conn.execute("SELECT doc_json FROM doc_cache WHERE fingerprint=?",
+                           (fingerprint,)).fetchone()
+        assert row is not None, "没有可做旧的缓存行 —— 夹具没跑通"
+        doc = json.loads(row["doc_json"])
+        if pointer is not None:
+            doc["meta"]["assets_dir"] = pointer
+        if drop_digests:
+            doc["meta"].pop("asset_digests", None)
+        conn.execute("UPDATE doc_cache SET doc_json=? WHERE fingerprint=?",
+                     (json.dumps(doc), fingerprint))
+        conn.commit()
+    finally:
+        conn.close()
+    return _cache_meta(settings, fingerprint) or {}
+
+
+def _two_pdf_bytes(settings) -> tuple[bytes, bytes]:
+    """两份 PDF：版面相同（同名插图）、插图**字节不同** —— "图是谁的"就是全部判据。"""
+    out = []
+    for rgb in ((200, 60, 60), (60, 60, 200)):
+        src = settings.data_dir / f"seed-{rgb[0]}.pdf"
+        src.parent.mkdir(parents=True, exist_ok=True)
+        _make_pdf(src, rgb=rgb)
+        out.append(src.read_bytes())
+    return out[0], out[1]
+
+
+def test_a_row_without_asset_digests_reparses_instead_of_trusting_a_directory(
+        client, settings, make_user, monkeypatch):
+    """⭐ 老缓存行（没有 `asset_digests`）无从核对 ⇒ **重解析**，不许按名字复制。
+
+    造法与生产里那类行一致（cycle 56 的读法 A）：F 解析过一次 → 删掉 F（目录被收走，
+    缓存行留下，指针被 `#20` 摘掉）→ G 复用同一个 id，往同一个目录写**它自己的**图 →
+    把 F 那行的 `assets_dir` 手改回 `p<id>/assets` 并去掉指纹 = 一条没被修过的老行。
+
+    再传 F 的字节：只有重解析能拿到 F 自己的图；按名字复制拿到的是 G 的 ——
+    不报错、不缺图、不自愈。
+    """
+    from papershelf.server import converter as cv
+
+    plan_id = _prepare(client, settings, make_user, monkeypatch, cv)
+    f_bytes, g_bytes = _two_pdf_bytes(settings)
+
+    pid_f, pdf_f = _upload(client, plan_id, "F.pdf", f_bytes)
+    fp_f = _fp(pdf_f)                     # ⚠️ 必须在删除**之前**算：键取自 PDF 字节
+    doc_f = _run_paper(settings, pid_f, fp_f)
+    names = sorted(_referenced_names(doc_f))
+    assert names, "F 没有引用任何图片 —— 夹具没跑通"
+    f_digests = _asset_digests(settings.papers_dir / f"p{pid_f}" / "assets")
+    assert f_digests, "F 的资产目录是空的 —— 夹具没跑通"
+
+    assert client.delete(f"/api/papers/{pid_f}").status_code in (200, 204)
+    assert not (settings.papers_dir / f"p{pid_f}").exists()
+
+    pid_g, pdf_g = _upload(client, plan_id, "G.pdf", g_bytes)
+    assert pid_g == pid_f, (
+        f"id 没有被复用（{pid_g} != {pid_f}）—— 本缺陷需要复用才会发生，夹具不成立")
+    _run_paper(settings, pid_g, _fp(pdf_g))
+    g_digests = _asset_digests(settings.papers_dir / f"p{pid_g}" / "assets")
+    assert g_digests and any(f_digests[n] != g_digests[n] for n in names), \
+        "两份 PDF 的插图字节相同 —— 分不出是谁的图，夹具不成立"
+
+    meta = _age_row(settings, fp_f, pointer=f"p{pid_g}/assets", drop_digests=True)
+    assert not meta.get("asset_digests"), "行没有被做旧 —— 夹具没跑通"
+    assert meta.get("assets_dir") == f"p{pid_g}/assets"
+
+    calls = _spy_parse(monkeypatch, cv)
+    pid_d, _pdf_d = _upload(client, plan_id, "F-again.pdf", f_bytes)
+    _run_paper(settings, pid_d, fp_f)
+    d_digests = _asset_digests(settings.papers_dir / f"p{pid_d}" / "assets")
+
+    assert len(calls) == 1, (
+        f"一条无从核对的老行被当成了图片来源（parse_pdf 调用 {len(calls)} 次）—— "
+        f"它按名字从 p{pid_g}/assets 复制，而那个目录现在装的是 G 的图")
+    for name in names:
+        assert d_digests.get(name) == f_digests[name], (
+            f"{name} 不是 F 自己的图：这篇拿到 {d_digests.get(name)}，"
+            f"F 的是 {f_digests[name]}（G 在同名文件里是 {g_digests[name]}）")
+    r = client.get(f"/papers/{pid_d}/assets/{names[0]}")
+    assert r.status_code == 200, f"供图端点返回 {r.status_code}"
+    assert hashlib.sha256(r.content).hexdigest() == f_digests[names[0]], \
+        "供图端点给出的不是 F 自己的图 —— 用户看到的是别人的插图"
+    assert _cache_meta(settings, fp_f).get("asset_digests"), (
+        "这一篇重解析之后，行里仍然没有图片指纹 —— 下一次命中它的人还是无从核对")
+
+
+def test_a_tampered_source_asset_is_not_copied_into_another_paper(
+        client, settings, make_user, monkeypatch):
+    """⭐ 指纹要**真的比对**：源目录里的字节被换掉之后，不许再按名字复制。
+
+    与上一个用例分工：那个查"行里有没有指纹"，这个查"指纹有没有被拿来比" ——
+    只把指纹写进去、命中时却不比，这条是红的。
+    """
+    from papershelf.server import converter as cv
+
+    plan_id = _prepare(client, settings, make_user, monkeypatch, cv)
+    f_bytes, _g_bytes = _two_pdf_bytes(settings)
+
+    pid_f, pdf_f = _upload(client, plan_id, "F.pdf", f_bytes)
+    fp_f = _fp(pdf_f)
+    doc_f = _run_paper(settings, pid_f, fp_f)
+    names = sorted(_referenced_names(doc_f))
+    assert names, "F 没有引用任何图片 —— 夹具没跑通"
+    f_digests = _asset_digests(settings.papers_dir / f"p{pid_f}" / "assets")
+
+    # 源目录里的字节被换掉：指针对、名字对、内容不对（目录易主的另一种形状）
+    tampered = settings.papers_dir / f"p{pid_f}" / "assets"
+    for name in names:
+        (tampered / name).write_bytes(b"not the figure this document was parsed with")
+
+    calls = _spy_parse(monkeypatch, cv)
+    pid_b, _pdf_b = _upload(client, plan_id, "F-again.pdf", f_bytes)
+    _run_paper(settings, pid_b, fp_f)
+    b_digests = _asset_digests(settings.papers_dir / f"p{pid_b}" / "assets")
+
+    assert len(calls) == 1, (
+        f"源文件的字节已经和指纹不符，却还是按名字复制了（parse_pdf 调用 {len(calls)} 次）")
+    for name in names:
+        assert b_digests.get(name) == f_digests[name], (
+            f"{name} 拿到的是被换掉的那份字节，不是这篇文档解析时的那张图")
+
+
+def test_a_same_named_leftover_in_the_papers_own_directory_is_overwritten(
+        client, settings, make_user, monkeypatch):
+    """⭐ 本篇目录里已有的同名文件必须被**覆盖**，不能当成"已经有了"。
+
+    C 形状（cycle 56 的读法 C）：缓存行**干净**、指针**正确**、源是 F 自己的图，但这一篇
+    的 `p<id>/assets` 里已经躺着一张同名的 G 的图 —— 上一任 `p<id>` 的残骸
+    （删除时 `rmtree` 失败只记日志）。旧实现的 `if dst.is_file(): continue` 直接跳过它：
+    0 次解析、不报错、不缺图，页面显示的是 G 的插图。
+    """
+    from papershelf.server import converter as cv
+
+    plan_id = _prepare(client, settings, make_user, monkeypatch, cv)
+    f_bytes, g_bytes = _two_pdf_bytes(settings)
+
+    pid_f, pdf_f = _upload(client, plan_id, "F.pdf", f_bytes)
+    fp_f = _fp(pdf_f)
+    doc_f = _run_paper(settings, pid_f, fp_f)
+    names = sorted(_referenced_names(doc_f))
+    assert names, "F 没有引用任何图片 —— 夹具没跑通"
+    f_digests = _asset_digests(settings.papers_dir / f"p{pid_f}" / "assets")
+
+    pid_g, pdf_g = _upload(client, plan_id, "G.pdf", g_bytes)
+    _run_paper(settings, pid_g, _fp(pdf_g))
+    g_digests = _asset_digests(settings.papers_dir / f"p{pid_g}" / "assets")
+    assert any(f_digests[n] != g_digests[n] for n in names), \
+        "两份 PDF 的插图字节相同 —— 夹具不成立"
+
+    # 这一篇自己的目录里已经有残骸：同名、字节是 G 的
+    pid_d, _pdf_d = _upload(client, plan_id, "F-again.pdf", f_bytes)
+    leftover = settings.papers_dir / f"p{pid_d}" / "assets"
+    leftover.mkdir(parents=True, exist_ok=True)
+    for name in names:
+        (leftover / name).write_bytes((settings.papers_dir / f"p{pid_g}" / "assets" / name)
+                                      .read_bytes())
+
+    calls = _spy_parse(monkeypatch, cv)
+    _run_paper(settings, pid_d, fp_f)
+    d_digests = _asset_digests(leftover)
+
+    assert not calls, (
+        f"缓存行是干净的、字节也对得上，不该重解析（parse_pdf 调用 {len(calls)} 次）")
+    for name in names:
+        assert d_digests.get(name) == f_digests[name], (
+            f"{name} 用的还是残骸：这篇拿到 {d_digests.get(name)}，"
+            f"F 的是 {f_digests[name]}（残骸里是 G 的 {g_digests[name]}）—— "
+            "名字一样、字节不同，跳过复制就等于把上一任的图当成这一篇的")
+    r = client.get(f"/papers/{pid_d}/assets/{names[0]}")
+    assert r.status_code == 200
+    assert hashlib.sha256(r.content).hexdigest() == f_digests[names[0]], \
+        "供图端点把残骸发出去了"
+
+
+def test_a_verified_cache_hit_still_costs_no_parse(
+        client, settings, make_user, monkeypatch):
+    """对照组：指纹对得上就**不许**重解析 —— 否则这个修复等于取消缓存复用。"""
+    from papershelf.server import converter as cv
+
+    plan_id = _prepare(client, settings, make_user, monkeypatch, cv)
+    f_bytes, _g_bytes = _two_pdf_bytes(settings)
+
+    pid_f, pdf_f = _upload(client, plan_id, "F.pdf", f_bytes)
+    fp_f = _fp(pdf_f)
+    doc_f = _run_paper(settings, pid_f, fp_f)
+    names = sorted(_referenced_names(doc_f))
+    f_digests = _asset_digests(settings.papers_dir / f"p{pid_f}" / "assets")
+    assert names and f_digests, "夹具没跑通"
+
+    calls = _spy_parse(monkeypatch, cv)
+    pid_b, _pdf_b = _upload(client, plan_id, "F-again.pdf", f_bytes)
+    _run_paper(settings, pid_b, fp_f)
+    b_digests = _asset_digests(settings.papers_dir / f"p{pid_b}" / "assets")
+
+    assert not calls, (
+        f"指纹对得上却重解析了（parse_pdf 调用 {len(calls)} 次）—— 缓存复用被废掉了")
+    for name in names:
+        assert b_digests.get(name) == f_digests[name], f"{name} 的字节与第一篇不一致"
+    assert (settings.papers_dir / f"p{pid_b}" / "assets" / names[0]).is_file()

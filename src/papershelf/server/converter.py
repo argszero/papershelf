@@ -10,6 +10,7 @@ FastAPI 的 `BackgroundTasks` 在**响应后**跑，不阻塞请求。
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import shutil
@@ -566,15 +567,20 @@ def _run(conn: sqlite3.Connection, paper: dict, settings, fingerprint: str | Non
                 log.info("① 解析：命中解析缓存（fingerprint=%s…），跳过 PDF 解析",
                          fingerprint[:12])
             else:
-                # 源目录已被删（那一篇被删文献了）或旧缓存没记来源 ⇒ 为这一篇就地重解析。
-                # 代价只有这一篇的解析，不触发 ①c/翻译的重新计费之外的东西。
-                log.info("① 解析：命中解析缓存但图片资产不全 → 为这一篇就地重新解析")
+                # 三种情况都走这里：源目录已被删（那一篇被删了文献）、旧缓存没记来源、
+                # 或者源文件的字节与解析时记下的指纹不符（目录易主 / 遗留同名文件）。
+                # 代价只有这一篇的解析 —— 解析零 token，不会重新计费 ①c 与翻译。
+                log.info("① 解析：命中解析缓存但图片资产搬不齐或核对不上 → 为这一篇就地重新解析")
                 cached = None
         if not cached:
             t_parse = time.monotonic()
             doc = parse_pdf(pdf_path, assets_dir=assets_dir)
             # 记下"这份缓存文档的图片在哪个目录"：下一次别人命中它时要靠这条把资产搬过去
             doc.meta["assets_dir"] = f"p{paper['id']}/assets"
+            # 每张图**字节**的指纹：光记目录不够 —— 目录会易主（`p<id>` 的 id 会被复用），
+            # 而资产名只按页编号 ⇒ 同名不同字节的东西能被静默复制过去（见
+            # `_materialise_cached_assets`）。
+            doc.meta["asset_digests"] = _asset_digests(doc, assets_dir)
             # arXiv/上传的元数据提示：文件名常含标题，交给后续元数据抽取
             if paper.get("source_ref"):
                 doc.meta.setdefault("source_ref", paper["source_ref"])
@@ -732,6 +738,31 @@ def _run(conn: sqlite3.Connection, paper: dict, settings, fingerprint: str | Non
     return doc, spend.tokens
 
 
+def _referenced_asset_names(doc: Doc) -> set[str]:
+    """文档块引用到的资产文件名（`payload["src"] == "assets/<name>"`）。"""
+    return {
+        str((b.payload or {}).get("src") or "").split("/", 1)[1]
+        for b in doc.blocks
+        if str((b.payload or {}).get("src") or "").startswith("assets/")
+    }
+
+
+def _asset_digests(doc: Doc, assets_dir: Path) -> dict[str, str]:
+    """记下本篇引用到的每张图的**字节**指纹，随解析产物一起进 `doc_cache`。
+
+    成本：每张图约 82 B（名字 + 64 位十六进制），60 张图的论文 ≈ 4.9 KB。
+    ⚠️ 不进缓存键：`doc_cache` 的键是 `sha256("parse-v{N}" + PDF 字节)`，`doc_json` 的内容
+       不参与 ⇒ 加这个字段**不需要**动 `PARSE_VERSION`、也不需要迁移；老行没有它 ⇒
+       命中缓存时按"无从核对"处理（为这一篇重解析一次，解析零 token）。
+    """
+    out: dict[str, str] = {}
+    for name in sorted(_referenced_asset_names(doc)):
+        path = assets_dir / name
+        if path.is_file():
+            out[name] = hashlib.sha256(path.read_bytes()).hexdigest()
+    return out
+
+
 def _materialise_cached_assets(doc: Doc, settings, paper_id: int, assets_dir: Path) -> bool:
     """把**缓存文档引用的图片**搬进这一篇自己的目录；返回资产是否齐全。
 
@@ -748,34 +779,39 @@ def _materialise_cached_assets(doc: Doc, settings, paper_id: int, assets_dir: Pa
 
     多用户自托管里两个人各传同一篇论文、或同一个人把同一份 PDF 导进两个计划，都会撞上它。
 
-    ## 判据
+    ## 判据（缺一条就会把别人的图当成这一篇的）
 
     - 来源 = `doc.meta["assets_dir"]`（解析时记下的相对路径）。**旧缓存没有这条** ⇒ 搬不了，
       返回 False 让调用方就地为这一篇重新解析（顺带把这条写进新缓存）。
-    - 已经在本篇目录里的文件不覆盖（幂等：重跑不会再复制一遍）。
-    - 任何一张图找不到源文件就返回 False —— 宁可重解析，也不留一张裂图。
+    - **字节要对得上**：源文件的 sha256 必须等于解析时记下的 `doc.meta["asset_digests"]`。
+      目录会易主（`p<id>` 的 id 会被复用），资产名又只按页编号 ⇒ 只按名字复制就会把
+      **别人的插图**当成本篇的：不报错、不缺图、也不自愈。没有指纹的老行同样返回 False。
+    - **本篇目录里已存在的同名文件必须被覆盖**：那可能是上一任 `p<id>` 留下的残骸
+      （删除时 `rmtree` 失败只记日志）。跳过它 = 把残骸当成这一篇的图。
+    - 先核对、再复制：核对不过时不留半套文件。
 
     转正副本（v12 旋转页，`meta["normalized_pdf"]`）一并搬：它的内容与源 PDF 同源、
     但**路径**也写死在缓存里，不搬的话它指向别的篇的目录，那篇被删就没人读得到了。
     """
-    wanted = {
-        str((b.payload or {}).get("src") or "").split("/", 1)[1]
-        for b in doc.blocks
-        if str((b.payload or {}).get("src") or "").startswith("assets/")
-    }
+    wanted = _referenced_asset_names(doc)
 
     src_rel = str(doc.meta.get("assets_dir") or "")
     src_dir = (settings.papers_dir / src_rel) if src_rel else None
+    digests = doc.meta.get("asset_digests") or {}
 
-    assets_dir.mkdir(parents=True, exist_ok=True)
+    # ── ① 先核对：源在不在、字节是不是当初解析出来的那一份 ──
     for name in sorted(wanted):
-        dst = assets_dir / name
-        if dst.is_file():
-            continue                       # 已经有了（幂等）
         src = src_dir / name if src_dir is not None else None
         if src is None or not src.is_file():
             return False                   # 搬不齐：交给调用方重解析
-        shutil.copy2(src, dst)
+        expected = digests.get(name)
+        if not expected or hashlib.sha256(src.read_bytes()).hexdigest() != expected:
+            return False                   # 核对不上（老行没有指纹 / 目录已易主）
+
+    # ── ② 再复制：**不跳过**本篇目录里已存在的同名文件（它可能属于上一任 p<id>）──
+    assets_dir.mkdir(parents=True, exist_ok=True)
+    for name in sorted(wanted):
+        shutil.copy2(src_dir / name, assets_dir / name)
 
     own_dir = settings.papers_dir / f"p{paper_id}"
     norm = doc.meta.get("normalized_pdf")
