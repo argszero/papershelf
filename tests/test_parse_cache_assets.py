@@ -26,6 +26,11 @@
    源文件必须对得上（老行没有这个字段 ⇒ 重解析），并且本篇目录里的同名文件**必须被覆盖**。
    只按目录名（老行的指针）、只按"文件在不在"（`if dst.is_file(): continue`）判断，
    都会把别人的图当成这一篇的：不报错、不缺图、不自愈。
+7. **整页转正副本 `normalized.pdf` 走同一个道理**（`meta["normalized_pdf_digest"]`）：
+   它也是"命中缓存时被搬进本篇目录"的产物，却一度**一个指纹都没有** ⇒ 本篇目录里的
+   同名残骸（甚至源已不在时）会被直接当成这一篇的副本，`converter` 随后把它当
+   `proofread_pdf` 交给 ①c ⇒ 页图是从**另一份 PDF** 渲染的，`set_table`/`merge_block`
+   会打在错的页上。
 """
 
 from __future__ import annotations
@@ -678,3 +683,292 @@ def test_a_verified_cache_hit_still_costs_no_parse(
     for name in names:
         assert b_digests.get(name) == f_digests[name], f"{name} 的字节与第一篇不一致"
     assert (settings.papers_dir / f"p{pid_b}" / "assets" / names[0]).is_file()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 转正副本（`normalized.pdf`）也必须有指纹 —— 它是被同一个函数采用的另一件产物
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _make_rotated_pdf(path: Path, rgb: tuple[int, int, int] = (200, 60, 60)) -> bytes:
+    """一页带图 + 一页**整页旋转 90°** 的表格 ⇒ 解析既产出被引用的图片，也产出转正副本。
+
+    合成手法照抄 `tests/test_rotated_pages.py`（先在横版页上画正着的表，再
+    `show_pdf_page(rotate=90)` 贴进竖版页）—— 判据看的是 span 级 `dir`，不是 `/Rotate`。
+    """
+    import fitz
+
+    W, H = 595.276, 790.866
+    doc = fitz.open()
+    page = doc.new_page(width=W, height=H)
+    page.insert_image(fitz.Rect(72, 72, 172, 172), stream=_png(rgb=rgb))
+    page.insert_text((72, 220), "The figure above is the whole point of this page.")
+
+    lay = fitz.open()
+    land = lay.new_page(width=H, height=W)
+    land.insert_text((60, 40), "1068  The International Journal of Advanced Manufacturing Technology",
+                     fontsize=9)
+    land.insert_text((60, 70), "Table 2  Research on single and multi-sensor", fontsize=9)
+    rows = [
+        ["Sensor", "Sensor type", "ML", "Ref"],
+        ["Single sensor", "Spectrum sensors", "SVM, DT, KNN, LDA", "[ 92 ]"],
+        ["Single sensor", "CT", "DT, KNN, SVM, LDA, QDA", "[ 100 ]"],
+        ["Multi-sensor", "Thermocouples, accelerometers", "RF, SVR, SVM, CART", "[ 98 ]"],
+    ]
+    col_w = [110.0, 200.0, 190.0, 50.0]
+    row_h, x0, y0 = 26.0, 60.0, 90.0
+    for r in range(len(rows) + 1):
+        y = y0 + r * row_h
+        land.draw_line(fitz.Point(x0, y), fitz.Point(x0 + sum(col_w), y), width=0.8)
+    for r, row in enumerate(rows):
+        x = x0
+        for c, cell in enumerate(row):
+            land.insert_text((x + 4, y0 + r * row_h + row_h - 9), cell, fontsize=8)
+            x += col_w[c]
+    p2 = doc.new_page(width=W, height=H)
+    p2.show_pdf_page(p2.rect, lay, 0, rotate=90)
+
+    doc.save(str(path))
+    doc.close()
+    lay.close()
+    return path.read_bytes()
+
+
+def _rotated_bytes(settings, *, rgb: tuple[int, int, int] = (200, 60, 60)) -> bytes:
+    src = settings.data_dir / f"seed-rot-{rgb[0]}.pdf"
+    src.parent.mkdir(parents=True, exist_ok=True)
+    return _make_rotated_pdf(src, rgb=rgb)
+
+
+def _normalised_copy(settings, pid: int) -> Path:
+    """这一篇的转正副本路径（`papers_dir/p<id>/normalized.pdf`）。"""
+    return settings.papers_dir / f"p{pid}" / "normalized.pdf"
+
+
+def _parsed_source(settings, client, plan_id: int, cv, monkeypatch, name: str):
+    """传一份带旋转页的 PDF、真解析一次，返回 (pid, fingerprint, 副本的 sha256, PDF 字节)。"""
+    f_bytes = _rotated_bytes(settings)
+    pid, pdf = _upload(client, plan_id, name, f_bytes)
+    fp = _fp(pdf)
+    doc = _run_paper(settings, pid, fp)
+    assert doc.meta.get("rotated_pages") == [2], (
+        f"夹具没跑通：这份 PDF 没被判出旋转页（rotated_pages={doc.meta.get('rotated_pages')!r}）")
+    copy = _normalised_copy(settings, pid)
+    assert copy.is_file(), "解析没有产出转正副本 —— 夹具没跑通"
+    good = hashlib.sha256(copy.read_bytes()).hexdigest()
+    assert _cache_meta(settings, fp).get("normalized_pdf_digest") == good, (
+        "缓存行没有记下转正副本的字节指纹 —— 命中它的下一篇无从核对，只能看"
+        "「本篇目录里有没有同名文件」")
+    return pid, fp, good, f_bytes
+
+
+def _drop_normalised_digest(settings, fingerprint: str) -> None:
+    """把缓存行做成"老版本写下的样子"：没有 `normalized_pdf_digest`（指针对、其余齐全）。"""
+    from papershelf.server.db import connect
+
+    conn = connect(settings)
+    try:
+        row = conn.execute("SELECT doc_json FROM doc_cache WHERE fingerprint=?",
+                           (fingerprint,)).fetchone()
+        assert row is not None, "没有可做旧的缓存行 —— 夹具没跑通"
+        doc = json.loads(row["doc_json"])
+        doc["meta"].pop("normalized_pdf_digest", None)
+        conn.execute("UPDATE doc_cache SET doc_json=? WHERE fingerprint=?",
+                     (json.dumps(doc), fingerprint))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def test_a_stale_normalised_copy_is_overwritten_by_the_verified_source(
+        client, settings, make_user, monkeypatch):
+    """⭐ 源副本**在、字节也对**时，本篇目录里那份同名残骸必须被**覆盖**（cycle 58 的坏那一半）。
+
+    `_materialise_cached_assets` 早先把 `normalized.pdf` 按"文件在不在"决定要不要复制
+    （`if src.is_file() and not dst.is_file()`，然后 `if dst.is_file(): adopt`），于是
+    `p<id>/normalized.pdf` 里躺着上一任 `p<id>` 的副本时，命中的这一篇把
+    `meta["normalized_pdf"]` 指向**别人的字节** —— 不报错、不重解析，而且正确的那份
+    就在手边。`converter` 随后把它当 `proofread_pdf` 交给 ①c：页图从另一份 PDF 渲染，
+    `set_table`/`merge_block` 打在错的页上。
+    """
+    from papershelf.server import converter as cv
+
+    plan_id = _prepare(client, settings, make_user, monkeypatch, cv)
+    pid_f, fp_f, good, f_bytes = _parsed_source(settings, client, plan_id, cv, monkeypatch, "F.pdf")
+    assert pid_f
+
+    pid_b, _pdf_b = _upload(client, plan_id, "F-again.pdf", f_bytes)
+    dst = _normalised_copy(settings, pid_b)
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    dst.write_bytes(b"%PDF-1.4 a previous occupant's page images")
+    foreign = hashlib.sha256(dst.read_bytes()).hexdigest()
+    assert foreign != good
+
+    calls = _spy_parse(monkeypatch, cv)
+    doc_b = _run_paper(settings, pid_b, fp_f)
+
+    assert not calls, (
+        f"源副本在、字节也对得上，不该重解析（parse_pdf 调用 {len(calls)} 次）")
+    assert doc_b.meta.get("normalized_pdf") == str(dst), (
+        f"副本没指向这一篇自己的目录（meta={doc_b.meta.get('normalized_pdf')!r}）—— "
+        "①c 会继续读上一篇的副本")
+    got = hashlib.sha256(dst.read_bytes()).hexdigest()
+    assert got == good, (
+        f"这一篇的转正副本是**别人的字节**（{got[:12]} 而不是 {good[:12]}）—— 按"
+        "「目标里有没有同名文件」采用的是上一任 p<id> 的残骸，而正确的那份就在手边；"
+        "①c 会拿它渲染这一篇的页图")
+
+
+def test_a_normalised_copy_whose_recorded_source_is_gone_is_reparsed(
+        client, settings, make_user, monkeypatch):
+    """⭐ 记录的源副本已经不在（只剩本篇的残骸）⇒ **重解析**，不许"目标里有文件"就算数。"""
+    from papershelf.server import converter as cv
+
+    plan_id = _prepare(client, settings, make_user, monkeypatch, cv)
+    pid_f, fp_f, good, f_bytes = _parsed_source(settings, client, plan_id, cv, monkeypatch, "F.pdf")
+
+    # 只摘掉源副本：图片资产照旧（否则连资产那一关都过不去，测不到这一条）
+    _normalised_copy(settings, pid_f).unlink()
+    assert not _normalised_copy(settings, pid_f).exists()
+
+    pid_b, _pdf_b = _upload(client, plan_id, "F-again.pdf", f_bytes)
+    dst = _normalised_copy(settings, pid_b)
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    dst.write_bytes(b"%PDF-1.4 a previous occupant's page images")
+    foreign = hashlib.sha256(dst.read_bytes()).hexdigest()
+    assert foreign != good
+
+    calls = _spy_parse(monkeypatch, cv)
+    doc_b = _run_paper(settings, pid_b, fp_f)
+
+    assert len(calls) == 1, (
+        f"记录在案的源副本已经不在了，却没有为这一篇重新解析（parse_pdf 调用 {len(calls)} 次）"
+        "—— 它把本篇目录里的残骸当成了副本来源，①c 看到的是另一份 PDF 的页")
+    got = hashlib.sha256(dst.read_bytes()).hexdigest()
+    assert got != foreign, (
+        "重解析之后本篇目录里仍然是上一任 p<id> 的那份残骸 —— ①c 读到的还是它的页")
+    assert doc_b.meta.get("normalized_pdf_digest") == got, (
+        "这一篇最终拿到的副本不是**它自己那次解析**签下的那一份"
+        f"（meta 记 {str(doc_b.meta.get('normalized_pdf_digest'))[:12]}，盘上是 {got[:12]}）")
+
+
+def test_a_tampered_normalised_source_copy_is_not_adopted(
+        client, settings, make_user, monkeypatch):
+    """⭐ 指纹要**真的比对**：源副本还在但字节被换掉之后，不许再采用它。
+
+    与上一个用例分工：那个查"源在不在"，这个查"字节对不对" —— 只判存在、不判字节，
+    这条是绿的。
+    """
+    from papershelf.server import converter as cv
+
+    plan_id = _prepare(client, settings, make_user, monkeypatch, cv)
+    pid_f, fp_f, good, f_bytes = _parsed_source(settings, client, plan_id, cv, monkeypatch, "F.pdf")
+
+    tampered = b"%PDF-1.4 not what was parsed"
+    _normalised_copy(settings, pid_f).write_bytes(tampered)
+
+    calls = _spy_parse(monkeypatch, cv)
+    pid_b, _pdf_b = _upload(client, plan_id, "F-again.pdf", f_bytes)
+    doc_b = _run_paper(settings, pid_b, fp_f)
+
+    assert len(calls) == 1, (
+        f"源副本的字节已经和指纹不符，却还是被采用了（parse_pdf 调用 {len(calls)} 次）")
+    dst = _normalised_copy(settings, pid_b)
+    got = hashlib.sha256(dst.read_bytes()).hexdigest()
+    assert got != hashlib.sha256(tampered).hexdigest(), (
+        "这一篇拿到的是**被换掉的那份字节** —— 判据只看了「文件在不在」，没比字节")
+    assert doc_b.meta.get("normalized_pdf_digest") == got, (
+        "这一篇最终拿到的副本不是**它自己那次解析**签下的那一份")
+
+
+def test_a_row_without_a_normalised_copy_digest_reparses(
+        client, settings, make_user, monkeypatch):
+    """⭐ 老缓存行（没有 `normalized_pdf_digest`）无从核对 ⇒ **重解析**，不许按存在与否采用。
+
+    与 `asset_digests` 的老行同一条规则：指纹不进缓存键，所以老行不会被迁移 ——
+    代价是这些行各重解析一次（解析零 token），换来的是"采用的东西都签过名"。
+    """
+    from papershelf.server import converter as cv
+
+    plan_id = _prepare(client, settings, make_user, monkeypatch, cv)
+    pid_f, fp_f, good, f_bytes = _parsed_source(settings, client, plan_id, cv, monkeypatch, "F.pdf")
+    _drop_normalised_digest(settings, fp_f)
+    assert not _cache_meta(settings, fp_f).get("normalized_pdf_digest"), "行没有被做旧"
+
+    pid_b, _pdf_b = _upload(client, plan_id, "F-again.pdf", f_bytes)
+    dst = _normalised_copy(settings, pid_b)
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    dst.write_bytes(b"%PDF-1.4 a previous occupant's page images")
+    foreign = hashlib.sha256(dst.read_bytes()).hexdigest()
+
+    calls = _spy_parse(monkeypatch, cv)
+    doc_b = _run_paper(settings, pid_b, fp_f)
+
+    assert len(calls) == 1, (
+        f"一条没有转正副本指纹的老行被当成了副本来源（parse_pdf 调用 {len(calls)} 次）—— "
+        "它采用的就是本篇目录里那份、属于上一任 p<id> 的文件")
+    got = hashlib.sha256(dst.read_bytes()).hexdigest()
+    assert got != foreign, "老行采用之后，盘上仍是上一任 p<id> 的残骸"
+    assert doc_b.meta.get("normalized_pdf_digest") == got, (
+        "这一篇最终拿到的副本不是**它自己那次解析**签下的那一份")
+
+
+def test_every_path_a_cache_hit_can_adopt_is_signed(
+        client, settings, make_user, monkeypatch):
+    """⭐ 覆盖面：缓存命中可能从盘上采用的**每一件产物**都必须是签过名的。
+
+    读法（本周期实测，不是转述）：`doc.meta` 里带路径的条目只有两条 ——
+    `assets_dir`（**相对**指针，`_materialise_cached_assets` 末尾一律改写成 `p<id>/assets`，
+    所以它不会停在别人的目录上）与 `normalized_pdf`（绝对路径 —— 本次给它补了
+    `normalized_pdf_digest`）。其余条目是标题 / 计数 / 校对统计，不指向磁盘。
+
+    这条护栏钉的是**覆盖面**而不是某一条路径：以后再有"命中缓存时从盘上拿一件东西进 meta"
+    的产物，它会先红一次，而不是让下一个洞静默长出来。
+    """
+    from papershelf.server import converter as cv
+
+    plan_id = _prepare(client, settings, make_user, monkeypatch, cv)
+    pid_f, _fp_f, _good, _bytes = _parsed_source(
+        settings, client, plan_id, cv, monkeypatch, "F.pdf")
+    doc = _run_paper(settings, pid_f, _fp_f)
+
+    paths = {k: v for k, v in doc.meta.items()
+             if isinstance(v, str) and v.startswith("/")}
+    assert set(paths) == {"normalized_pdf"}, (
+        f"`meta` 里带绝对路径的条目是 {sorted(paths)} —— 每多一条就是「命中缓存时会从盘上"
+        "采用的一件产物」，它必须有指纹（或干脆不该进 meta）")
+    copy = Path(paths["normalized_pdf"])
+    assert copy.is_file(), "meta 指着一个不存在的副本 —— 夹具没跑通"
+    assert doc.meta.get("normalized_pdf_digest") == \
+        hashlib.sha256(copy.read_bytes()).hexdigest(), (
+        "转正副本进了 meta，却没有与它一致的字节指纹 —— 命中缓存时只能靠"
+        "「目标里有没有同名文件」决定要不要采用别人的副本")
+    assert doc.meta.get("assets_dir") == f"p{pid_f}/assets", (
+        f"资产指针指向别处（{doc.meta.get('assets_dir')!r}）—— 下一篇命中缓存会去那里搬文件")
+
+
+def test_reconverting_the_same_paper_does_not_copy_a_file_onto_itself(
+        client, settings, make_user, monkeypatch):
+    """⭐ 同一篇被**再次转换**（命中缓存，而来源就是它自己的目录）不许因此崩掉。
+
+    "已存在的同名文件一律覆盖"是 2026-11-12 那条修复的要害（跳过它 = 把上一任 `p<id>` 的
+    残骸当成本篇的图），但它缺了另外半个条件：**来源目录就是本篇目录**时（用户点「重试」、
+    或同一篇再排一次队）`shutil.copy2(src, src)` 抛 `SameFileError` ⇒ 整篇转换失败。
+    判据 = 字节已经在核对那一关过过、且这是同一个文件 ⇒ 不复制。
+
+    这条在"一律覆盖"而没有 samefile 条件时红。
+    """
+    from papershelf.server import converter as cv
+
+    plan_id = _prepare(client, settings, make_user, monkeypatch, cv)
+    pid_f, fp_f, good, _bytes = _parsed_source(
+        settings, client, plan_id, cv, monkeypatch, "F.pdf")
+
+    calls = _spy_parse(monkeypatch, cv)
+    doc = _run_paper(settings, pid_f, fp_f)      # 第二次转换：命中缓存，来源就是它自己
+
+    assert not calls, (
+        f"同一篇的第二次转换本该命中缓存（parse_pdf 调用 {len(calls)} 次）")
+    assert doc.meta.get("assets_dir") == f"p{pid_f}/assets"
+    assert doc.meta.get("normalized_pdf") == str(_normalised_copy(settings, pid_f))
+    got = hashlib.sha256(_normalised_copy(settings, pid_f).read_bytes()).hexdigest()
+    assert got == good, "再转换一次把这一篇自己的转正副本改掉了"

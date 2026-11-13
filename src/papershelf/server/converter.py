@@ -581,6 +581,14 @@ def _run(conn: sqlite3.Connection, paper: dict, settings, fingerprint: str | Non
             # 而资产名只按页编号 ⇒ 同名不同字节的东西能被静默复制过去（见
             # `_materialise_cached_assets`）。
             doc.meta["asset_digests"] = _asset_digests(doc, assets_dir)
+            # 整页转正副本（v12，`meta["normalized_pdf"]`）**也要签名**：它同样是命中缓存时
+            # 被"搬进本篇目录"这一步采用的产物，内容同样是源 PDF 的一个纯函数（指纹已把它
+            # 钉住），却在这之前一个指纹都没有 ⇒ 命中缓存只能看"文件在不在"就采用它。
+            # 与 `asset_digests` 一样**不进缓存键**：不涨 `PARSE_VERSION`、不迁移；老行
+            # 没有这个字段 ⇒ 命中时按"无从核对"处理（为这一篇重解析一次，解析零 token）。
+            norm_digest = _normalized_pdf_digest(doc)
+            if norm_digest:
+                doc.meta["normalized_pdf_digest"] = norm_digest
             # arXiv/上传的元数据提示：文件名常含标题，交给后续元数据抽取
             if paper.get("source_ref"):
                 doc.meta.setdefault("source_ref", paper["source_ref"])
@@ -763,6 +771,24 @@ def _asset_digests(doc: Doc, assets_dir: Path) -> dict[str, str]:
     return out
 
 
+def _file_digest(path: str | Path | None) -> str:
+    """单个文件的 sha256；没给路径或文件不在 ⇒ 空串（调用方据此判"无从核对"）。"""
+    if not path:
+        return ""
+    p = Path(str(path))
+    return hashlib.sha256(p.read_bytes()).hexdigest() if p.is_file() else ""
+
+
+def _normalized_pdf_digest(doc: Doc) -> str:
+    """整页转正副本的字节指纹（没有副本 ⇒ 空串），随解析产物一起进 `doc_cache`。
+
+    为什么它**也必须**有指纹：命中缓存时会把它"搬进本篇目录"（见
+    `_materialise_cached_assets`），而它的内容与源 PDF 同源 —— 判据不落在字节上，
+    就只剩"目标目录里有没有同名文件"，那足以把**上一任 `p<id>` 的副本**当成本篇的。
+    """
+    return _file_digest(doc.meta.get("normalized_pdf"))
+
+
 def _materialise_cached_assets(doc: Doc, settings, paper_id: int, assets_dir: Path) -> bool:
     """把**缓存文档引用的图片**搬进这一篇自己的目录；返回资产是否齐全。
 
@@ -792,6 +818,9 @@ def _materialise_cached_assets(doc: Doc, settings, paper_id: int, assets_dir: Pa
 
     转正副本（v12 旋转页，`meta["normalized_pdf"]`）一并搬：它的内容与源 PDF 同源、
     但**路径**也写死在缓存里，不搬的话它指向别的篇的目录，那篇被删就没人读得到了。
+    **它同样要过字节核对**（`meta["normalized_pdf_digest"]`）：同一条理由 —— 目标
+    `p<paper_id>/normalized.pdf` 也可能躺着上一任的副本，只问"文件在不在"就采用，
+    等于拿**别人的 PDF** 去渲染这一篇的页图（①c 据此出 `set_table`/`merge_block`）。
     """
     wanted = _referenced_asset_names(doc)
 
@@ -808,21 +837,34 @@ def _materialise_cached_assets(doc: Doc, settings, paper_id: int, assets_dir: Pa
         if not expected or hashlib.sha256(src.read_bytes()).hexdigest() != expected:
             return False                   # 核对不上（老行没有指纹 / 目录已易主）
 
+    # 转正副本按同一套判据核对，且**同在这一步**：核对不过就不许留下半套文件
+    norm = str(doc.meta.get("normalized_pdf") or "")
+    if norm:
+        expected_norm = str(doc.meta.get("normalized_pdf_digest") or "")
+        if not expected_norm or _file_digest(norm) != expected_norm:
+            # 没签名（老行）、源已被删、或字节与解析时不符 —— 都不能采用
+            return False
+
     # ── ② 再复制：**不跳过**本篇目录里已存在的同名文件（它可能属于上一任 p<id>）──
+    # ⚠️ 但"来源目录就是本篇目录"时（同一篇被再次转换：点「重试」、或再排一次队）不能复制 ——
+    #    字节刚在 ① 核对过，而 `shutil.copy2(src, src)` 抛 `SameFileError`，整篇直接失败。
+    #    这是"一律覆盖"（上一版是"已有就跳过"，那会把残骸当成本篇的图）必须配的那半个条件。
     assets_dir.mkdir(parents=True, exist_ok=True)
     for name in sorted(wanted):
-        shutil.copy2(src_dir / name, assets_dir / name)
+        src, dst = src_dir / name, assets_dir / name
+        if dst.is_file() and src.samefile(dst):
+            continue                       # 就是这一份：已核对过字节，无需动
+        shutil.copy2(src, dst)
 
-    own_dir = settings.papers_dir / f"p{paper_id}"
-    norm = doc.meta.get("normalized_pdf")
     if norm:
-        src_norm = Path(str(norm))
-        dst_norm = own_dir / "normalized.pdf"
-        if src_norm.is_file() and not dst_norm.is_file():
-            dst_norm.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(src_norm, dst_norm)
-        if dst_norm.is_file():
-            doc.meta["normalized_pdf"] = str(dst_norm)
+        # 字节已在 ① 核对过 ⇒ **无条件覆盖**。本篇目录里那份可能是上一任 `p<id>` 的残骸
+        # （删除时 `rmtree` 失败只记日志），跳过它 = 把别人的副本当成这一篇的。
+        src_norm = Path(norm)
+        dst_norm = settings.papers_dir / f"p{paper_id}" / "normalized.pdf"
+        dst_norm.parent.mkdir(parents=True, exist_ok=True)
+        if not (dst_norm.is_file() and src_norm.samefile(dst_norm)):
+            shutil.copy2(src_norm, dst_norm)   # 同一个文件不复制：`copy2` 会抛 SameFileError
+        doc.meta["normalized_pdf"] = str(dst_norm)
 
     # 指向"现在真的放着这些文件"的目录 —— 下一次别人命中这份缓存时靠它搬
     doc.meta["assets_dir"] = f"p{paper_id}/assets"
