@@ -33,6 +33,12 @@
   不是靠小心，而是**结构上不可能变**（`tests/test_assets_rebuild.py` 逐字段钉住）。
 - **零 LLM 调用**：插图是磁盘文件，不是译文 ⇒ `tokens_used` 一分不涨。
 - **不覆盖已有文件**：只补缺的，`p<id>/assets` 里已在的图一律原样不动。
+- **记录在案的来源也要按字节核对**（`meta["asset_digests"]`，与命中解析缓存时**同一套**判据）：
+  资产名只按页编号（`p1_img1.png`），而目录会易主（`p<id>` 的 id 会被复用）⇒ 只按名字从
+  记录在案的目录复制，就会把**别人的插图**当成本篇的悄悄补上去：不报错、不缺图、也不自愈。
+  cycle 62 实测（未修前）：来源目录里是外来字节 `6b742b49…`、行里记着真指纹 `8c6806d8…`，
+  返回的仍是 `ok=True / repaired=1 / source="recorded"` —— 落盘的就是外来那一份。
+  没有指纹的老行同样**不搬**（"无从核对"不等于"可以搬"）。
 
 ## 为什么必须先证明身份（来源目录没了的这一支）
 
@@ -52,6 +58,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import shutil
 import sqlite3
@@ -123,12 +130,17 @@ def rebuild_paper_assets(conn: sqlite3.Connection, paper_id: int, settings,
     # ── ① 记录在案的来源目录（解析时写进 `meta["assets_dir"]` 的那一个）──
     src_rel = str((doc.meta or {}).get("assets_dir") or "")
     src_dir = (settings.papers_dir / src_rel) if src_rel else None
+    digests = dict((doc.meta or {}).get("asset_digests") or {})
     repaired: list[str] = []
+    refused: list[str] = []
     if src_dir is not None and src_dir.is_dir() \
             and src_dir.resolve() != assets_dir.resolve():
-        repaired = _copy_into(src_dir, assets_dir, missing)
+        repaired, refused = _copy_into(src_dir, assets_dir, missing, expected=digests)
         if repaired:
             log_fn("来源目录 %s 补回 %d 张：%s", src_rel, len(repaired), ", ".join(repaired))
+        if refused:
+            log_fn("来源目录 %s 里有 %d 张按字节核对不通过，没有搬：%s",
+                   src_rel, len(refused), ", ".join(refused))
 
     still = [n for n in missing if not (assets_dir / n).is_file()]
     if not still:
@@ -139,8 +151,9 @@ def rebuild_paper_assets(conn: sqlite3.Connection, paper_id: int, settings,
     pdf_path = Path(str(paper.get("pdf_path") or ""))
     if not pdf_path.is_file():
         return {"ok": False, "referenced": len(wanted), "repaired": len(repaired),
-                "reason": ("记录在案的图片来源目录已经不在了，这篇也没有 PDF 原件可以重新生成"
-                           f"（仍缺 {', '.join(still)}）：{_REEXTRACT_HINT}")}
+                "reason": (f"记录在案的来源没能补齐这些图（仍缺 {', '.join(still)}）"
+                           f"{_refusal_note(refused, digests)}，"
+                           f"这篇也没有 PDF 原件可以重新生成：{_REEXTRACT_HINT}")}
 
     # 解析进**这篇自己的目录**下的临时子目录：`parse_pdf` 会把转正副本写到
     # `assets_dir.parent/normalized.pdf`，所以父目录也一并收在 scratch 里，
@@ -153,9 +166,12 @@ def rebuild_paper_assets(conn: sqlite3.Connection, paper_id: int, settings,
         if not _same_layout(fresh, doc):
             return {"ok": False, "referenced": len(wanted), "repaired": len(repaired),
                     "reason": ("重新解析出的块与库里这份产物对不上（块 id 或原文不同），"
-                               f"不敢按文件名把图安上去（仍缺 {', '.join(still)}）："
-                               f"{_REEXTRACT_HINT}")}
-        extra = _copy_into(scratch / "assets", assets_dir, still)
+                               f"不敢按文件名把图安上去（仍缺 {', '.join(still)}）"
+                               f"{_refusal_note(refused, digests)}：{_REEXTRACT_HINT}")}
+        # 这一支**不**按指纹核对：scratch 是**这篇自己的 PDF** 重新解析出来的产物，身份
+        # 已由 `_same_layout` 逐块证明（块 id + 原文）⇒ 里面的图就是这一篇的。指纹记的是
+        # 上一次解析的字节，拿它拦这里只会把"重新解析能修好"的那条路也堵掉。
+        extra, _refused_again = _copy_into(scratch / "assets", assets_dir, still)
         repaired += extra
         still = [n for n in still if not (assets_dir / n).is_file()]
     finally:
@@ -163,25 +179,49 @@ def rebuild_paper_assets(conn: sqlite3.Connection, paper_id: int, settings,
 
     if still:
         return {"ok": False, "referenced": len(wanted), "repaired": len(repaired),
-                "reason": (f"重新解析出的产物里也没有这些图（{', '.join(still)}），"
-                           f"无法修复：{_REEXTRACT_HINT}")}
+                "reason": (f"重新解析出的产物里也没有这些图（{', '.join(still)}）"
+                           f"{_refusal_note(refused, digests)}，无法修复：{_REEXTRACT_HINT}")}
     return {"ok": True, "changed": True, "referenced": len(wanted),
             "repaired": len(repaired), "source": "reparse"}
 
 
-def _copy_into(src_dir: Path, assets_dir: Path, names: list[str]) -> list[str]:
-    """把 `names` 里能在 `src_dir` 找到的文件复制进 `assets_dir`；返回真的复制了的。
+def _refusal_note(refused: list[str], digests: dict[str, str]) -> str:
+    """为什么这些图没从记录在案的来源搬过来 —— **点名文件与原因**，给用户看。"""
+    if not refused:
+        return ""
+    parts = []
+    for name in refused:
+        parts.append(f"{name}（字节与该篇解析时记下的指纹不符）" if digests.get(name)
+                     else f"{name}（这条产物没有记下它的指纹，无从核对）")
+    return "，且记录在案的来源里 " + "、".join(parts) + " 按字节核对后没有搬"
+
+
+def _copy_into(src_dir: Path, assets_dir: Path, names: list[str],
+               expected: dict[str, str] | None = None) -> tuple[list[str], list[str]]:
+    """把 `names` 里能在 `src_dir` 找到的文件复制进 `assets_dir`。
+
+    返回 `(真的复制了的, 按字节核对后拒收的)`。
 
     - **不覆盖**目标已有的文件（幂等：第二次调用什么都不做）；
-    - 源缺哪个就跳过哪个（由调用方决定"缺了算什么"）。
+    - 源缺哪个就跳过哪个（由调用方决定"缺了算什么"）；
+    - 给了 `expected`（资产名 → sha256）⇒ 源文件字节对不上、或**根本没有指纹**的，一律
+      **不复制**，进"拒收"那一列。资产名只按页编号、目录会易主 ⇒ 只按名字复制，等于把
+      别人的图安到这一篇上（见上面不变量第 4 条）。拒收的名字仍是"缺"，调用方会把它交给
+      重新解析那一支，而 `repaired` 只数真的落了地的。
     """
     done: list[str] = []
+    refused: list[str] = []
     assets_dir.mkdir(parents=True, exist_ok=True)
     for name in names:
         src = src_dir / name
         dst = assets_dir / name
         if not src.is_file() or dst.is_file():
             continue
+        if expected is not None:
+            want = expected.get(name)
+            if not want or hashlib.sha256(src.read_bytes()).hexdigest() != want:
+                refused.append(name)
+                continue
         shutil.copy2(src, dst)
         done.append(name)
-    return done
+    return done, refused
