@@ -38,6 +38,14 @@ ROOT = Path(__file__).resolve().parents[1]
 # 一张最小 PNG（内容不重要：这里量的是"文件在不在、端点回不回 200"）
 _PNG = b"\x89PNG\r\n\x1a\n" + b"\x00" * 64
 
+# 别人的图：与 `_PNG` 字节不同，但文件名一模一样（资产名只按页编号 ⇒ 必然重名）
+_FOREIGN = b"\x89PNG\r\n\x1a\n" + b"\xee" * 64
+
+
+def _sha(data: bytes) -> str:
+    import hashlib
+    return hashlib.sha256(data).hexdigest()
+
 
 # ── 夹具 ────────────────────────────────────────────────────────────────
 def _done_paper(client, make_user, *, conv_state: str = "done") -> int:
@@ -187,7 +195,9 @@ def test_rebuild_assets_restores_a_missing_figure_and_keeps_annotations(
     pid = _done_paper(client, make_user)
     sibling = 4242                              # 「同源那一篇」：只借它的目录
     _put_source_asset(settings, f"p{sibling}/assets", "p1_img1.png")
-    _store_doc(pid, meta={"assets_dir": f"p{sibling}/assets"}, figures=["p1_img1.png"])
+    _store_doc(pid, meta={"assets_dir": f"p{sibling}/assets",
+                          "asset_digests": {"p1_img1.png": _sha(_PNG)}},
+               figures=["p1_img1.png"])
 
     url = _asset_url(pid, "p1_img1.png")
     assert client.get(url).status_code == 404, "前提不成立：图还在，就没有这个病灶"
@@ -219,7 +229,9 @@ def test_rebuild_assets_is_idempotent_and_never_reparses(client, settings, make_
     """再点一次是 no-op：不复制、不重新解析（真的重解析会烧掉几秒 CPU 并可能动库）。"""
     pid = _done_paper(client, make_user)
     _put_source_asset(settings, "p4242/assets", "p1_img1.png")
-    _store_doc(pid, meta={"assets_dir": "p4242/assets"}, figures=["p1_img1.png"])
+    _store_doc(pid, meta={"assets_dir": "p4242/assets",
+                          "asset_digests": {"p1_img1.png": _sha(_PNG)}},
+               figures=["p1_img1.png"])
     assert client.post(f"/api/papers/{pid}/rebuild-assets").status_code == 202
 
     after_first = (settings.papers_dir / f"p{pid}" / "assets" / "p1_img1.png").read_bytes()
@@ -462,7 +474,9 @@ def test_a_stale_refs_job_does_not_hijack_the_assets_repair(client, settings, ma
     """
     pid = _done_paper(client, make_user)
     _put_source_asset(settings, "p4242/assets", "p1_img1.png")
-    _store_doc(pid, meta={"assets_dir": "p4242/assets"}, figures=["p1_img1.png"])
+    _store_doc(pid, meta={"assets_dir": "p4242/assets",
+                          "asset_digests": {"p1_img1.png": _sha(_PNG)}},
+               figures=["p1_img1.png"])
     _set_pending(pid, "refs")                   # ← 残留
 
     assert client.post(f"/api/papers/{pid}/rebuild-assets").status_code == 202
@@ -515,3 +529,108 @@ def test_the_decline_reason_is_visible_where_the_state_stays_done():
     # 锚点带上左花括号：`.ptable .t-warn-gone` 也包含 `.ptable .t-warn`，
     # 只比子串的话"把规则改名"这种真回归会被判绿（变异检验抓过一次）。
     assert ".ptable .t-warn {" in css, "t-warn 没有样式 —— 写了类名却没样式等于看不见"
+
+
+# ── ⑥ 记录在案的来源**也要按字节核对**（cycle 62）─────────────────────────
+def test_the_recorded_source_is_refused_when_its_bytes_are_not_this_papers(
+        client, settings, make_user, monkeypatch):
+    """⭐ 记录在案的目录里坐着**别人的字节** ⇒ 不搬，改走"就地为这一篇重新解析"。
+
+    未修前（`f0a3442`）实测：返回 `ok=True / repaired=1 / source="recorded"`，落盘的是外来
+    那一份（`6b742b49…`，而这一篇自己的图是 `8c6806d8…`）—— 不报错、不缺图、也不自愈。
+    资产名只按页编号、`p<id>` 的 id 会被复用 ⇒ 只问"目录里有这个文件名"等于认别人的图。
+    """
+    from papershelf.server import assetsfix as af
+    from papershelf.server.config import get_settings
+    from papershelf.server.db import connect
+
+    pid = _done_paper(client, make_user)
+    src = _put_source_asset(settings, "p4242/assets", "p1_img1.png")
+    src.write_bytes(_FOREIGN)                    # 目录已易主：这里是另一篇的图
+    stored = _store_doc(pid, meta={"assets_dir": "p4242/assets",
+                                   "asset_digests": {"p1_img1.png": _sha(_PNG)}},
+                        figures=["p1_img1.png"])
+
+    def fake_parse(pdf_path, assets_dir=None, **_kw):
+        out = Path(assets_dir)
+        out.mkdir(parents=True, exist_ok=True)
+        (out / "p1_img1.png").write_bytes(_PNG)  # 这篇自己的 PDF 重新解析出来的图
+        return _fresh_doc_like(stored)
+
+    monkeypatch.setattr(af, "parse_pdf", fake_parse)
+
+    conn = connect(get_settings())
+    try:
+        out = af.rebuild_paper_assets(conn, pid, get_settings())
+    finally:
+        conn.close()
+
+    landed = settings.papers_dir / f"p{pid}" / "assets" / "p1_img1.png"
+    assert out["source"] == "reparse", (
+        f"还从记录在案的目录搬了图，而那些字节属于别人：{out}"
+    )
+    assert landed.is_file() and landed.read_bytes() == _PNG, \
+        "落到这一篇目录里的不是它自己的图"
+    assert out["repaired"] == 1, f"修好了却把张数记成了 {out['repaired']}"
+
+
+def test_the_recorded_source_is_still_used_when_its_bytes_match(
+        client, settings, make_user, monkeypatch):
+    """对照方向：字节与指纹一致 ⇒ 照旧从记录在案的目录搬，`source="recorded"`、不重解析。
+
+    这一条防的是"把修复路径改成空转"：核对写成恒假、或干脆不复制，它就会红。
+    """
+    from papershelf.server import assetsfix as af
+    from papershelf.server.config import get_settings
+    from papershelf.server.db import connect
+
+    pid = _done_paper(client, make_user)
+    _put_source_asset(settings, "p4242/assets", "p1_img1.png")      # 写进去的就是 _PNG
+    _store_doc(pid, meta={"assets_dir": "p4242/assets",
+                          "asset_digests": {"p1_img1.png": _sha(_PNG)}},
+               figures=["p1_img1.png"])
+    calls = _spy_parse(monkeypatch)             # 任何一次重新解析都会 AssertionError
+
+    conn = connect(get_settings())
+    try:
+        out = af.rebuild_paper_assets(conn, pid, get_settings())
+    finally:
+        conn.close()
+
+    assert out["ok"] and out["changed"] and out["source"] == "recorded", \
+        f"字节与指纹都对的来源被拒绝了（修复路径变成了空转）：{out}"
+    assert out["repaired"] == 1
+    assert not calls, "来源可用却重新解析了一遍"
+    assert (settings.papers_dir / f"p{pid}" / "assets" / "p1_img1.png").read_bytes() == _PNG
+
+
+def test_a_row_without_digests_is_never_repaired_from_the_recorded_source(
+        client, settings, make_user):
+    """老行（`#23` 之前落库、没有 `asset_digests`）⇒ **不搬**，并点名"无从核对"。
+
+    这是本次改动**故意付的代价**：没有指纹就分不清那个目录里的字节是谁的 ⇒ 按"来源未知"
+    处理（与命中解析缓存时同一条口径）。PDF 还在就重解析一次（零 token）；PDF 也没了就
+    在这里明确放弃 —— 而不是悄悄补上一张别人的图。
+    """
+    from papershelf.server.config import get_settings
+    from papershelf.server.db import connect, tx
+
+    pid = _done_paper(client, make_user)
+    src = _put_source_asset(settings, "p4242/assets", "p1_img1.png")
+    src.write_bytes(_FOREIGN)
+    _store_doc(pid, meta={"assets_dir": "p4242/assets"}, figures=["p1_img1.png"])
+
+    conn = connect(get_settings())
+    try:
+        with tx(conn):                          # 来源与原件双失的最小形状
+            conn.execute("UPDATE papers SET pdf_path='' WHERE id=?", (pid,))
+    finally:
+        conn.close()
+
+    assert client.post(f"/api/papers/{pid}/rebuild-assets").status_code == 202
+
+    assert not (settings.papers_dir / f"p{pid}" / "assets" / "p1_img1.png").exists(), \
+        "没有指纹的来源被搬了 —— 落进来的那一张是别人的图"
+    err = _state(pid)["conv_error"] or ""
+    assert "p1_img1.png" in err, f"放弃的原因没有点名是哪张图：{err!r}"
+    assert "没有记下它的指纹" in err, f"没有说清为什么不能搬：{err!r}"
