@@ -25,7 +25,7 @@ from ...pipeline.validate import expects_chinese
 from .. import blockops
 from ..config import Settings, get_settings
 from ..db import load_json
-from ..repo import get_block, list_highlights, public_block, update_block
+from ..repo import get_block, list_highlights, public_block
 from ..security import current_user, get_conn, require_paper
 
 router = APIRouter(prefix="/api/docs/{paper_id}", tags=["blocks"])
@@ -163,6 +163,11 @@ def retranslate_block(paper_id: int, block_id: str,
     能重译的是"**可能有中文**"的块（`blockops.RETRANSLATE_TYPES`）：正文/标题/摘要、
     **图注**（宿主 2026-09-20）、表格、文献条目。表格与文献条目各走自己的通道（㊴/㊹），
     译文不只在 `zh` 里 —— 所以下面要把 `payload` 里那几项一起回写。
+
+    ⚠️ 换掉中文 ⇒ 锚在**这段中文**上的划痕/笔记也必须一起处理（`blockops.retranslate_block`），
+    并把账回给前端。整段重新翻译，新旧中文之间**没有**字符级对应，所以走「映射不了」那一支：
+    划痕删、笔记转「文献级」（内容保留）。静默让批注指到别的字上、或悄悄删掉却不吭声，
+    是本项目最坏的失败模式。
     """
     paper = require_paper(conn, paper_id, user)
     rows = conn.execute("SELECT * FROM blocks WHERE paper_id=? ORDER BY ord",
@@ -225,9 +230,15 @@ def retranslate_block(paper_id: int, block_id: str,
         for k in ("title_en", "title_zh"):
             if k in target_block.payload:
                 patch[k] = target_block.payload[k]
-    update_block(conn, paper_id, block_id, zh=new_zh, zh_source="mt", payload_patch=patch)
+    res = blockops.retranslate_block(conn, paper_id, block_id, zh=new_zh, payload_patch=patch)
+    if not res["ok"]:
+        raise HTTPException(_http_status(res), res["reason"])
     fresh = get_block(conn, paper_id, block_id)
     marks = [h for h in list_highlights(conn, paper_id) if h["block_id"] == block_id]
     out = public_block(fresh, marks=marks) if fresh else {"id": block_id, "zh": new_zh}
+    # 账本与 `PATCH /blocks/{id}` 同一形状：换掉中文会让锚在上面的批注失效，
+    # 用户必须**当场**看见丢了什么。
+    out["anchors_moved"] = res["anchors_moved"]
+    out["anchors_dropped"] = res["anchors_dropped"]
     out["tokens"] = tr.tokens_used
     return out
