@@ -516,11 +516,12 @@ export function ReaderPage() {
    *
    *  两种"没了"要分开说：划痕（只有坐标）是**真的消失**；笔记（有内容）**只在内容里留着**，
    *  锚点被清空成「文献级笔记」。混成一句"2 处批注随之移除"会让用户以为笔记也没了。 */
-  function editReport(moved?: number, dropped?: Array<{ kind?: string }>, zhStale?: boolean): string {
+  function editReport(moved?: number, dropped?: Array<{ kind?: string }>, zhStale?: boolean,
+                      lead = '已保存（标记为人工修订，重跑不会被覆盖）'): string {
     const gone = dropped ?? []
     const hls = gone.filter((d) => d.kind !== 'note').length
     const ns = gone.length - hls
-    const parts = ['已保存（标记为人工修订，重跑不会被覆盖）']
+    const parts = [lead]
     if (moved) parts.push(`本块 ${moved} 处批注已随文字移动`)
     if (hls) parts.push(`${hls} 处划痕的文字已被删除，随之移除`)
     if (ns) parts.push(`${ns} 条笔记失去落点，已转为「文献级笔记」（内容保留）`)
@@ -557,7 +558,11 @@ export function ReaderPage() {
     try {
       const fresh = await api.retranslateBlock(pid, b.id)
       setDoc((d) => d && ({ ...d, blocks: d.blocks.map((x) => (x.id === b.id ? fresh : x)) }))
-      flash('已重译此块')
+      // 换掉中文 ⇒ 锚在这段中文上的划痕/笔记已经不在原位：**本地那份也要重拉**，
+      // 否则被删掉的划痕还挂在 marks 里、会继续按旧坐标画在这一块上。
+      setNotes(share ? await share.loadNotes(pid).catch(() => notes) : await api.notes(pid).catch(() => notes))
+      setMarks(share ? await share.loadMarks(pid).catch(() => marks) : await api.marks(pid).catch(() => marks))
+      flash(editReport(fresh.anchors_moved, fresh.anchors_dropped, undefined, '已重译此块'))
     } catch (e) { flash(e instanceof Error ? e.message : '重译失败') }
   }
 

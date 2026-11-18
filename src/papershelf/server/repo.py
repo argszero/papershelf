@@ -194,6 +194,20 @@ def update_block(conn: sqlite3.Connection, paper_id: int, block_id: str, *,
                  zh: str | None = None, zh_source: str | None = None,
                  payload_patch: dict[str, Any] | None = None) -> bool:
     """块级修订（决策⑯）：人工改 `zh` 时必须把 `zh_source` 置为 `human`，重跑不得覆盖。"""
+    with tx(conn):
+        return write_block(conn, paper_id, block_id, zh=zh, zh_source=zh_source,
+                           payload_patch=payload_patch)
+
+
+def write_block(conn: sqlite3.Connection, paper_id: int, block_id: str, *,
+                zh: str | None = None, zh_source: str | None = None,
+                payload_patch: dict[str, Any] | None = None) -> bool:
+    """`update_block` 的**不带事务**内核。
+
+    拆出来的理由与 `write_doc` 一字不差：`server.blockops.retranslate_block` 要把「换掉这一块的
+    中文」和「作废锚在那段中文上的批注」放进**同一次** `tx` —— `db.tx` 只做 commit/rollback、
+    **不可重入**，内层一提交，外层就失去回滚能力（㉛ 补全踩过同款）。
+    """
     row = conn.execute("SELECT payload FROM blocks WHERE paper_id=? AND id=?",
                        (paper_id, block_id)).fetchone()
     if row is None:
@@ -213,8 +227,7 @@ def update_block(conn: sqlite3.Connection, paper_id: int, block_id: str, *,
     if not sets:
         return False
     args += [paper_id, block_id]
-    with tx(conn):
-        conn.execute(f"UPDATE blocks SET {', '.join(sets)} WHERE paper_id=? AND id=?", args)
+    conn.execute(f"UPDATE blocks SET {', '.join(sets)} WHERE paper_id=? AND id=?", args)
     return True
 
 

@@ -41,7 +41,7 @@ from typing import Any
 
 from ..pipeline.model import Block, Doc, make_block_id
 from .db import dump_json, load_json, tx
-from .repo import load_doc, write_doc
+from .repo import load_doc, write_block, write_doc
 
 log = logging.getLogger("papershelf.blockops")
 
@@ -313,6 +313,46 @@ def edit_block(conn: sqlite3.Connection, paper_id: int, block_id: str, *,
              block_id, len(old_en), len(new_en), len(old_zh), len(new_zh), moved, len(dropped))
     return {"ok": True, "id": block_id, "anchors_moved": moved, "anchors_dropped": dropped,
             "zh_stale": bool(new_en != old_en and zh is None and new_zh.strip())}
+
+
+# ── 重译已有块 ─────────────────────────────────────────────────────────────
+def retranslate_block(conn: sqlite3.Connection, paper_id: int, block_id: str, *,
+                      zh: str, payload_patch: dict[str, Any] | None = None) -> dict[str, Any]:
+    """换掉一块的中文（「重译此块」），并**当场处理**锚在那段中文上的批注。
+
+    与 `edit_block` 的差别只有一条：**新旧文字之间有没有字符级对应**。
+
+    - 「编辑此块」是人**定向**改一段文字（拆分、合并、手改一句）⇒ 两端逐字未动，
+      `remap_span` 的「最长公共前缀 + 最长公共后缀」是**确定**的重映射。
+    - 「重译此块」是同一段原文**整段重新翻一遍**：新旧中文之间没有任何字符级对应。
+      而 `remap_span` 在这里照样回得出一个区间（它总能找到一截公共前缀），那个区间指的是
+      **另外几个字** —— 实测笔记 `zh 3–8`（摘录「很重要。它」）被映射到 `至关`。
+      这正是 `server/notesfix.py` 写下的那条判据：比丢了更难发现，所以宁可作废、报出来。
+
+    所以这里传 `new=""`：**每一条都走"映射不了"那一支**（`remap_block_anchors` 的三条政策
+    一字不改）—— 划痕删掉，笔记**内容保留**并转成「文献级笔记」，连原文摘录一起报给调用方。
+    译文**逐字未变**时（翻译器把原文还回来）一条批注都不动。
+
+    块改写与批注作废在**同一次** `tx` 里（`tx` 不可重入 ⇒ 写库走 `repo.write_block`）。
+    返回值与 `edit_block` 同形：`anchors_moved` / `anchors_dropped`，路由直接回给前端。
+    """
+    row = conn.execute("SELECT zh FROM blocks WHERE paper_id=? AND id=?",
+                       (paper_id, block_id)).fetchone()
+    if row is None:
+        return {"ok": False, "code": "not_found", "reason": "块不存在"}
+    old_zh = row["zh"] or ""
+    moved = 0
+    dropped: list[dict[str, Any]] = []
+    with tx(conn):
+        if zh != old_zh:
+            acc = remap_block_anchors(conn, paper_id, block_id, "zh", old_zh, "")
+            moved += acc["moved"]
+            dropped += acc["dropped"]
+        write_block(conn, paper_id, block_id, zh=zh, zh_source="mt",
+                    payload_patch=payload_patch)
+    log.info("  · 重译块 %s：译文 %d→%d 字；批注搬迁 %d、作废 %d",
+             block_id, len(old_zh), len(zh), moved, len(dropped))
+    return {"ok": True, "id": block_id, "anchors_moved": moved, "anchors_dropped": dropped}
 
 
 # ── 插入新块 ───────────────────────────────────────────────────────────────

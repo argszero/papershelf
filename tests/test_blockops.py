@@ -701,3 +701,57 @@ def test_retranslate_overwrites_a_human_caption(client, settings, owned, scripte
     got = r.json()
     assert got["zh"] == CAP_ZH and got["zh_source"] == "mt"      # 真的换成了机器译文
     assert "人工写的图注" not in got["zh"]
+
+
+def test_retranslate_drops_the_chinese_anchors_and_reports_them(client, settings, owned,
+                                                              scripted_llm):
+    """换掉中文 ⇒ 锚在这段中文上的划痕/笔记必须**当场**处理，并把账回给前端。
+
+    新旧中文之间没有字符级对应（同一段原文整段重翻）⇒ 走「映射不了」那一支：
+    划痕删掉、笔记转「文献级」（内容保留）。与 `notesfix` 同一条判据 —— `remap_span`
+    在这种情况下照样回得出区间（总能找到一截公共前缀），而那个区间指的是**另外几个字**，
+    比丢了更难发现。这条钉四件事：
+
+    ① 响应里有账（与 `PATCH /blocks/{id}` 同一形状）；② 那道中文划痕真的没了，且新文字上
+    不再画着它；③ 笔记解锚但 `content` 与 `quote` 逐字保留；④ 同一块上的**英文**划痕一条不动。
+    """
+    from papershelf.server.db import connect
+
+    NEW_ZH = "安全至关重要。"                  # 7 字，与 ZH2 不同长、且是另一句话
+    pid = owned["pid"]
+    conn = connect(settings)
+    _anchor(conn, "highlights", "b-0002", "zh", 0, 5, color="amber", created_at="t")
+    _anchor(conn, "notes", "b-0002", "zh", 3, 8, content="我的笔记",
+            quote=ZH2[3:8], created_at="t")
+    # 同一块上的英文划痕：中英两套坐标系（㉛），换中文不该动它一个字
+    _anchor(conn, "highlights", "b-0002", "en", 0, 6, color="green", created_at="t")
+    conn.commit()
+
+    scripted_llm(f'<p data-b="b-0002">{NEW_ZH}</p>')
+    r = client.post(f"/api/docs/{pid}/blocks/b-0002/retranslate")
+    assert r.status_code == 200, r.text
+    got = r.json()
+    assert got["zh"] == NEW_ZH
+
+    # ① 账本：与 PATCH 兄弟同一形状，静默丢批注是这里最坏的失败模式
+    assert got["anchors_moved"] == 0
+    dropped = got["anchors_dropped"]
+    assert sorted(d["kind"] for d in dropped) == ["highlight", "note"]
+    assert any(d["kind"] == "highlight" and d["quote"] == ZH2[0:5] for d in dropped)
+
+    # ② 划痕真的没了；返回的 HTML 上不再画着它
+    assert conn.execute("SELECT * FROM highlights WHERE paper_id=? AND block_id='b-0002'"
+                        " AND lang='zh'", (pid,)).fetchall() == []
+    assert "hl-amber" not in got["zh_html"]
+
+    # ③ 笔记内容与摘录逐字保留，只解锚
+    note = conn.execute("SELECT * FROM notes WHERE paper_id=? AND content='我的笔记'",
+                        (pid,)).fetchone()
+    assert note["block_id"] is None and note["lang"] is None
+    assert note["start"] is None and note["end"] is None
+    assert note["quote"] == ZH2[3:8]
+
+    # ④ 英文侧那条划痕原样在位
+    en = conn.execute("SELECT start, end, color FROM highlights WHERE paper_id=?"
+                      " AND block_id='b-0002' AND lang='en'", (pid,)).fetchall()
+    assert [(m["start"], m["end"], m["color"]) for m in en] == [(0, 6, "green")]

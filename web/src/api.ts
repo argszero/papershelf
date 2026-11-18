@@ -138,8 +138,10 @@ export const api = {
     request<{ ok: boolean; id: string; notes_unanchored: number; highlights_deleted: number;
               quotes: string[] }>(
       `/api/docs/${paperId}/blocks/${blockId}`, { method: 'DELETE' }),
+  /** 重译一块。回的是 `BlockEditResult` 而不是裸 `Block`：换掉中文会让锚在这段中文上的
+   *  划痕/笔记失效，服务端把账（`anchors_moved` / `anchors_dropped`）一起回来，前端必须当场说。 */
   retranslateBlock: (paperId: number, blockId: string) =>
-    request<Block>(`/api/docs/${paperId}/blocks/${blockId}/retranslate`, { method: 'POST' }),
+    request<BlockEditResult>(`/api/docs/${paperId}/blocks/${blockId}/retranslate`, { method: 'POST' }),
 
   // ── 笔记（⑯ 块锚点 + ㉛ 区间锚点）──
   notes: (paperId: number) => request<Note[]>(`/api/papers/${paperId}/notes`),
