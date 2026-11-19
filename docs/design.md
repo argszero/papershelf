@@ -258,7 +258,15 @@ GET    /api/papers/{id}/doc                  # 块级 JSON（阅读器取数，�
 PATCH  /api/docs/{paper_id}/blocks/{block_id}  {en?, zh?, type?, reconciled?}  # 编辑（回完整块 + 批注账）
 POST   /api/docs/{paper_id}/blocks            {after?|before?, en?, zh?, type?, level?}  # 插入 → 201
 DELETE /api/docs/{paper_id}/blocks/{block_id} # 删除（回 notes_unanchored / highlights_deleted / quotes）
-POST   /api/docs/{paper_id}/blocks/{block_id}/retranslate  # ⑯ 重译此块
+POST   /api/docs/{paper_id}/blocks/{block_id}/retranslate  # ⑯ 重译此块（回块 + 批注账）
+# ⚠️ 换掉中文 ⇒ 锚在这段中文上的批注**当场处理**（`blockops.retranslate_block`，与编辑/删除同一套账）：
+#   划痕**删掉**、笔记**掉锚**成「文献级笔记」（内容与 `quote` 保留），响应回 `anchors_moved`/`anchors_dropped`。
+#   中文侧**一律不重映射** —— `remap_span` 按「最长公共前缀 + 最长公共后缀」映射，对重译它**不报错**，
+#   而是把区间落到别的字上（实测 `安全性很重要。它也难。` → `安全至关重要。`：`[8,10)` 的「也难」
+#   被平移到 `[2,6)` 盖住「至关重要」；`[0,8)` 的「安全性很重要。它」被**夹到公共前缀**只剩「安全」；
+#   只有落进被替换那段中间的区间才回 `None`）—— 都是静默的，所以与 `server/notesfix.py` 走同一条
+#   政策（那边传 `new=""`）：**宁可作废、当场报出来**。
+#   英文侧不动（`en` 没变）；译文**逐字未变**时一条批注都不动。
 # ⚠️ 两个按钮的**开放范围不同**（各有一份名单，前后端逐字钉住，见 `tests/test_blockops.py`）：
 #   「编辑此块」= 文字在 `en`/`zh` 里的块 `TEXT_TYPES`（含 **图注 `figure`**，宿主 2026-09-20）；
 #     改图注时 `payload["caption"]` 同步更新（解析/①c 读它）；图注块的**类型不可改**（图靠 payload.src）。
