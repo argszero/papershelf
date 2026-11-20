@@ -260,6 +260,15 @@ def patch_paper(paper_id: int, body: PaperPatch, conn: sqlite3.Connection = Depe
     if body.tags is not None:
         sets.append("tags=?")
         args.append(dump_json(body.tags))
+    # ⚠️ 状态分支一旦替用户定了进度（「已读」→ 100% 锁定 / 「未读」→ 清零），
+    #    这次请求里的 `progress` 就**一律不再写**（#29）。
+    #    病灶：两段共用同一个 `sets`/`args`，同一次 PATCH 同时带 `status_` 与 `progress`
+    #    时 `progress=?` 被追加**两遍**，SQLite 取后写的那次 ⇒
+    #    标「已读」的论文落成 `read` + 请求里那个百分比 + `manual` 锁死
+    #    （之后真的往下读，滚动上报一律 409，进度永远停在那个数），
+    #    标「未读」则落成 `unread` + 非零进度，正是下面那个分支要挡的自相矛盾状态。
+    #    依据是项目自己的规则（`docs/design.md:684`）：**标记已读 → 100% 且锁定**。
+    status_pins_progress = False
     if body.status_ is not None:
         if body.status_ not in ("unread", "reading", "read", "reviewed"):
             raise HTTPException(status.HTTP_400_BAD_REQUEST, "状态取值不合法")
@@ -269,15 +278,17 @@ def patch_paper(paper_id: int, body: PaperPatch, conn: sqlite3.Connection = Depe
         if body.status_ in ("read", "reviewed"):
             sets += ["progress=?", "progress_mode=?"]
             args += [100, "manual"]
+            status_pins_progress = True
         elif body.status_ == "unread":
             # 标回「未读」= 重新开始读 → 进度清零。
             # 否则会出现"未读 但 80%"的自相矛盾状态（进度只增不减后尤其明显）。
             sets += ["progress=?", "progress_mode=?"]
             args += [0, "auto"]
+            status_pins_progress = True
         elif body.progress is None:
             sets += ["progress_mode=?"]
             args.append("auto")
-    if body.progress is not None:
+    if body.progress is not None and not status_pins_progress:
         if not 0 <= body.progress <= 100:
             raise HTTPException(status.HTTP_400_BAD_REQUEST, "进度须在 0-100")
         if body.progress_by not in (None, "scroll", "user"):

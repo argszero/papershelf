@@ -150,6 +150,32 @@ def test_read_lock_rejects_scrolling_and_keeps_last_read(client, settings, make_
     assert _row(settings, pid)["status"] == "read"
 
 
+def test_one_patch_with_status_and_progress_lets_the_status_win(client, settings, make_user):
+    """同一次 PATCH 同时带 `status_` 与 `progress`：状态说了算，进度不许被写第二遍（#29）。
+
+    实测（`d1b14672`）：两段各往同一个 `SET` 里追加一次 `progress=?`，SQLite 取后写那次 ⇒
+    - 标「已读」的论文落成 `read` + **请求里那个 30%** + `manual` 锁死：之后真的往下读到 60%，
+      滚动上报一律 409，这篇就永远停在 30% 了 —— 而 `docs/design.md:684` 写的是
+      「标记已读 → 100% 且锁定」。
+    - 标「未读」落成 `unread` + 30%，正是上面那条「未读 但 80%」的自相矛盾状态。
+
+    已发布的前端走不到这里（阅读器与看板只发 `status_`，元数据抽屉只发 `progress`），
+    所以这是**端点契约**的错，不是线上回归；但契约错了，任何脚本或第三方客户端都会踩。
+    """
+    pid = _start(settings, make_user, client)
+    r = client.patch(f"/api/papers/{pid}", json={"status_": "read", "progress": 30}).json()
+    assert (r["status"], r["progress"], r["progress_mode"]) == ("read", 100, "manual"), \
+        "标「已读」就是 100% 且锁定，同一个请求里那个 30% 不能把它顶掉"
+    assert client.patch(f"/api/papers/{pid}", json={"progress": 60}).status_code == 409, \
+        "锁在 100% 上：滚动被拒是因为『已读』，不是因为被钉在 30%"
+    assert _row(settings, pid)["progress"] == 100
+
+    pid2 = _start(settings, make_user, client, email="owner2@tsinghua.edu.cn")
+    r = client.patch(f"/api/papers/{pid2}", json={"status_": "unread", "progress": 30}).json()
+    assert (r["status"], r["progress"], r["progress_mode"]) == ("unread", 0, "auto"), \
+        "标回「未读」要把进度清零，不许留下『未读 但 30%』"
+
+
 def test_only_scrolling_writes_last_read_at(client, settings, make_user):
     """「最近阅读」只有滚动能写 —— 改标题/标签/状态都不许碰它。
 
