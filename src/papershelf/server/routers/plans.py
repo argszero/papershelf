@@ -6,7 +6,7 @@
 from __future__ import annotations
 
 import sqlite3
-from typing import Any
+from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, Field
@@ -19,14 +19,19 @@ from ..security import current_user, get_conn, require_plan
 router = APIRouter(prefix="/api/plans", tags=["plans"])
 
 
+# 计划名的长度规则只写一处，创建与修改共用 —— 否则 `PATCH /api/plans/{id}`
+# 会收下 `POST /api/plans` 用 422 拒收的名称（空串、500 字），同一份数据两条路径两个标准。
+PlanName = Annotated[str, Field(min_length=1, max_length=200)]
+
+
 class PlanIn(BaseModel):
-    name: str = Field(min_length=1, max_length=200)
+    name: PlanName
     goal: int | None = None
     description: str = ""
 
 
 class PlanPatch(BaseModel):
-    name: str | None = None
+    name: PlanName | None = None
     goal: int | None = None
     description: str | None = None
 
@@ -75,12 +80,26 @@ def get_plan(plan_id: int, conn: sqlite3.Connection = Depends(get_conn),
 def patch_plan(plan_id: int, body: PlanPatch, conn: sqlite3.Connection = Depends(get_conn),
                user: dict[str, Any] = Depends(current_user)) -> dict[str, Any]:
     require_plan(conn, plan_id, user)
+    # ⚠️ `body.x is not None` 分不清「没传这个字段」和「显式传 null 来清空」：
+    #    编辑抽屉里把「目标篇数」删空会发 `goal: null`，旧逻辑静默忽略 ⇒
+    #    界面上报"保存成功"、那个数字却还在（#31）。与 `papers.py::patch_paper` 同一个坑：
+    #    `model_fields_set` 才是「这次请求实际带了哪些字段」。
+    provided = body.model_fields_set
     sets, args = [], []
-    for field in ("name", "goal", "description"):
-        val = getattr(body, field)
-        if val is not None:
-            sets.append(f"{field}=?")
-            args.append(val)
+    if "name" in provided:
+        # `plans.name` 是 NOT NULL（`db.py`）⇒ null 不可能是"清空"，只能是非法值。
+        if body.name is None:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, "计划名称不能为空")
+        sets.append("name=?")
+        args.append(body.name)
+    if "goal" in provided:                    # null = 清空目标篇数（列可空）
+        sets.append("goal=?")
+        args.append(body.goal)
+    if "description" in provided:
+        # 说明清空落成空串而不是 NULL：创建路径的缺省值就是 `""`（`PlanIn.description`），
+        # 前端 `Plan.description` 也声明成 string 而非可空 —— 两条路径给同一个值。
+        sets.append("description=?")
+        args.append("" if body.description is None else body.description)
     if sets:
         sets.append("updated_at=?")
         args += [utcnow(), plan_id]
