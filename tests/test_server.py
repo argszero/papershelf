@@ -353,6 +353,51 @@ def test_plans_are_private_between_users(client, make_user):
     assert other.patch(f"/api/plans/{plan_id}", json={"name": "x"}).status_code == 404
 
 
+def test_patching_a_plan_clears_a_field_and_holds_the_name_to_the_create_rule(client, make_user):
+    """#31：`PATCH /api/plans/{id}` 清得掉字段，且名称的宽严与 `POST /api/plans` 一致。
+
+    实测（`667318b4`，真端点）三件事：`{"name": ""}` 与 500 字名称都回 200 并原样落库，
+    而 `POST /api/plans` 对同样两个名称回 422；`{"goal": null}` 回 200，目标篇数**一动不动**。
+    最后那条**已发布的前端真的走得到**：编辑抽屉里把「目标篇数」删空再保存，
+    发出去的就是 `goal: null`（`web/src/pages/Plans.tsx`），界面上报"保存成功"、数字还在。
+    病灶一句话：`if val is not None` 分不清「没传这个字段」和「显式传 null 来清空」。
+    """
+    email, pw = make_user("plan-patch@tsinghua.edu.cn")
+    client.post("/api/auth/login", json={"email": email, "password": pw})
+    plan_id = client.post(
+        "/api/plans", json={"name": "P", "goal": 7, "description": "d"}).json()["id"]
+
+    # 创建路径的宽严就是这条端点的尺子
+    assert client.post("/api/plans", json={"name": ""}).status_code == 422
+    assert client.post("/api/plans", json={"name": "y" * 500}).status_code == 422
+    assert client.patch(
+        f"/api/plans/{plan_id}", json={"name": ""}).status_code == 422, \
+        "PATCH 收下了 POST 会拒收的空名称"
+    assert client.patch(
+        f"/api/plans/{plan_id}", json={"name": "y" * 500}).status_code == 422, \
+        "PATCH 收下了 POST 会拒收的 500 字名称"
+    # `plans.name` 是 NOT NULL ⇒ 显式 null 只可能是 400，不是「清空」
+    assert client.patch(
+        f"/api/plans/{plan_id}", json={"name": None}).status_code == 400, \
+        "PATCH 把 null 名称当成了清空"
+    # 这三次被拒，一个字节都不许落库
+    got = client.get(f"/api/plans/{plan_id}").json()
+    assert (got["name"], got["goal"], got["description"]) == ("P", 7, "d")
+
+    # 显式 null = 清空（"没传这个字段"才是保持不变）
+    r = client.patch(f"/api/plans/{plan_id}", json={"goal": None, "description": None})
+    assert r.status_code == 200
+    assert r.json()["goal"] is None, "显式传 null 没能清空目标篇数"
+    assert r.json()["description"] == "", "显式传 null 没能清空计划说明"
+    assert client.get(f"/api/plans/{plan_id}").json()["goal"] is None, "清空没有落库"
+
+    # 只带一个字段时，别的字段不许被顺手清零
+    assert client.patch(f"/api/plans/{plan_id}", json={"goal": 3}).json()["goal"] == 3
+    r = client.patch(f"/api/plans/{plan_id}", json={"description": "新说明"})
+    assert (r.json()["goal"], r.json()["description"]) == (3, "新说明"), \
+        "改说明把目标篇数一起清掉了"
+
+
 def test_arxiv_import_into_another_users_plan_is_refused(client, make_user, monkeypatch):
     """⭐ 往**别人的**计划里导入 arXiv 论文必须 404，而且一行都不许多。
 
