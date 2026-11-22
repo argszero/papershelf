@@ -218,6 +218,31 @@ def test_deleting_a_mark_keeps_its_note(client, owned):
     assert len(rows) == 1 and rows[0]["hl_id"] is None and rows[0]["start"] == 0
 
 
+def test_a_mark_clipped_away_by_a_wider_one_unbinds_its_note_too(client, owned):
+    """被更宽的划痕**整段盖掉** = 那道划痕没了 ⇒ 指着它的笔记必须解绑（同 `delete_highlight`）。
+
+    只删不解绑的后果不只是"悬空引用"：`highlights.id` 会被 SQLite 回收，笔记回头就绑在
+    刚划的**那一条**上 —— 卡片上的颜色圆点看着还在，点它跳到的却是划痕自己的区间。
+    所以这里留一条**范围之外**的邻居划痕：它活着并占住最大的 id，新划痕只能拿新 id，
+    悬空才测得出来（没有邻居时 rowid 被回收，"看起来没坏"与"坏了"分不开）。
+    """
+    pid = owned["pid"]
+    note = client.post(f"/api/papers/{pid}/notes",
+                       json={"content": "批注", "block_id": "b-0002", "lang": "en",
+                             "start": 0, "end": 6}).json()
+    auto = note["hl_id"]
+    assert auto is not None                     # 选区笔记顺手上色，笔记就锚在那道划痕上
+    _mk(client, pid, start=27, end=37)          # 邻居：在覆盖范围之外，存活并占住最大 id
+    wide = _mk(client, pid, start=0, end=26)    # 整段盖掉刚补的那道
+    marks = {r["id"] for r in client.get(f"/api/papers/{pid}/highlights").json()}
+    assert auto not in marks                    # 被盖住那道确实删掉了
+    assert wide["id"] != auto                   # rowid 没被回收 —— 悬空才看得出来
+    rows = client.get(f"/api/papers/{pid}/notes").json()
+    assert len(rows) == 1                       # 笔记还在：删的是划痕，不是批注
+    assert rows[0]["hl_id"] is None             # 解绑
+    assert (rows[0]["start"], rows[0]["end"]) == (0, 6)   # 笔记自己的坐标一个字没动
+
+
 def test_block_level_note_still_works(client, owned):
     r = client.post(f"/api/papers/{owned['pid']}/notes",
                     json={"content": "整块笔记", "block_id": "b-0001"})

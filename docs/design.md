@@ -149,7 +149,7 @@ notes(
   lang      TEXT,                 -- ㉛ 'en' | 'zh'（区间在**哪一侧**的坐标系里）
   start     INTEGER,              -- ㉛ 区间起点（裸文本字符偏移，0 起、闭开）
   end       INTEGER,              -- ㉛ 区间终点
-  hl_id     INTEGER,              -- ㉛ 这条笔记写在哪道划痕上（划痕被擦掉时置 NULL，
+  hl_id     INTEGER,              -- ㉛ 这条笔记写在哪道划痕上（划痕被擦掉/被盖住时置 NULL，
                                   --     笔记**不跟着消失** —— 它有自己的坐标）
   sid       TEXT,                 -- ㉚ 遗留列：句锚点已退役，仅旧数据迁移期可能非空
   quote     TEXT,                 -- 该段文字的原文快照，卡片直接显示，不再回查文档
@@ -289,7 +289,8 @@ PATCH  /api/highlights/{hl_id}               # body {color} 换一支笔（端�
 DELETE /api/highlights/{hl_id}               # 擦掉（幂等：删不存在的行也 200）
 # ⚠️ 坐标是块**裸文本**的字符偏移，由**服务端**渲染器吐出的 `<span class="o" data-o="N">`
 #    锚点定义；前端只用它把 DOM 选区换算成数字，绝不自己生成坐标（㉛）。
-# ⚠️ 擦划痕只把笔记的 hl_id 置 NULL（`repo.delete_highlight`）—— 擦掉荧光笔 ≠ 撕掉批注。
+# ⚠️ 划痕消失的**两条路**都只把笔记的 hl_id 置 NULL（`repo.delete_highlight` 擦掉、
+#    `repo.insert_highlight` 被更宽的划痕整段盖住）—— 擦掉荧光笔 ≠ 撕掉批注。
 
 # 分享（⑩⑪⑯；2026-09-12 分享管理）
 GET    /api/shares                           # **跨计划**列出本人全部分享（带 plan_name / label）
@@ -723,7 +724,8 @@ const S       = { get: p => activePlan().status[p.id], set: (id, v) => { activeP
   这个缺陷在只发合成事件（`dispatchEvent` / `el.click()`）的测法下**测不出来** —— 真实序列
   `mouseup → click` 才是关键，验收必须走真实鼠标事件。
 - **点已有划痕 → 就地小菜单**：换笔 / 加笔记 / **擦掉**。擦掉只把笔记的 `hl_id` 置 NULL
-  （`repo.delete_highlight`）—— 擦掉荧光笔 ≠ 撕掉批注。
+  （`repo.delete_highlight`）—— 擦掉荧光笔 ≠ 撕掉批注。划痕消失的另一条路是**被更宽的划痕整段盖住**
+  （`repo.insert_highlight` 的裁切支），那里同样只解绑：笔记自己的坐标一个字不动。
 - **笔记锚到区间**：表单顶行写「第 N 段（中文）· 第 a–b 字」（段号是**正文段**计数，不是块序号：
   块序号里混着标题/图表/公式，直接用会出现"第 137 段"这种对人不友好的数字）。
   卡片显示引用与**笔色圆点**（`.nc-hl.pen-<色>`，与色板共用一份颜色定义）。
