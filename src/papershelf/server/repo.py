@@ -291,7 +291,7 @@ def insert_highlight(conn: sqlite3.Connection, paper_id: int, *, block_id: str, 
     而颜色本身**不带含义**，混色之后连"这是哪支笔"都答不上来；何况点"删除"时
     该删哪一条也说不清。而"再划一遍就是重划"是所有人对笔的直觉 —— 照直觉做。
 
-    裁切有四种结局：完全覆盖 → 删；只剩左段 / 只剩右段 → 改端点；
+    裁切有四种结局：完全覆盖 → 删（**删之前先把指着它的笔记解绑**）；只剩左段 / 只剩右段 → 改端点；
     被新划痕从中间劈开 → 改端点 + 补一条右段（**沿用原来的颜色**，它不是新划的）。
 
     ⚠️ **调用方负责事务**（`with tx(conn)`）：`tx` 不可重入 —— 嵌一层会在内层就提交掉。
@@ -318,6 +318,11 @@ def insert_highlight(conn: sqlite3.Connection, paper_id: int, *, block_id: str, 
         elif right:
             conn.execute("UPDATE highlights SET start=? WHERE id=?", (right[0], r["id"]))
         else:
+            # 整段被盖住 ⇒ 删。删之前先把**指着它的笔记解绑**：删的是划痕，不是批注
+            # （同 `delete_highlight` 那条规矩）。只删不解绑的后果不是一句"悬空引用"：
+            # rowid 会被回收，笔记回头就绑在**刚划的这条**上 —— 颜色圆点看着还在，
+            # 点它跳到的却是划痕自己的区间，而不是笔记记下的那一段文字。
+            conn.execute("UPDATE notes SET hl_id=NULL WHERE hl_id=?", (r["id"],))
             conn.execute("DELETE FROM highlights WHERE id=?", (r["id"],))
     cur = conn.execute(
         "INSERT INTO highlights (paper_id, block_id, lang, start, end, color, created_at)"
