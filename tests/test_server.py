@@ -340,6 +340,43 @@ def test_last_admin_cannot_be_disabled(client, make_user):
     assert r.status_code == 400
 
 
+def test_admin_password_reset_revokes_existing_sessions(client, make_user):
+    """#35：管理员重置口令必须踢掉该用户**已持有**的会话，与自助重置同一条规矩。
+
+    判据分三步，缺一不可：
+    ① 改密真的生效了（旧口令 401）—— 否则"会话不通"可能只是口令压根没改；
+    ② 那条旧 token 已经不能用（``GET /api/auth/me`` → 401）；
+    ③ 只踢目标、不误伤别人（管理员自己的会话照旧）—— 防"一律清空"式的过度修复。
+
+    病灶（``f80b575`` 实测）：``patch_user`` 自己 ``UPDATE users SET password_hash=?``，
+    从不碰 ``sessions``，于是``②``拿到的是 **200**、身份还是那个用户。
+    """
+    admin_email, admin_pw = make_user("admin@pku.edu.cn", is_admin=True)
+    user_email, user_pw = make_user("u@tsinghua.edu.cn")
+    client.post("/api/auth/login", json={"email": admin_email, "password": admin_pw})
+    uid = next(u["id"] for u in client.get("/api/admin/users").json()
+               if u["email"] == user_email)
+
+    # 该用户在别处登录过，手里有一条会话（新 cookie jar = 另一个浏览器）
+    other = client.__class__(client.app_ref)
+    assert other.post("/api/auth/login",
+                      json={"email": user_email, "password": user_pw}).status_code == 200
+    old_token = other.cookies.get("papershelf_session")
+    assert old_token
+    assert client.get("/api/auth/me",
+                      cookies={"papershelf_session": old_token}).status_code == 200
+
+    r = client.patch(f"/api/admin/users/{uid}", json={"password": "brandnew123"})
+    assert r.status_code == 200
+
+    assert client.post("/api/auth/login",
+                       json={"email": user_email, "password": user_pw}).status_code == 401
+    assert client.get("/api/auth/me",
+                      cookies={"papershelf_session": old_token}).status_code == 401
+    # 管理员自己没被顺手踢掉
+    assert client.get("/api/auth/me").json()["email"] == admin_email
+
+
 # ── 隔离（①⑦）──────────────────────────────────────────────────────────
 def test_plans_are_private_between_users(client, make_user):
     a = make_user("a@tsinghua.edu.cn")

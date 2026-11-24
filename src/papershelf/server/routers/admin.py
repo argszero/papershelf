@@ -16,11 +16,11 @@ from pydantic import BaseModel, Field
 from ..db import rows_to_list, tx, utcnow
 from ..security import (
     SESSION_COOKIE,
+    apply_password,
     create_user,
     current_admin,
     current_user,
     get_conn,
-    hash_password,
     impersonation,
     session_row,
     user_by_email,
@@ -95,16 +95,20 @@ def patch_user(user_id: int, body: PatchUserIn,
         if body.status_ == "active" and not row["activated_at"]:
             sets.append("activated_at=?")
             args.append(utcnow())
-    if body.password:
-        sets.append("password_hash=?")
-        args.append(hash_password(body.password))
     if body.is_admin is not None:
         sets.append("is_admin=?")
         args.append(1 if body.is_admin else 0)
-    if sets:
-        args.append(user_id)
+    # 口令走 `apply_password`（写口令 **并** 踢掉该用户所有会话），与自助重置（`set_password`）
+    # 是同一条规矩：管理员重置口令的场景就是"这个号被盗了"，旧 cookie 必须当场失效 ——
+    # 只改口令不踢会话，偷走 cookie 的人照样进得来（#35）。
+    # 它与状态/管理员标记写在**同一次** `tx` 里（`db.tx` 不可重入 ⇒ 用不带事务的内核）。
+    if sets or body.password:
         with tx(conn):
-            conn.execute(f"UPDATE users SET {', '.join(sets)} WHERE id=?", args)
+            if sets:
+                args.append(user_id)
+                conn.execute(f"UPDATE users SET {', '.join(sets)} WHERE id=?", args)
+            if body.password:
+                apply_password(conn, user_id, body.password)
     return _public(dict(conn.execute("SELECT * FROM users WHERE id=?", (user_id,)).fetchone()))
 
 

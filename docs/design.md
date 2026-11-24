@@ -312,7 +312,7 @@ GET    /share/{token}/…                      # 只读页面（前端路由，`
 # 管理（㉑）
 GET    /api/admin/users
 POST   /api/admin/users                      # 手动开号（⑮ 无 SMTP 时的唯一入口）
-PATCH  /api/admin/users/{id}                 # 禁用/启用、重置密码
+PATCH  /api/admin/users/{id}                 # 禁用/启用、重置密码（重置同时踢掉该用户所有会话）
 ```
 
 **只读分享的写保护**：以中间件按会话上下文判定 —— 请求携带 share token 时，除 GET 白名单外一律 403。
