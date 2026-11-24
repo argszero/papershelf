@@ -173,12 +173,23 @@ def consume_code(conn: sqlite3.Connection, *, email: str, purpose: str, code: st
     return True
 
 
+def apply_password(conn: sqlite3.Connection, user_id: int, new_password: str) -> None:
+    """`set_password` 的**不带事务**内核：写口令 + 踢掉该用户所有会话。
+
+    拆出来与 `repo.write_doc` 同一理由（`db.tx` 不可重入）：管理员那条
+    `PATCH /api/admin/users/{id}` 要把口令连同状态/管理员标记写在**同一次提交**里 ——
+    改密与踢会话若分成两次提交，中途崩一下就会留下"新口令已生效、旧 cookie 还能用"，
+    而那正是这条规矩要堵的窗口（#35）。
+    """
+    conn.execute("UPDATE users SET password_hash=? WHERE id=?",
+                 (hash_password(new_password), user_id))
+    conn.execute("DELETE FROM sessions WHERE user_id=?", (user_id,))
+
+
 def set_password(conn: sqlite3.Connection, user_id: int, new_password: str) -> None:
     """重置口令，并**踢掉该用户所有会话**（改密后旧 cookie 必须立即失效）。"""
     with tx(conn):
-        conn.execute("UPDATE users SET password_hash=? WHERE id=?",
-                     (hash_password(new_password), user_id))
-        conn.execute("DELETE FROM sessions WHERE user_id=?", (user_id,))
+        apply_password(conn, user_id, new_password)
 
 
 def ensure_admin(conn: sqlite3.Connection, email: str, password: str) -> int:
@@ -323,7 +334,8 @@ def require_paper(conn: sqlite3.Connection, paper_id: int, user: dict[str, Any])
 
 
 __all__ = [
-    "SESSION_COOKIE", "SESSION_DAYS", "CODE_PURPOSES", "activate_user", "code_cooldown_left",
+    "SESSION_COOKIE", "SESSION_DAYS", "CODE_PURPOSES", "activate_user", "apply_password",
+    "code_cooldown_left",
     "consume_code", "create_user", "current_admin",
     "current_user", "email_allowed", "end_session", "ensure_admin", "get_conn",
     "hash_password", "impersonation", "issue_code", "require_paper", "require_plan",
