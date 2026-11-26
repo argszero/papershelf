@@ -211,3 +211,80 @@ def test_frontend_actually_wires_the_button():
     # 样式类必须在 CSS 里有定义（否则按钮长得跟"编辑/删除"一样、hover 无法区分）
     css = (ROOT / "web" / "src" / "styles.css").read_text(encoding="utf-8")
     assert ".t-re" in css, "styles.css 没有 .t-re 规则"
+
+
+# ── #25：退役版本的死行 ─────────────────────────────────────────────────────
+# 键里混了 `PARSE_VERSION`，所以每涨一次版本全库就整体换键：旧行再也命中不了，
+# 而原先没有任何入口删得掉（`reextract` 删的正是**当前**版本那一行）。
+# 回收判据只能落在"行自己记着的版本"上 —— 版本号夹在 sha256 里已经还原不出来。
+
+
+def test_reextract_prunes_rows_from_retired_parse_versions(client, settings, make_user):
+    """已退役版本的行被回收，**不可知**与**比当前还新**的行都留着。
+
+    三条判据各有各的代价：
+    - 收回已退役的（`parse_version < PARSE_VERSION`）是本改动要的效果 —— 那些行永远命中不了，
+      留着只让删除路径的全表扫越来越慢（实测 1 行 0.3 ms → 102 行 41.3 ms）；
+    - `NULL` = 加这一列之前的存量行，版本号还原不出来 ⇒ **不猜、不删**：猜错就是把一个
+      还能命中的产物删掉；
+    - `parse_version > PARSE_VERSION` = 库比代码新（回滚过的部署）⇒ 同样留着，
+      它可能正是这次要命中的那一行。
+    """
+    from papershelf.pipeline import PARSE_VERSION
+    from papershelf.server.db import connect, tx
+
+    pid, pdf_path = _seed(client, make_user)
+    _seed_cache(settings, pdf_path)                 # 当前版本那一行：本来就会被删
+    conn = connect(settings)
+    try:
+        with tx(conn):
+            for fp, ver in (("retired", PARSE_VERSION - 1),
+                            ("unknown", None),
+                            ("future", PARSE_VERSION + 1),
+                            ("live-other", PARSE_VERSION)):
+                conn.execute(
+                    "INSERT OR REPLACE INTO doc_cache "
+                    "(fingerprint, doc_json, created_at, parse_version) "
+                    "VALUES (?,?,datetime('now'),?)", (fp, "{}", ver))
+    finally:
+        conn.close()
+
+    assert client.post(f"/api/papers/{pid}/reextract").status_code == 202
+
+    conn = connect(settings)
+    try:
+        left = {r["fingerprint"] for r in conn.execute("SELECT fingerprint FROM doc_cache")}
+    finally:
+        conn.close()
+    assert "retired" not in left, (
+        "已退役版本的行没被回收 —— 它再也命中不了，却还在拖慢删除时的全表扫")
+    assert {"unknown", "future", "live-other"} <= left, (
+        f"回收动到了不该动的行：剩下 {sorted(left)}（NULL = 版本不可知、"
+        "大于当前 = 库比代码新，两种都必须留着）")
+
+
+def test_migration_adds_parse_version_to_a_legacy_cache(settings):
+    """迁移：旧库补上这一列，且**存量行留 NULL** —— 不可知就是不可知，不猜一个版本号。
+
+    存量行如果被猜成某一代，回收就可能把它当成死行删掉，而它或许正是下次要命中的那一行。
+    """
+    from papershelf.server.db import _migrate, connect, tx
+
+    conn = connect(settings)
+    try:
+        conn.execute("ALTER TABLE doc_cache DROP COLUMN parse_version")   # 模拟旧库
+        conn.commit()
+        with tx(conn):
+            conn.execute("INSERT OR REPLACE INTO doc_cache (fingerprint, doc_json, created_at) "
+                         "VALUES ('legacy','{}',datetime('now'))")
+        assert "parse_version" not in {r["name"] for r in conn.execute("PRAGMA table_info(doc_cache)")}
+
+        _migrate(conn)
+        cols = {r["name"] for r in conn.execute("PRAGMA table_info(doc_cache)")}
+        row = conn.execute("SELECT parse_version FROM doc_cache WHERE fingerprint='legacy'"
+                           ).fetchone()
+    finally:
+        conn.close()
+    assert "parse_version" in cols, "迁移没给 doc_cache 补上 parse_version 列"
+    assert row["parse_version"] is None, (
+        f"存量行被写成了 {row['parse_version']}：版本号已不可还原，写一个值就是编的")

@@ -281,6 +281,37 @@ def test_cache_hit_falls_back_to_reparsing_when_the_source_assets_are_gone(
     )
 
 
+def test_the_cache_row_records_the_parse_version_that_wrote_it(
+        client, settings, make_user, monkeypatch):
+    """#25：新写的缓存行必须说明**自己属于哪一代解析器**。
+
+    否则它退役之后无从辨认 —— 键是 `sha256("parse-v{N}" + PDF)`，版本号混进去就没了，
+    于是只能永远留着（一行 ≈ 734 KB/篇），而删除路径的 `doc_json LIKE ?` 是全表扫。
+    """
+    from papershelf.pipeline import PARSE_VERSION
+    from papershelf.server import converter as cv
+    from papershelf.server.db import connect
+
+    plan_id = _prepare(client, settings, make_user, monkeypatch, cv)
+    src = settings.data_dir / "versioned.pdf"
+    src.parent.mkdir(parents=True, exist_ok=True)
+    _make_pdf(src)
+    pid, pdf_path = _upload(client, plan_id, "版本.pdf", src.read_bytes())
+
+    _run_paper(settings, pid, _fp(pdf_path))        # 真解析 + 真写缓存行（LLM 全替身）
+
+    conn = connect(settings)
+    try:
+        row = conn.execute("SELECT parse_version FROM doc_cache WHERE fingerprint=?",
+                           (_fp(pdf_path),)).fetchone()
+    finally:
+        conn.close()
+    assert row is not None, "转换没有落下缓存行 —— 夹具没跑通"
+    assert row["parse_version"] == PARSE_VERSION, (
+        f"缓存行记的版本是 {row['parse_version']!r}、当前是 {PARSE_VERSION}："
+        "它退役后就分不清属于哪一代，只能永远留着、也永远删不掉")
+
+
 def _cache_meta(settings, fingerprint: str) -> dict | None:
     """读缓存行里的 `meta`（行不在则 None）。"""
     from papershelf.server.db import connect

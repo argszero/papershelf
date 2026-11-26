@@ -207,9 +207,13 @@ CREATE TABLE IF NOT EXISTS shares (
 
 -- 缓存去重（待定项 7）：同一份 PDF 解析结果复用，只重放翻译
 CREATE TABLE IF NOT EXISTS doc_cache (
-  fingerprint TEXT PRIMARY KEY,      -- PDF 内容 hash
-  doc_json    TEXT NOT NULL,
-  created_at  TEXT
+  fingerprint   TEXT PRIMARY KEY,    -- PDF 内容 hash **+ 解析版本号**（`_pdf_fingerprint`）
+  doc_json      TEXT NOT NULL,
+  created_at    TEXT,
+  -- 写这一行时用的是哪个 `PARSE_VERSION`（#25）。**NULL = 不可知**：加这一列之前写的行，
+  -- 版本号夹在 sha256 里已经还原不出来 ⇒ 不可知的行一律留着（见 `_prune_retired_versions`
+  -- 与 `_migrate`）。它只是**一行自己的出生证明**，不参与缓存键。
+  parse_version INTEGER
 );
 """.replace("__HIGHLIGHTS_DDL__", HIGHLIGHTS_DDL)
 
@@ -326,6 +330,13 @@ def _migrate(conn: sqlite3.Connection) -> None:
     for name, ddl in (("act_as_user_id", "INTEGER"), ("act_as_at", "TEXT")):
         if name not in sess_cols:
             conn.execute(f"ALTER TABLE sessions ADD COLUMN {name} {ddl}")
+    # 解析缓存行的「写它时的 `PARSE_VERSION`」（#25）。加它的原因：`PARSE_VERSION` 一涨，
+    # 全库的 `doc_cache` 行都再也命中不了（键里混了版本号），而**没有任何入口能删它们**
+    # ——「重新提取」只删得出当前版本那一行。版本号夹在 sha256 里不可还原 ⇒ 存量行**留 NULL**
+    # （语义 = 不可知，永不回收）：宁可留着已知的死行，也不猜一个版本号出来。
+    dcols = {r["name"] for r in conn.execute("PRAGMA table_info(doc_cache)")}
+    if "parse_version" not in dcols:
+        conn.execute("ALTER TABLE doc_cache ADD COLUMN parse_version INTEGER")
     # 存量永久分享链接（`expires_at IS NULL`）按新规收敛：从**现在**起 24 小时。
     # 给宽限而不是立即作废 —— 已经发出去的链接立刻全废会让访客撞 410，体验是"链接坏了"。
     conn.execute(
