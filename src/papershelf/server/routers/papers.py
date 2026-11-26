@@ -410,6 +410,47 @@ def _remove_paper_files(settings: Settings, pdf_path: str | None, paper_id: int,
             log.warning("删除磁盘产物失败（已忽略）：%s：%s", target, exc)
 
 
+def _prune_retired_versions(conn: sqlite3.Connection) -> int:
+    """删掉**版本已知、且已退役**的解析缓存行，返回删掉的行数（#25）。
+
+    ## 它补的是哪一段
+
+    缓存键 = `sha256("parse-v{N}" + PDF 字节)` ⇒ `PARSE_VERSION` 每涨一次，全库的行**整体换键**：
+    旧键再也命中不了（`converter._run` 只按当前版本算指纹去查），可**删也删不掉**
+    —— `reextract` 删的正是当前版本那一行。于是每涨一次版本，表里就多留一代死行
+    （实测一行 ≈ 734 KB/篇），而 `_forget_reclaimed_assets_dir` 的 `doc_json LIKE ?`
+    是**不带索引**的全表扫，行越多，删文献越慢（1 行 0.3 ms → 102 行 41.3 ms）。
+
+    ## 为什么判据只能是「行自己记着的版本」
+
+    版本号混进 sha256 就没了：既有行回答不出自己属于哪一代（`NULL`），拿 PDF 反推要
+    逐篇整文件 hash、还会连累"行可以越过删除"这条既定口径（`tests/test_delete_paper.py`）。
+    所以回收只认**记着版本、且低于当前版本**的行：`NULL` = 不可知 ⇒ 留着。
+    也不删 `parse_version > PARSE_VERSION` 的行 —— 那意味着库比代码新（回滚过的部署），
+    猜它是死行就可能删掉一个还会被命中的产物。
+
+    ## 在哪跑、为什么不在别处跑
+
+    只在 `reextract` 里、与那句单行 `DELETE` 同一个事务、同一个触发点：**用户点了「重新提取」
+    才回收**。刻意不做定时、不在启动时跑 —— 换个版本就擅自删库里的行，是没被要求的破坏；
+    而 `VACUUM` 也不做（归还页给文件系统会让所有写者停住，那是另一个操作、另一笔代价）。
+
+    删的是**全库**的死行（不是这一篇的）：一行只要版本已退役，就再也命中不了，
+    它属于哪一篇都不影响这个判断。
+    """
+    from ...pipeline import PARSE_VERSION
+
+    cur = conn.execute(
+        "DELETE FROM doc_cache WHERE parse_version IS NOT NULL AND parse_version < ?",
+        (PARSE_VERSION,),
+    )
+    pruned = cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
+    if pruned:
+        log.info("回收 %d 行已退役的解析缓存（parse_version < %s；未知版本的行不动）",
+                 pruned, PARSE_VERSION)
+    return pruned
+
+
 def _forget_reclaimed_assets_dir(conn: sqlite3.Connection | None, settings: Settings,
                                  paper_id: int) -> None:
     """把**仍指向「已被收走的 `p<id>/`」**的解析缓存行摘掉来源指针。
@@ -562,6 +603,9 @@ def reextract(paper_id: int, background: BackgroundTasks,
     with tx(conn):
         if fingerprint:
             conn.execute("DELETE FROM doc_cache WHERE fingerprint=?", (fingerprint,))
+        # 顺手回收**已退役版本**留下的死行（#25）：版本一涨它们就再也命中不了，
+        # 且没有任何别的入口能删掉。未知版本（NULL）的行不在此列。
+        _prune_retired_versions(conn)
         conn.execute("DELETE FROM notes WHERE paper_id=?", (paper_id,))
         conn.execute("DELETE FROM highlights WHERE paper_id=?", (paper_id,))
     # 排队**在事务之外**用共用入口：`job=None` 清掉可能残留的 `pending_job`

@@ -699,11 +699,18 @@ def _run(conn: sqlite3.Connection, paper: dict, settings, fingerprint: str | Non
 
     # 解析 + 原文校对 + 公式的成果先缓存（下次同 PDF 可直接复用）
     if fingerprint:
+        # 写下这一行是哪个解析版本产出的（#25）：`PARSE_VERSION` 一涨，旧行就再也命中不了，
+        # 而删不掉就成了永久的死行。惰性导入与 `papers._pdf_fingerprint` 一致 ——
+        # 版本号在**调用时**读，不钉在模块导入那一刻。
+        from ..pipeline import PARSE_VERSION as _pv
+
         with tx(conn):
             conn.execute(
-                """INSERT INTO doc_cache (fingerprint, doc_json, created_at) VALUES (?,?,?)
-                   ON CONFLICT(fingerprint) DO UPDATE SET doc_json=excluded.doc_json""",
-                (fingerprint, doc.to_json(), utcnow()),
+                """INSERT INTO doc_cache (fingerprint, doc_json, created_at, parse_version)
+                   VALUES (?,?,?,?)
+                   ON CONFLICT(fingerprint) DO UPDATE SET doc_json=excluded.doc_json,
+                                                          parse_version=excluded.parse_version""",
+                (fingerprint, doc.to_json(), utcnow(), _pv),
             )
 
     # ── ②b 元数据与标签自动抽取（决策⑲）──
