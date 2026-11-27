@@ -377,6 +377,46 @@ def test_admin_password_reset_revokes_existing_sessions(client, make_user):
     assert client.get("/api/auth/me").json()["email"] == admin_email
 
 
+def test_admin_user_endpoints_hold_a_password_to_one_rule(client, make_user):
+    """#38：管理员开号与改口令必须是同一把尺子 —— 改口令原先绕得开开号的下限。
+
+    实测（``1835b1a``，把两个模型抽出来喂 pydantic）：``CreateUserIn`` 对 ``"a"`` 回
+    ``string_too_short``，``PatchUserIn`` 却把 ``"a"``、``""``、五千位全收下；
+    端到端就是 ``POST`` 422 / ``PATCH`` 200，账号就这么落成一位口令。
+
+    判据取「两条路径对同一批口令给出同一个答案」：只断言 ``PATCH`` 会拒，
+    漏得掉「哪天 ``POST`` 的下限也被人改松」这种两边一起漂的情形。
+    中间那段断言「被拒之后一个字节都没落库」—— 只看 422 说不出这个。
+    """
+    admin_email, admin_pw = make_user("admin@pku.edu.cn", is_admin=True)
+    user_email, user_pw = make_user("u@tsinghua.edu.cn")
+    client.post("/api/auth/login", json={"email": admin_email, "password": admin_pw})
+    uid = next(u["id"] for u in client.get("/api/admin/users").json()
+               if u["email"] == user_email)
+    # 另开一个 cookie jar 当「那个用户自己的浏览器」，免得登录把管理员的会话顶掉
+    other = client.__class__(client.app_ref)
+
+    for i, bad in enumerate(("", "a", "short12", "x" * 201)):
+        created = client.post("/api/admin/users",
+                              json={"email": f"new{i}@tsinghua.edu.cn", "password": bad})
+        patched = client.patch(f"/api/admin/users/{uid}", json={"password": bad})
+        assert created.status_code == patched.status_code == 422, (
+            f"{len(bad)} 位口令：开号回 {created.status_code}、改口令回 {patched.status_code}"
+            " —— 两条路径的标准不一致")
+
+    # 被拒的这四次一个字节都不许落库：原口令照旧登得进去
+    assert other.post("/api/auth/login",
+                      json={"email": user_email, "password": user_pw}).status_code == 200
+
+    # 边界两头都收下：正好 8 位、正好 200 位（下限是 >=、上限是 <=，不是 >）
+    assert client.patch(f"/api/admin/users/{uid}",
+                        json={"password": "abcdefgh"}).status_code == 200
+    assert other.post("/api/auth/login",
+                      json={"email": user_email, "password": "abcdefgh"}).status_code == 200
+    assert client.patch(f"/api/admin/users/{uid}",
+                        json={"password": "z" * 200}).status_code == 200
+
+
 # ── 隔离（①⑦）──────────────────────────────────────────────────────────
 def test_plans_are_private_between_users(client, make_user):
     a = make_user("a@tsinghua.edu.cn")

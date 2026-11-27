@@ -11,11 +11,12 @@ import sqlite3
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 
 from ..db import rows_to_list, tx, utcnow
 from ..security import (
     SESSION_COOKIE,
+    AccountPassword,
     apply_password,
     create_user,
     current_admin,
@@ -32,14 +33,16 @@ log = logging.getLogger("papershelf.admin")
 
 class CreateUserIn(BaseModel):
     email: str
-    password: str = Field(min_length=8)
+    password: AccountPassword
     display_name: str = ""
     is_admin: bool = False
 
 
 class PatchUserIn(BaseModel):
     status_: str | None = None      # active | disabled
-    password: str | None = None
+    # 与 `CreateUserIn` 同一把尺子（`security.AccountPassword`）：不传 = 不改口令，
+    # 传了就得够长。空串不再被 `if body.password:` 静默吞掉（#38）。
+    password: AccountPassword | None = None
     is_admin: bool | None = None
 
 

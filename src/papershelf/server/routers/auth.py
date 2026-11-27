@@ -22,6 +22,7 @@ from ..terms import TERMS_BODY, TERMS_SUMMARY, TERMS_VERSION
 from ..security import (
     SESSION_COOKIE,
     SESSION_DAYS,
+    AccountPassword,
     code_cooldown_left,
     consume_code,
     create_user,
@@ -43,7 +44,8 @@ router = APIRouter(prefix="/api/auth", tags=["auth"])
 class RegisterIn(BaseModel):
     email: str
     code: str = Field(min_length=4, max_length=12)
-    password: str = Field(min_length=8, max_length=200)
+    # 与管理员开号同一个类型（`security.AccountPassword`）：口令长度规则只写一处。
+    password: AccountPassword
     display_name: str = ""
     # 用户协议（宿主 2026-09-11）：**必须为 true 才开号**，且把生效版本号落库。
     # 默认 False 是刻意的 —— 旧客户端不传这个字段时会被拒，而不是静默跳过同意。
@@ -57,7 +59,7 @@ class EmailIn(BaseModel):
 class ResetIn(BaseModel):
     email: str
     code: str = Field(min_length=4, max_length=12)
-    password: str = Field(min_length=8, max_length=200)
+    password: AccountPassword
 
 
 class LoginIn(BaseModel):
