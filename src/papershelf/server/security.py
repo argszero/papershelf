@@ -14,11 +14,12 @@ import re
 import secrets
 import sqlite3
 from datetime import datetime, timedelta, timezone
-from typing import Any
+from typing import Annotated, Any
 
 from argon2 import PasswordHasher
 from argon2.exceptions import VerifyMismatchError
 from fastapi import Depends, HTTPException, Request, status
+from pydantic import Field
 
 from .config import Settings, get_settings
 from .db import dump_json, expires_in, new_token, rows_to_list, utcnow, tx
@@ -31,6 +32,19 @@ _EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[a-zA-Z]{2,}$")
 
 
 # ── 密码 ──────────────────────────────────────────────────────────────────
+# 口令的长度规则只写一处，四个入口共用：开号（`CreateUserIn`）、管理员改口令
+# （`PatchUserIn`）、注册（`RegisterIn`）、找回（`ResetIn`）—— 与 `plans.PlanName`
+# 同一取向。原先只有管理员改口令那条没有约束，于是 `PATCH /api/admin/users/{id}`
+# 收下了 `POST /api/admin/users` 用 422 拒收的口令：一位、空串、五千位全收（#38）。
+# 空串不再是「静默不改口令」的写法：这个体是 patch，字段缺省才表示不改。
+PASSWORD_MIN_LEN = 8
+PASSWORD_MAX_LEN = 200
+# `ensure_admin` 在启动引导时读的也是这两个数（它不是请求体，拿不到类型约束）。
+AccountPassword = Annotated[
+    str, Field(min_length=PASSWORD_MIN_LEN, max_length=PASSWORD_MAX_LEN)
+]
+
+
 def hash_password(raw: str) -> str:
     return _ph.hash(raw)
 
@@ -200,7 +214,7 @@ def ensure_admin(conn: sqlite3.Connection, email: str, password: str) -> int:
     而随机密码又只写进日志/无处可见。所以**必须显式给出密码**，否则直接报错，
     引导失败可见、可修，不给任何后门。
     """
-    if not password or len(password) < 8:
+    if not password or len(password) < PASSWORD_MIN_LEN:
         raise ValueError(
             "PAPERSHELF_ADMIN_PASSWORD 未设置或过短（≥8 位）；"
             "首次引导需要它来创建/校验管理员账号"
@@ -334,7 +348,8 @@ def require_paper(conn: sqlite3.Connection, paper_id: int, user: dict[str, Any])
 
 
 __all__ = [
-    "SESSION_COOKIE", "SESSION_DAYS", "CODE_PURPOSES", "activate_user", "apply_password",
+    "SESSION_COOKIE", "SESSION_DAYS", "CODE_PURPOSES", "AccountPassword", "activate_user",
+    "apply_password",
     "code_cooldown_left",
     "consume_code", "create_user", "current_admin",
     "current_user", "email_allowed", "end_session", "ensure_admin", "get_conn",
